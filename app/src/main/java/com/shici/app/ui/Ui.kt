@@ -42,3 +42,18 @@ fun Context.button(label: String, primary: Boolean = false, action: () -> Unit):
 fun LinearLayout.space(height: Int = 16) { addView(View(context), LinearLayout.LayoutParams(1, context.dp(height))) }
 fun LinearLayout.divider() { addView(View(context).apply { setBackgroundColor(Paper.line) },
     LinearLayout.LayoutParams(-1, context.dp(1)).apply { topMargin = context.dp(12); bottomMargin = context.dp(12) }) }
+
+fun Context.badge(label: String): TextView = text(label, 16f, Paper.green).apply {
+    setPadding(dp(12), dp(4), dp(12), dp(4)); background = shape(Paper.lightGreen, 8)
+}
+fun Context.inputField(hintText: String, singleLine: Boolean = false): EditText = EditText(this).apply {
+    hint = hintText; textSize = 16f; setTextColor(Paper.ink); setHintTextColor(Paper.secondary)
+    setSingleLine(singleLine); minHeight = dp(48)
+    setPadding(dp(12), dp(12), dp(12), dp(12)); background = shape(Paper.surface, 8, true)
+}
+fun Context.pair(first: View, second: View, horizontal: Boolean, gap: Int = 16): LinearLayout =
+    (if (horizontal) row() else column()).apply {
+        addView(first, if (horizontal) LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(gap) }
+            else LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(gap) })
+        addView(second, if (horizontal) LinearLayout.LayoutParams(0, -2, 1f) else LinearLayout.LayoutParams(-1, -2))
+    }
