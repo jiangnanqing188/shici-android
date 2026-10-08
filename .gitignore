@@ -1,0 +1,12 @@
+.gradle/
+.kotlin/
+**/build/
+local.properties
+.idea/
+*.iml
+*.apk
+*.aab
+.tools/
+artifacts/
+docs/design/*.png
+docs/design/*.webp
