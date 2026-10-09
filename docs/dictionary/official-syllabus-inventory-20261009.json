@@ -1,0 +1,311 @@
+{
+  "schema_version": 1,
+  "checked_on": "2026-10-09",
+  "purpose": "官方考纲来源核查；非官方逐词列表提取完成或内容验收",
+  "candidate_baseline": {
+    "database_sha256": "8509688fa5f66307e6565432e66e99561d257a55114e74e8ea8f080564874d48",
+    "unique_headwords": 12785,
+    "domain_counts": {
+      "cet4": 4216,
+      "cet6": 3475,
+      "ky": 4950,
+      "tem4": 4025,
+      "tem8": 12197
+    },
+    "metadata": {
+      "content_review_status": "unreviewed",
+      "status": "local_candidate_not_content_approved",
+      "syllabus_verified": false
+    }
+  },
+  "exams": [
+    {
+      "exam": "ky",
+      "agent_model": "gpt-6-luna",
+      "reasoning_effort": "high",
+      "agent_report": ".tools/dictionaries/syllabus-review-20261009/ky.json",
+      "agent_report_sha256": "9fc8c9b4bd71789eeb67e7ac3080a61d58472a7b214b4bd6eac135271ea18734",
+      "status": "official_requirements_only",
+      "syllabus_versions": [
+        {
+          "title": "2027年全国硕士研究生招生考试英语(一)考试大纲(非英语专业)",
+          "edition": "2027",
+          "applicable_year": 2027,
+          "issuer": "教育部教育考试院；高等教育出版社出版发行",
+          "published_on": null,
+          "official_url": "https://www.hep.com.cn/search?reader=R7",
+          "authority_basis": "高等教育出版社官方产品目录的搜索结果列出该2027版题名、编者教育部教育考试院与定价；搜索结果未显示出版日期，故不填猜测日期。",
+          "latest_status": "截至2026-10-09已确认的最新英语（一）版本；官方出版社检索目录已列2027版。中国教育考试网公开大纲目录可读到2022版，但新版仍以出版社官方目录为证。"
+        },
+        {
+          "title": "2027年全国硕士研究生招生考试英语(二)考试大纲(非英语专业)",
+          "edition": "2027",
+          "applicable_year": 2027,
+          "issuer": "教育部教育考试院；高等教育出版社出版发行",
+          "published_on": null,
+          "official_url": "https://xuanshu.hep.com.cn/front/book/findBookProducts?pageNum=2&professionPath=%2F599a40bf1fc164e5a8bc695d",
+          "authority_basis": "高等教育出版社官方产品目录的搜索结果列出该2027版题名、编者教育部教育考试院与定价；搜索结果未显示出版日期，故不填猜测日期。",
+          "latest_status": "截至2026-10-09已确认的最新英语（二）版本；官方出版社检索目录已列2027版。中国教育考试网公开大纲目录可读到2022版，但新版仍以出版社官方目录为证。"
+        }
+      ],
+      "vocabulary_requirement": {
+        "reported_word_count": null,
+        "scope": "未取得2027版英语（一）或英语（二）官方大纲词汇要求原文，当前官方词汇量要求未确认。历史约5500说法只保留为第三方培训机构文章的secondary_reprint线索，不作为当前或历史官方要求已证实的依据。",
+        "source_url": null,
+        "location": null,
+        "counting_note": "没有合法取得并核验2027官方词汇要求原文或完整附录，故数量留空。转载文章中的约5500不是本次官方核实数字，也不是词表实测唯一词头数。"
+      },
+      "full_wordlist": {
+        "available": false,
+        "official_source_url": null,
+        "sha256": null,
+        "headwords_file": null,
+        "unique_count": null,
+        "extraction_verified": false,
+        "limitations": [
+          "高教社官方目录已列2027英语（一）和英语（二）大纲为付费出版物，检索页并未公开完整正文或词汇附录。",
+          "中国教育考试网可公开检索的目录中本次找到的英语（二）官方存档为2022版；其可读页面不含正文/词汇附录，且不能替代2027版本。",
+          "本次未找到可公开取得、逐词可核验的2027官方词表；不能据“未找到”断言其他合法官方数字资源绝不存在。",
+          "不会将培训机构资料、商业词书、网盘文件、GitHub词表或旧版文本冒充2027官方完整词表。"
+        ]
+      },
+      "source_cache_file": null
+    },
+    {
+      "exam": "cet4",
+      "agent_model": "gpt-6-luna",
+      "reasoning_effort": "high",
+      "agent_report": ".tools/dictionaries/syllabus-review-20261009/cet4.json",
+      "agent_report_sha256": "fe876994323720fc782d9407bad0af51729166f320fc872b26dca6a933ea05db",
+      "status": "official_wordlist_available",
+      "syllabus_versions": [
+        {
+          "title": "全国大学英语四、六级考试大纲（2016年修订版）",
+          "edition": "2016年修订版",
+          "applicable_year": "截至2026-10-09，CET官网大纲栏目列示的公开版；未发现官方公告称其已被更新版本替代",
+          "issuer": "全国大学英语四、六级考试委员会（官方CET网站发布；PDF所载历史信息提及教育部考试中心）",
+          "published_on": "未见明确发布日期；PDF元数据创建日期为2016-09-10（不等同于发布日期）",
+          "official_url": "https://cet.neea.edu.cn/res/Home/1704/55b02330ac17274664f06d9d3db8249d.pdf",
+          "authority_basis": "PDF由教育部教育考试院主办的CET官网大纲栏目提供；封面及正文标明“全国大学英语四、六级考试大纲（2016年修订版）”。",
+          "latest_status": "在所核查的官方公开入口中，该2016年修订版仍为列示版本；这证明官方栏目当前列示状态，不证明存在独立公告确认其永久有效，也未检出更新版替代公告。"
+        }
+      ],
+      "vocabulary_requirement": {
+        "reported_word_count": 5418,
+        "scope": "官方词表说明所称四级与六级合计的词目数；★标注六级词，未标★词项按该表分级规则属四级。5418不是经核定的四级单独词数，也不代表所有考试文本词汇的绝对覆盖边界。",
+        "source_url": "https://cet.neea.edu.cn/res/Home/1704/55b02330ac17274664f06d9d3db8249d.pdf",
+        "location": "PDF印刷页15（物理页20）的词表“说明”；正文PDF印刷页1（物理页6）关于词汇范围的条款。",
+        "counting_note": "直接采用官方说明的合计数5418，不从常见4500/4800说法、OCR估算或第三方词表反推四级独立数量。官方说明中的“词目”含义与表中并列词形/派生形式的统计口径未进一步拆分。"
+      },
+      "full_wordlist": {
+        "available": true,
+        "official_source_url": "https://cet.neea.edu.cn/res/Home/1704/55b02330ac17274664f06d9d3db8249d.pdf",
+        "sha256": "9166d3c03b7bc43abd9d9df91bd2ef8085b4419286f1e5ca100dea68f3cfd1f1",
+        "headwords_file": null,
+        "unique_count": null,
+        "extraction_verified": false,
+        "limitations": [
+          "完整共享四/六级词表确实随官方PDF公开，物理页20为说明页，正文词项范围为物理页21—149；这是官方PDF可获取性结论，不等于本次已得到准确机器词表。",
+          "已尝试按pdftotext -bbox-layout的坐标重建行与主栏/派生词副栏。候选解析得到主栏行5377条、副栏簇2512条，但与末页横向栏目数字5418、2551不能可靠核平；这些只是失败解析诊断数，不是官方词数或词头统计，未写入unique_count。",
+          "主栏★标记有时独立、有时与文本融合；PDF内部映射还出现全角G等异常，编号同形词及括号/斜线异拼需要视觉逐项确认。bbox候选不能保证列归属、词项边界、拼法及星标分级零漏/零错，故extraction_verified=false。",
+          "本次未生成headwords.json；5418为官方说明的词目数，不是经核验的CET4单独非★数。物理页149出现的第二个数2551及其语义未据排版推断。",
+          "PDF权限标记为copy=no；未绕过权限限制。缓存仅保存官方原始PDF作为来源证据，不将OCR/bbox候选当作可靠词表发布。"
+        ]
+      },
+      "source_cache_file": ".tools/dictionaries/syllabus-review-20261009/cet4/cache/neea-cet4-cet6-syllabus-2016-revised.pdf"
+    },
+    {
+      "exam": "cet6",
+      "agent_model": "gpt-6-luna",
+      "reasoning_effort": "high",
+      "agent_report": ".tools/dictionaries/syllabus-review-20261009/cet6.json",
+      "agent_report_sha256": "c309a6d1132f895f01e4e8b5252f3e11c9122198d1a2ac061461a88fdd9e2ae8",
+      "status": "official_wordlist_available",
+      "syllabus_versions": [
+        {
+          "title": "全国大学英语四、六级考试大纲（2016年修订版）",
+          "edition": "2016年修订版",
+          "applicable_year": "截至2026-10-09为CET官网栏目所列/链接版本；未发现另列年度版本",
+          "issuer": "全国大学英语四、六级考试委员会（封面署名编著）；教育部教育考试院CET官网提供下载",
+          "published_on": null,
+          "official_url": "https://cet.neea.edu.cn/res/Home/1704/55b02330ac17274664f06d9d3db8249d.pdf",
+          "authority_basis": "用户提供的官方CET大纲栏目链接指向该PDF；PDF封面标注2016年修订版、编著单位及上海交通大学出版社。对下载原件执行pdfinfo：Document Info CreationDate与ModDate均为2016-09-10 18:30:15+08:00。XMP的ModifyDate/MetadataDate另显示2016-12-21 04:36:29+08:00；这两项元数据时间均不等于正式公告/出版日期。",
+          "latest_status": "截至核查日，在官方栏目列出的全国大学英语四、六级英语大纲为2016年修订版；这是官网当前所列/本次找到的最新版本，但缺少官方版本历史，不能证明绝对不存在未列出的更新版本。"
+        }
+      ],
+      "vocabulary_requirement": {
+        "reported_word_count": 5418,
+        "scope": "官方说明：四、六级共用词表共收录5418个词目，分四级、六级两个级别，六级词用★标出。这是共享附录总量，不是可直接等同为“六级增量”或已校验的单独六级headword数量。词汇范围参照该附录。",
+        "source_url": "https://cet.neea.edu.cn/res/Home/1704/55b02330ac17274664f06d9d3db8249d.pdf",
+        "location": "PDF正文“考试系列介绍”纸面页1（词汇范围说明）；“词表”标题及说明在纸面页15/PDF物理页20；实际词头始于纸面页16/PDF物理页21（a/an），终于纸面页144/PDF物理页149（★zoom）。",
+        "counting_note": "5418是官方说明的原表“词目”总数，不是本地抽取后按NFC/大小写/空白等规范化并去重得到的唯一词头数（unique_count未计算，保持null）。原文说明同形异音异义词分列、同形异义词一般也分列；两种拼法可并列，英/美变体拼写依规则处理；派生词原则上不单列，特别常用的除外，词表中另有副栏/并列派生形式。因此5418不能简单解释成规范化唯一词头数，亦不能据此得出CET6增量数。末页另印2551，本次未找到文字解释其计数口径。"
+      },
+      "full_wordlist": {
+        "available": true,
+        "official_source_url": "https://cet.neea.edu.cn/res/Home/1704/55b02330ac17274664f06d9d3db8249d.pdf",
+        "sha256": "9166d3c03b7bc43abd9d9df91bd2ef8085b4419286f1e5ca100dea68f3cfd1f1",
+        "headwords_file": null,
+        "unique_count": null,
+        "extraction_verified": false,
+        "limitations": [
+          "完整官方四/六级合并词表确在PDF内：标题与说明为纸面页15/PDF物理页20；实际词头从纸面页16/PDF物理页21的a/an开始，至纸面页144/PDF物理页149的★zoom结束。",
+          "未生成headwords.json：不重做其他代理的词表提取。本报告仅校正页码/元数据并核实首末词头；不把跨栏文字层的拆字、错序或星号对齐未经逐项核验的结果宣称为已验证数组。",
+          "官方词表的5418为原表词目总数，不等于简单规范化后的唯一词头数：正文说明同形异音异义词分列，同形异义词一般分列；拼法变体有并列规则；派生词原则上不单列（特别常用者例外），并可在副栏并列派生词形。unique_count因此为null。",
+          "官方文件是四/六级合并词表；官方明示分两级且六级词标★，但本次未证明六级考试的应用范围应按“所有四级词+星标增量”自动合并。",
+          "末页数字2551未被独立文字定义，暂不作为六级增量计数。"
+        ]
+      },
+      "source_cache_file": ".tools/dictionaries/syllabus-review-20261009/cet6/official-cet-syllabus-2016-revised.pdf"
+    },
+    {
+      "exam": "tem4",
+      "agent_model": "gpt-6-luna",
+      "reasoning_effort": "high",
+      "agent_report": ".tools/dictionaries/syllabus-review-20261009/tem4/tem4.json",
+      "agent_report_sha256": "a47fae577a7d66074eeedd76a95ae28293b6fc8985a33b4b2c96ea1fef870d90",
+      "status": "official_requirements_only",
+      "syllabus_versions": [
+        {
+          "title": "高校英语专业四级考试大纲（2004年新版）",
+          "edition": "2004年新版（正式考纲版本；当前未检得后续正式重版）",
+          "applicable_year": "2005年起；截至2026-10-09，官方TEM网站仍公布相应要求与2016年起施行的题型结构",
+          "issuer": "高等学校外语专业教学指导委员会英语组考试大纲修订组；由英语组审议通过并上报相关主管机构（版本沿革依据出版社介绍）",
+          "published_on": "2004年（具体出版日未核实）",
+          "official_url": "https://www.sflep.com/show-20-292-1.html",
+          "authority_basis": "高校外语专业教学测试办公室官网现行TEM4内容页列明考试目标、5500—6000认知词汇及3000—4000积极使用词汇；上海外语教育出版社说明2004年新版自2005年起施行。未找到官网公开的完整考纲扫描件或正式版本公告，因此版本沿革有部分依据出版社一手介绍而非原始考纲版权页。",
+          "latest_status": "截至核查日，官方测试办公室网站仍列示该词汇要求和现行试卷内容；出版方的2026工具书目录仍称其TEM4备考产品依据2004年新版考纲编写。未发现可验证的后续考纲新版；故可确认的最新适用正式版本为2004年新版，但此结论是公开来源范围内的检索结论，不等于测试办公室发布了‘仍有效’声明。"
+        },
+        {
+          "title": "关于英语专业四、八级考试题型调整的说明（TEM4部分）",
+          "edition": "2015年8月发布的题型调整说明；自2016年起执行，不是新版词汇大纲",
+          "applicable_year": "2016年起；截至2026-10-09官方TEM页面仍使用六部分、130分钟结构",
+          "issuer": "高校外语专业教学测试办公室／外语专业教学测试专家委员会（说明发布与决定机关，来自高校教务部门转引及上海外语教育出版社介绍）",
+          "published_on": "2015-08（官方发布日期以二手转引所载月份为准，原始通知页未检得）",
+          "official_url": "https://tem.fltonline.cn/?p=74688",
+          "authority_basis": "测试办公室官网现行TEM4内容页展示与2016局部调整相符的考试分部、题型、时长；高校教务部门转引测试办公室通知明确调整自2016年起。该文件只涉及试卷结构/题型，不替代或改写词汇要求。",
+          "latest_status": "官方TEM4内容页当前仍列示听写、听力理解、语言知识、完型填空、阅读理解、写作六部分及130分钟；此为适用的后续题型调整，非一份新的完整考试大纲。"
+        }
+      ],
+      "vocabulary_requirement": {
+        "reported_word_count": "5500-6000（认知词汇）；其中3000-4000为语境中正确、熟练运用的积极词汇",
+        "scope": "高校外语专业教学测试办公室官网当前公布的TEM4语言知识考核要求。官方页面未定义是否按词元、词形、词组或专名去重计数；这是教学/考核目标范围，不是可直接逐项核验的官方词头总表。",
+        "source_url": "https://tem.fltonline.cn/?p=74688",
+        "location": "网页“语言知识（Part III: Language Usage）考核要求”第2项；在线页面，无页码",
+        "counting_note": "按官网原表述保留范围，不把区间取中值，不把5500/6000当成实测词表unique_count，也不把宣传词书的5000/8000或其他第三方核心词书规模等同官方清单。另，2000年教学大纲高校镜像四级要求表写5500-6500认知词汇；此差异表明考纲网页与专业教学大纲需分开引用。"
+      },
+      "full_wordlist": {
+        "available": false,
+        "official_source_url": null,
+        "sha256": null,
+        "headwords_file": null,
+        "unique_count": null,
+        "extraction_verified": false,
+        "limitations": [
+          "本次未找到由测试办公室、外教社或其他权利方公开提供、可合法取得并核对完整内容的TEM4官方词头原文。",
+          "2004年《英语专业四、八级词汇表》正式出版物可由高校书目核实为414页的修订版，但公开书目不含全文；不抓取/缓存非官方盗版扫描或电子书，不绕过登录、付费或访问控制。",
+          "公开的高校镜像教学大纲文本不能替代词汇表工作组的完整词表原件；本轮未对扫描附件或二手词书进行OCR、人工补录或逐词抽取。",
+          "出版社2026目录中待出版的约3000条TEM4核心词产品是出版方编选产品，不等于官方全词表；第三方专四词书、真题词、考试数据库标签亦不作为正式逐词基准。"
+        ]
+      },
+      "source_cache_file": null
+    },
+    {
+      "exam": "tem8",
+      "agent_model": "gpt-6-luna",
+      "reasoning_effort": "high",
+      "agent_report": ".tools/dictionaries/syllabus-review-20261009/tem8/tem8.json",
+      "agent_report_sha256": "5a9c6ac4d790f11652740102b73d8d0459ffbfa2a9e5a80a7dff581324ae4de5",
+      "status": "official_requirements_only",
+      "syllabus_versions": [
+        {
+          "title": "英语专业八级考试内容（TEM8）",
+          "edition": "高校外语专业教学测试办公室官网现行网页说明；页面未标版次或发布日期",
+          "applicable_year": "截至2026-10-09官网仍公开；2026年度考试通知确认当年考试，但未声明该页面对应的正式版次",
+          "issuer": "高校外语专业教学测试办公室",
+          "published_on": null,
+          "official_url": "https://tem.fltonline.cn/?p=74676",
+          "authority_basis": "测试办公室官方考试网站直接发布的TEM8考试内容和要求；官网2026年度考试通知可确认当年考试安排，但不能据此推定一个未标注的考纲版次或发布日期。",
+          "latest_status": "本次核查日的官方现行公开要求页面；其阅读、翻译、写作和考试结构与高校转载的2020年说明相吻合，但官网未给出可核定的版次/发布日期。"
+        },
+        {
+          "title": "高校英语专业八级考试大纲（2004年新版）",
+          "edition": "2004年新版",
+          "applicable_year": "上海外语教育出版社资料说明新大纲自2005年起用于命题；截至2026年的独立适用性未由当前通知单独确认",
+          "issuer": "高校英语专业八级考试大纲修订小组（据出版目录/书目记录）；出版：上海外语教育出版社",
+          "published_on": "2004",
+          "official_url": null,
+          "authority_basis": "上海外语教育出版社自有网站说明该系列依据2004年新版大纲编写、考试自2005年起按照新大纲命题；大学网站转载该大纲正文。原出版物的公开官方全文链接未找到。",
+          "latest_status": "本次能识别的最近一部独立出版、编号明确的TEM8考试大纲；未发现后续编号修订版。不能仅据此断言其2026年仍是唯一正式版本，官方现行网页另有未注明版本的考试内容说明。"
+        },
+        {
+          "title": "高等学校英语专业英语教学大纲（2000版）",
+          "edition": "2000版，高年级阶段教学要求",
+          "applicable_year": "英语专业教学基准文件；不得等同TEM8考试大纲",
+          "issuer": "高等学校外语专业教学指导委员会英语组（出版记录）；联合出版：上海外语教育出版社、外语教学与研究出版社",
+          "published_on": "2000",
+          "official_url": null,
+          "authority_basis": "大学公开的教学大纲扫描件可见高年级词汇数量及能力分层；出版社书目与2004年配套词汇表说明其教学配套关系。",
+          "latest_status": "作为历史英语专业教学大纲及词汇配套附件的来源核查；不是TEM8考试大纲，也不能由此推出当前闭卷考词表。"
+        }
+      ],
+      "vocabulary_requirement": {
+        "reported_word_count": null,
+        "scope": "TEM8官方现行考试内容页未报告词汇总数。另一个独立文件《高等学校英语专业英语教学大纲》（2000版）规定高年级认知词汇10,000—12,000、其中正确熟练使用5,000—6,000及常用搭配；这是英语专业教学要求，不是TEM8专属闭卷清单。出版社称配套《英语专业四、八级词汇表》约13,000词，含词组、派生词和专业词，也不是经证实的TEM8唯一可考词表。",
+        "source_url": "https://tem.fltonline.cn/?p=74676",
+        "location": "TEM8官方页面：语言知识、阅读、翻译及写作考核要求；页面无词数条款。2000版教学大纲扫描件第5页：高年级词汇要求。",
+        "counting_note": "不把10,000—12,000认知/5,000—6,000熟练运用的教学级别目标移植成TEM8考试大纲自身数字；不把出版社所称约13,000（包含词组、派生词等）当作经过唯一词头规范化的精确词条数。TEM4官方当前页面的5,500—6,000/3,000—4,000是数量目标，同样未提供完整封闭词表。"
+      },
+      "full_wordlist": {
+        "available": false,
+        "official_source_url": null,
+        "sha256": null,
+        "headwords_file": null,
+        "unique_count": null,
+        "extraction_verified": false,
+        "limitations": [
+          "未找到由TEM8考试主管/发布机构公开提供、可合法取得且可验证完整性的逐词封闭考纲表。",
+          "官方考试网站公开的是考试内容与能力要求页面，未附完整词头数组。",
+          "出版社对《英语专业四、八级词汇表》只公开内容介绍和目录；本次未购入或扫描受版权保护的整本词表。",
+          "历史2004版大纲转载中的“原则上/基本上不超出大纲范围”是命题原则，不等于所有试题只会出现一份封闭清单内词项。",
+          "没有进行OCR、补词、词形还原或用核心词书/民间文件拼出伪官方清单。",
+          "出版社目录只公开了教学配套词汇表的四个附录标题（词缀表、部分国家和地区/首都/货币表、不规则动词表、英美常用词拼写差异表），没有公开正文；未取得或缓存其完整内容。"
+        ]
+      },
+      "source_cache_file": null
+    }
+  ],
+  "primary_web_evidence": [
+    {
+      "url": "https://cet.neea.edu.cn/xhtml1/folder/16113/1588-1.htm",
+      "scope": "CET官方栏目，英语项列2016修订版",
+      "cache_file": ".tools/dictionaries/syllabus-review-20261009/cet-official-index.html",
+      "sha256": "998dc1666e94b4d04e7d5287f7ce7560c127f40131d33477e74ece56078b1dcf"
+    },
+    {
+      "url": "https://tem.fltonline.cn/?p=74688",
+      "scope": "TEM4官方现行要求：认知5500–6000、熟练使用3000–4000；网页未显示版次",
+      "cache_file": ".tools/dictionaries/syllabus-review-20261009/tem4-office-current.html",
+      "sha256": "a33092c6eba01ad6b120958e377b7828444b6e499ab029893909827eae89af52"
+    },
+    {
+      "url": "https://tem.fltonline.cn/?p=74676",
+      "scope": "TEM8官方现行能力要求；网页未列专属完整词表或词数",
+      "cache_file": ".tools/dictionaries/syllabus-review-20261009/tem8-office-current.html",
+      "sha256": "aaea2faf3aad10d9c4e8e41c1eac1c48c1314ac42ec3c2389c14c6a9d83aa8f0"
+    },
+    {
+      "url": "https://xuanshu.hep.com.cn/front/book/findBookProducts?pageNum=2&professionPath=%2F599a40bf1fc164e5a8bc695d",
+      "scope": "官方出版社目录列2027英语二大纲及编者，不含全文或出版日期",
+      "cache_file": ".tools/dictionaries/syllabus-review-20261009/ky-hep-english2-catalog.html",
+      "sha256": "576449700f4388d81a8e377190658f046a250d4a038d03cf59fc4cd664ce4341"
+    }
+  ],
+  "complete_original_wordlists": {
+    "exam_count": 2,
+    "distinct_document_count": 1
+  },
+  "approved_machine_wordlists": 0,
+  "syllabus_comparison_performed": false,
+  "syllabus_union_count": null,
+  "do_not_infer": "官方词目声明、认知/运用要求和规范化唯一词头数量口径不同；不能用约数或教学配套词量凑成18000。"
+}
