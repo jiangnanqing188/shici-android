@@ -1,0 +1,132 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-09",
+  "purpose": "只读分析备考词书，并非正式考试大纲或获准再分发的释义资产",
+  "sources": [
+    {
+      "group": "qwerty",
+      "exam": "cet4",
+      "book": "四级新东方词书",
+      "file": "CET4_T.json",
+      "format": "qwerty-json",
+      "commit": "1182426f2bd0a28c95302c33f9e19136b1262a70",
+      "url": "https://raw.githubusercontent.com/RealKai42/qwerty-learner/1182426f2bd0a28c95302c33f9e19136b1262a70/public/dicts/CET4_T.json",
+      "sha256": "733dd9f9c05ed9e3c35fbd65608e4e061e2d34c461723e057513e346562992de",
+      "syllabus_verified": false,
+      "redistribution_status": "unresolved"
+    },
+    {
+      "group": "qwerty",
+      "exam": "cet6",
+      "book": "六级新东方词书",
+      "file": "CET6_T.json",
+      "format": "qwerty-json",
+      "commit": "1182426f2bd0a28c95302c33f9e19136b1262a70",
+      "url": "https://raw.githubusercontent.com/RealKai42/qwerty-learner/1182426f2bd0a28c95302c33f9e19136b1262a70/public/dicts/CET6_T.json",
+      "sha256": "ed5e76b945b7c7bc567a75d44a6eaeda137c767960121057deab52593e245d6e",
+      "syllabus_verified": false,
+      "redistribution_status": "unresolved"
+    },
+    {
+      "group": "qwerty",
+      "exam": "ky",
+      "book": "考研新东方词书",
+      "file": "KaoYan_3_T.json",
+      "format": "qwerty-json",
+      "commit": "1182426f2bd0a28c95302c33f9e19136b1262a70",
+      "url": "https://raw.githubusercontent.com/RealKai42/qwerty-learner/1182426f2bd0a28c95302c33f9e19136b1262a70/public/dicts/KaoYan_3_T.json",
+      "sha256": "2997157b54912bb56118cf3153fb891c452fbfe813da8d21bb219ea7f2829090",
+      "syllabus_verified": false,
+      "redistribution_status": "unresolved"
+    },
+    {
+      "group": "qwerty",
+      "exam": "tem4",
+      "book": "专四核心词书",
+      "file": "Level4luan_2_T.json",
+      "format": "qwerty-json",
+      "commit": "1182426f2bd0a28c95302c33f9e19136b1262a70",
+      "url": "https://raw.githubusercontent.com/RealKai42/qwerty-learner/1182426f2bd0a28c95302c33f9e19136b1262a70/public/dicts/Level4luan_2_T.json",
+      "sha256": "3c48b2ece3603b63daca4e887e615fb0a732266a568fe4be8ef2d1f497a4a722",
+      "syllabus_verified": false,
+      "redistribution_status": "unresolved"
+    },
+    {
+      "group": "qwerty",
+      "exam": "tem8",
+      "book": "专八核心词书",
+      "file": "Level8luan_2_T.json",
+      "format": "qwerty-json",
+      "commit": "1182426f2bd0a28c95302c33f9e19136b1262a70",
+      "url": "https://raw.githubusercontent.com/RealKai42/qwerty-learner/1182426f2bd0a28c95302c33f9e19136b1262a70/public/dicts/Level8luan_2_T.json",
+      "sha256": "1203dc5777cea51998f6de22cf2f7565c9a87185e7f1593065e708de14fb647d",
+      "syllabus_verified": false,
+      "redistribution_status": "unresolved"
+    },
+    {
+      "group": "kajweb",
+      "exam": "cet4",
+      "book": "四级有道词书",
+      "file": "CET4luan_2.zip",
+      "format": "kajweb-zip",
+      "member": "CET4luan_2.json",
+      "commit": "3992bcb94c800a2fd38a9fd6ff95b2353e755363",
+      "url": "https://raw.githubusercontent.com/kajweb/dict/3992bcb94c800a2fd38a9fd6ff95b2353e755363/book/1524052539052_CET4luan_2.zip",
+      "sha256": "a57da774dcabcf154567c0526fd8871d9c61cb6536f993b146330f0c2fd73b37",
+      "syllabus_verified": false,
+      "redistribution_status": "unresolved"
+    },
+    {
+      "group": "kajweb",
+      "exam": "cet6",
+      "book": "六级有道词书",
+      "file": "CET6_2.zip",
+      "format": "kajweb-zip",
+      "member": "CET6_2.json",
+      "commit": "3992bcb94c800a2fd38a9fd6ff95b2353e755363",
+      "url": "https://raw.githubusercontent.com/kajweb/dict/3992bcb94c800a2fd38a9fd6ff95b2353e755363/book/1524052554766_CET6_2.zip",
+      "sha256": "fe12c5a331510e86da4a187a829d9d72e2785588e60ce45d830f349c30fc3866",
+      "syllabus_verified": false,
+      "redistribution_status": "unresolved"
+    },
+    {
+      "group": "kajweb",
+      "exam": "ky",
+      "book": "考研有道词书",
+      "file": "KaoYan_2.zip",
+      "format": "kajweb-zip",
+      "member": "KaoYan_2.json",
+      "commit": "3992bcb94c800a2fd38a9fd6ff95b2353e755363",
+      "url": "https://raw.githubusercontent.com/kajweb/dict/3992bcb94c800a2fd38a9fd6ff95b2353e755363/book/1521164654696_KaoYan_2.zip",
+      "sha256": "8f0670da980d55aee3e63a140633d33f78df04738ad18dbc6cfd552b63da0a5d",
+      "syllabus_verified": false,
+      "redistribution_status": "unresolved"
+    },
+    {
+      "group": "kajweb",
+      "exam": "tem4",
+      "book": "专四核心词书",
+      "file": "Level4luan_2.zip",
+      "format": "kajweb-zip",
+      "member": "Level4luan_2.json",
+      "commit": "3992bcb94c800a2fd38a9fd6ff95b2353e755363",
+      "url": "https://raw.githubusercontent.com/kajweb/dict/3992bcb94c800a2fd38a9fd6ff95b2353e755363/book/1521164625401_Level4luan_2.zip",
+      "sha256": "c7ff8c70668597e3e9c26349b998d9c8ebe9da5f24e7a728484f2963d737b05f",
+      "syllabus_verified": false,
+      "redistribution_status": "unresolved"
+    },
+    {
+      "group": "kajweb",
+      "exam": "tem8",
+      "book": "专八核心词书",
+      "file": "Level8luan_2.zip",
+      "format": "kajweb-zip",
+      "member": "Level8luan_2.json",
+      "commit": "3992bcb94c800a2fd38a9fd6ff95b2353e755363",
+      "url": "https://raw.githubusercontent.com/kajweb/dict/3992bcb94c800a2fd38a9fd6ff95b2353e755363/book/1521164650006_Level8luan_2.zip",
+      "sha256": "6ae970809b5abdc2b02ea8a6fe9c8e9767c7ac08b391c89f9e33958fc4ef31c1",
+      "syllabus_verified": false,
+      "redistribution_status": "unresolved"
+    }
+  ]
+}
