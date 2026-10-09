@@ -17,9 +17,10 @@ class DebugPerformance {
     fun selectionReady() {
         operation?.let { emit("selection_ready", "ok", "click_to_selection_ms=${it.clickToSelection()}") }
     }
-    fun release() { operation?.release(); emit("release", "pending") }
+    // OperationTiming's internal release marker is reused; the public metric now starts at Finish.
+    fun selectionSubmit() { operation?.release(); emit("selection_submit", "pending") }
     fun definitionVisible() {
-        operation?.releaseToDefinition()?.let { emit("definition_visible", "ok", "release_to_definition_ms=$it") }
+        operation?.releaseToDefinition()?.let { emit("definition_visible", "ok", "submit_to_definition_ms=$it") }
     }
     fun stage(stage: String, status: String) { emit(stage, status) }
     fun end(status: String, stage: String) { emit(stage, status); operation = null }

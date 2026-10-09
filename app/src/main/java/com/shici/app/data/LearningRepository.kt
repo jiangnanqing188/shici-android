@@ -6,9 +6,13 @@ import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 import com.shici.app.core.*
+import java.time.LocalDate
+import java.time.ZoneId
 
 /** Queries are serialized by ShiciApplication.worker; all mutations are transactional. */
 class LearningRepository(context: Context, name: String = "learning.db") : SQLiteOpenHelper(context, name, null, 1) {
+    val changes = LearningChanges()
+
     override fun onConfigure(db: SQLiteDatabase) { db.setForeignKeyConstraintsEnabled(true) }
 
     override fun onCreate(db: SQLiteDatabase) {
@@ -32,10 +36,13 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
         require(event.entryKey == entry.key && !event.revoked)
         if (!canCommit()) return false
         val db = writableDatabase
+        check(!db.inTransaction()) { "学习变更不能嵌套在未提交事务中" }
         db.beginTransaction()
+        var changed = false
         try {
             val old = eventById(db, event.id)
-            if (!LearningRules.isDuplicate(old, event)) {
+            changed = !LearningRules.isDuplicate(old, event)
+            if (changed) {
                 if (replaces != null) {
                     require(replaces != event.id)
                     require(eventById(db, replaces) != null) { "原查询已不存在" }
@@ -53,18 +60,49 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
             }
             if (!canCommit()) return false
             db.setTransactionSuccessful()
-            return true
+        } finally { db.endTransaction() }
+        if (changed) changes.publishCommitted()
+        return true
+    }
+
+    fun revoke(id: String) = change { db ->
+        db.update("events", ContentValues().apply { put("revoked", 1) }, "id=? AND revoked=0", arrayOf(id))
+    }
+
+    fun updateWord(key: String, mastered: Boolean, note: String) = change { db ->
+        val marked = if (mastered) 1 else 0
+        db.update("words", ContentValues().apply {
+            put("mastered", marked); put("note", note)
+        }, "entry_key=? AND (mastered<>? OR note<>?)", arrayOf(key, marked.toString(), note))
+    }
+
+    private fun change(write: (SQLiteDatabase) -> Int) {
+        val db = writableDatabase
+        check(!db.inTransaction()) { "学习变更不能嵌套在未提交事务中" }
+        db.beginTransaction()
+        val affected: Int
+        try {
+            affected = write(db)
+            db.setTransactionSuccessful()
+        } finally { db.endTransaction() }
+        if (affected > 0) changes.publishCommitted()
+    }
+
+    fun snapshot(date: LocalDate = LocalDate.now(), zone: ZoneId = ZoneId.systemDefault()): LearningSnapshot {
+        val db = readableDatabase
+        check(!db.inTransaction()) { "只能读取已提交的学习快照" }
+        db.beginTransactionNonExclusive()
+        try {
+            val words = words()
+            val stats = LearningRules.summarize(words, events(), date, zone)
+            db.setTransactionSuccessful()
+            return LearningSnapshot(words, stats, changes.version)
         } finally { db.endTransaction() }
     }
 
-    fun revoke(id: String) {
-        writableDatabase.update("events", ContentValues().apply { put("revoked", 1) }, "id=?", arrayOf(id))
-    }
-
-    fun updateWord(key: String, mastered: Boolean, note: String) {
-        writableDatabase.update("words", ContentValues().apply {
-            put("mastered", if (mastered) 1 else 0); put("note", note)
-        }, "entry_key=?", arrayOf(key))
+    fun exportSnapshot(search: String, date: LocalDate = LocalDate.now()): LearningExportSnapshot {
+        check(!readableDatabase.inTransaction()) { "只能导出已提交的学习快照" }
+        return LearningExportSnapshot(words(search), search, date)
     }
 
     fun words(search: String = ""): List<LearnedWord> {

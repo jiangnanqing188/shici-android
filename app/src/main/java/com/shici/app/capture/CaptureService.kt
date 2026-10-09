@@ -95,7 +95,7 @@ class CaptureService : Service() {
             display = projection!!.createVirtualDisplay("shici-screen", screenWidth, screenHeight,
                 resources.configuration.densityDpi, DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
                 imageReader.surface, null, main)
-            if (showBubble()) CaptureStatus.update(CapturePhase.ACTIVE, "已开启 · 点击悬浮「词」开始框选")
+            if (showBubble()) CaptureStatus.update(CapturePhase.ACTIVE, "已开启 · 点击悬浮「词」开始划选")
         } catch (e: Exception) { fail("开启失败：${e.message ?: "系统拒绝捕获"}") }
         return START_NOT_STICKY
     }
@@ -108,7 +108,7 @@ class CaptureService : Service() {
         val open = PendingIntent.getActivity(this, 2, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         val notification = Notification.Builder(this, CHANNEL).setSmallIcon(R.drawable.ic_shici)
-            .setContentTitle("拾词 · 全屏查词已开启").setContentText("仅框选时识别；点停止释放捕获")
+            .setContentTitle("拾词 · 全屏查词已开启").setContentText("仅完成划选时识别；点停止释放捕获")
             .setContentIntent(open).addAction(Notification.Action.Builder(null, "停止查词", stop).build())
             .setOngoing(true).build()
         if (Build.VERSION.SDK_INT >= 29) startForeground(1001, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
@@ -172,7 +172,7 @@ class CaptureService : Service() {
             screenWidth = width; screenHeight = height
             previous?.setOnImageAvailableListener(null, null)
             frames.post { previous?.close() }
-            if (showBubble()) toast("画面尺寸已变化，请重新框选")
+            if (showBubble()) toast("画面尺寸已变化，请重新划选")
         } catch (e: Exception) {
             replacement?.close()
             fail("捕获尺寸变化失败：${e.message}")
@@ -262,39 +262,115 @@ class CaptureService : Service() {
 
     private fun showSelection(token: Long, bitmap: Bitmap) {
         val layout = column().apply { setBackgroundColor(Paper.background) }
-        val header = row().apply { gravity = Gravity.CENTER_VERTICAL; setPadding(dp(16), dp(8), dp(16), dp(8)) }
-        header.addView(text("框选要查的单词\n取词中 · 静态截图不暂停题目", 16f), LinearLayout.LayoutParams(0, -2, 1f))
-        header.addView(button("取消") { dismissPanel(); showBubble() })
+        val selection = SelectionView(this, bitmap, { selected ->
+            if (sessionIsActive() && gate.accepts(token)) recognize(bitmap, selected)
+        }, { if (gate.accepts(token)) perf.selectionReady() })
+        layout.addView(text("沿文字涂划 · 可多笔累积，跨行请抬笔\n静态截图不暂停题目；完成才识别，轻点不提交", 16f).apply {
+            setPadding(dp(16), dp(8), dp(16), dp(4))
+        })
+        val header = row().apply { gravity = Gravity.CENTER_VERTICAL; setPadding(dp(16), dp(4), dp(16), dp(8)) }
+        header.addView(button("完成划选", true) {
+            if (sessionIsActive() && gate.accepts(token) && !selection.submit()) toast("请沿文字划过至少 6dp，再完成划选；轻点不查询")
+        }, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(8) })
+        header.addView(button("重画") { selection.clearStrokes() }, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(8) })
+        header.addView(button("取消") { dismissPanel(); showBubble() }, LinearLayout.LayoutParams(0, -2, 1f))
         layout.addView(header)
-        layout.addView(SelectionView(this, bitmap, { area ->
-            if (gate.accepts(token)) recognize(bitmap, area)
-        }, { if (gate.accepts(token)) perf.selectionReady() }), LinearLayout.LayoutParams(-1, 0, 1f))
+        layout.addView(selection, LinearLayout.LayoutParams(-1, 0, 1f))
         addPanel(layout, fullScreen = true)
     }
 
-    private fun recognize(bitmap: Bitmap, area: PixelBox) {
-        perf.release()
+    private fun recognize(bitmap: Bitmap, selection: HighlighterSelection) {
+        perf.selectionSubmit()
         val token = gate.next()
-        val slice = Bitmap.createBitmap(bitmap, area.left, area.top, area.width, area.height)
-        val crop = if (slice === bitmap) bitmap.copy(Bitmap.Config.ARGB_8888, false) else slice
+        val area = selection.crop
+        val crop = try {
+            val slice = Bitmap.createBitmap(bitmap, area.left, area.top, area.width, area.height)
+            // OCR owns its bitmap until completion, even if cancellation recycles the screenshot.
+            if (slice === bitmap) checkNotNull(bitmap.copy(Bitmap.Config.ARGB_8888, false)) else slice
+        } catch (e: Exception) {
+            perf.stage("ocr", "failed"); showMessage("无法准备识别画面：${e.message}"); return
+        }
         removePanelView()
         val pending = column().apply { setPadding(dp(24), dp(24), dp(24), dp(24)); background = shape(Paper.surface) }
-        pending.addView(text("正在本地识别…", 20f, bold = true))
+        pending.addView(text("正在本地识别笔迹附近的文字…", 20f, bold = true))
+        pending.addView(button("重新划选") { requestFrame() }); pending.space(8)
         pending.addView(button("取消") { dismissPanel(); showBubble() })
         addPanel(pending)
-        recognizer!!.process(InputImage.fromBitmap(crop, 0))
-            .addOnSuccessListener { result ->
-                if (sessionIsActive() && gate.accepts(token)) {
-                    val words = DemoDictionary.ocrWords(result.text)
-                    when (words.size) {
-                        0 -> { perf.stage("ocr_empty", "failed"); showMessage("没有识别到英文单词。请缩小到一个单词或手动纠错。", result.text) }
-                        1 -> lookup(words.first(), result.text)
-                        else -> { perf.stage("ocr_multiple", "needs_confirmation"); showChoices("识别到多个词，请确认一个", words.map { word -> word to { lookup(word, result.text) } }) }
+        if (!sessionIsActive() || !gate.accepts(token)) { crop.recycle(); return }
+        val task = try {
+            checkNotNull(recognizer).process(InputImage.fromBitmap(crop, 0))
+        } catch (e: Exception) {
+            crop.recycle()
+            if (sessionIsActive() && gate.accepts(token)) {
+                perf.stage("ocr", "failed"); showMessage("识别失败：${e.message}")
+            }
+            return
+        }
+        task.addOnSuccessListener { result ->
+            if (sessionIsActive() && gate.accepts(token)) {
+                var lineIndex = 0
+                val elements = buildList {
+                    result.textBlocks.forEach { block -> block.lines.forEach { line ->
+                        val index = lineIndex++
+                        val lineRect = line.boundingBox
+                        if (lineRect != null) {
+                            val lineBox = HighlighterGeometry.restoreBox(FloatBox(lineRect.left.toFloat(), lineRect.top.toFloat(),
+                                lineRect.right.toFloat(), lineRect.bottom.toFloat()), area)
+                            line.elements.forEach { element ->
+                                element.boundingBox?.let { box ->
+                                    add(HighlighterWord(element.text, HighlighterGeometry.restoreBox(FloatBox(box.left.toFloat(),
+                                        box.top.toFloat(), box.right.toFloat(), box.bottom.toFloat()), area), index, lineBox))
+                                }
+                            }
+                        }
+                    } }
+                }
+                val selected = HighlighterGeometry.hitWords(selection, elements)
+                val raw = HighlighterGeometry.selectedText(selected)
+                when {
+                    selected.isEmpty() -> {
+                        perf.stage("ocr_empty", "failed")
+                        showMessage("笔迹没有命中可识别文字。没有查询或新增记录；请沿字形重新划选，或手动纠错。")
+                    }
+                    selected.size == 1 && DemoDictionary.normalize(selected.first().text) != null -> lookup(selected.first().text, raw)
+                    else -> {
+                        perf.stage("ocr_multiple", "needs_confirmation")
+                        showSelectedText(raw, selected.map { it.text })
                     }
                 }
             }
-            .addOnFailureListener { e -> if (sessionIsActive() && gate.accepts(token)) { perf.stage("ocr", "failed"); showMessage("识别失败：${e.message}") } }
-            .addOnCompleteListener { crop.recycle() }
+        }.addOnFailureListener { e ->
+            if (sessionIsActive() && gate.accepts(token)) { perf.stage("ocr", "failed"); showMessage("识别失败：${e.message}") }
+        }.addOnCompleteListener { crop.recycle() }
+    }
+
+    private fun showSelectedText(raw: String, words: List<String>) {
+        gate.next()
+        val content = card("选中原文")
+        content.addView(text(raw, 18f)); content.space()
+        content.addView(text("译句未接入 · 请选择一个词查词；不会批量自动加入生词本。", 16f, Paper.warning)); content.space()
+        words.filter { DemoDictionary.normalize(it) != null }.distinct().forEach { word ->
+            content.addView(button("查词：$word") { lookup(word, raw) }); content.space(8)
+        }
+        content.addView(button("纠正选中文字") { showTextCorrection(raw) }); content.space(8)
+        content.addView(button("重新划选") { requestFrame() }); content.space(8)
+        content.addView(button("取消") { dismissPanel(); showBubble() })
+        addPanel(scroll(content))
+    }
+    private fun showTextCorrection(raw: String) {
+        gate.next()
+        val content = card("纠正选中文字")
+        content.addView(text("保留大小写、标点与换行；确认后仍需选择一个词查词。译句未接入。"))
+        val input = inputField("选中的原文").apply { setText(raw) }
+        content.addView(input)
+        content.addView(button("确认文字", true) {
+            val corrected = input.text.toString()
+            if (corrected.isBlank()) toast("选中文字不能为空；不会查询或入库")
+            else showSelectedText(corrected, corrected.split(Regex("\\s+")))
+        }); content.space(8)
+        content.addView(button("重新划选") { requestFrame() }); content.space(8)
+        content.addView(button("取消") { dismissPanel(); showBubble() })
+        addPanel(scroll(content))
     }
 
     private fun lookup(form: String, raw: String, replaces: String? = null) {
@@ -306,23 +382,28 @@ class CaptureService : Service() {
                     perf.stage("dictionary_ambiguity", "needs_confirmation")
                     showChoices("「${result.form}」存在词形歧义，请确认词头", result.entries.map { entry ->
                         "${entry.headword} · ${entry.meaning}" to { showDefinition(result.form, raw, entry, replaces) }
-                    })
+                    }, raw, replaces)
                 } else showDefinition(result.form, raw, result.entries.first(), replaces)
             }
         }
     }
-    private fun showChoices(title: String, choices: List<Pair<String, () -> Unit>>) {
+    private fun showChoices(title: String, choices: List<Pair<String, () -> Unit>>, raw: String, replaces: String?) {
         gate.next()
         val content = card(title)
+        content.addView(text("选中原文：\n$raw")); content.space()
         choices.forEach { (label, action) -> content.addView(button(label, action = action)); content.space(8) }
-        content.addView(button("关闭") { dismissPanel(); showBubble() })
+        content.addView(button("手动纠错") { showCorrection(raw, replaces) }); content.space(8)
+        content.addView(button("重新划选") { requestFrame() }); content.space(8)
+        content.addView(button("取消") { dismissPanel(); showBubble() })
         addPanel(scroll(content))
     }
     private fun showMessage(message: String, raw: String = "", replaces: String? = null) {
         gate.next()
         val content = card("取词提示")
         content.addView(text(message, 16f, Paper.warning)); content.space()
+        if (raw.isNotBlank()) { content.addView(text("选中原文：\n$raw")); content.space() }
         content.addView(button("手动纠错") { showCorrection(raw, replaces) }); content.space(8)
+        content.addView(button("重新划选") { requestFrame() }); content.space(8)
         content.addView(button("返回做题") { dismissPanel(); showBubble() })
         addPanel(scroll(content))
     }
@@ -333,7 +414,8 @@ class CaptureService : Service() {
         val input = EditText(this).apply { setText(raw); hint = "一个英文单词"; setSingleLine(true) }
         content.addView(input)
         content.addView(button("确认查询", true) { lookup(input.text.toString(), originalRaw, replaces) }); content.space(8)
-        content.addView(button("关闭") { dismissPanel(); showBubble() })
+        content.addView(button("重新划选") { requestFrame() }); content.space(8)
+        content.addView(button("取消") { dismissPanel(); showBubble() })
         addPanel(scroll(content))
     }
 
@@ -342,6 +424,7 @@ class CaptureService : Service() {
         val event = QueryEvent(UUID.randomUUID().toString(), entry.key, raw, form, System.currentTimeMillis())
         val content = card(entry.headword)
         content.addView(text("原词形：$form · ${entry.partOfSpeech}"))
+        content.addView(text("选中原文：\n$raw"))
         content.addView(text(entry.meaning, 18f)); content.space()
         content.addView(text("演示词库 · ${DemoDictionary.SOURCE}\n${DemoDictionary.VERSION}", 14f, Paper.warning))
         val status = text("保存中…", 16f, Paper.secondary)
@@ -351,6 +434,7 @@ class CaptureService : Service() {
         val retry = button("重试保存") {}
         undo.isEnabled = false; correct.isEnabled = false; retry.visibility = View.GONE
         content.addView(undo); content.space(8); content.addView(correct); content.space(8); content.addView(retry); content.space(8)
+        content.addView(button("重新划选") { requestFrame() }); content.space(8)
         content.addView(button("返回做题", true) { dismissPanel(); showBubble() })
         addPanel(scroll(content))
         val drawListener = object : ViewTreeObserver.OnDrawListener {

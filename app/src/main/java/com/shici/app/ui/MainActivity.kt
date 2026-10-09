@@ -31,7 +31,6 @@ class MainActivity : Activity() {
         private const val OVERLAY_PERMISSION = 10
         private const val CAPTURE_PERMISSION = 11
         private const val NOTIFICATION_PERMISSION = 12
-        private const val EXPORT_FILE = 13
     }
     private val app get() = application as ShiciApplication
     private val main = Handler(Looper.getMainLooper())
@@ -44,10 +43,14 @@ class MainActivity : Activity() {
     private var search = ""
     private var selectedKey: String? = null
     private var consentGeneration = -1L
-    private var renderGeneration = 0
-    private var pendingExport: List<LearnedWord>? = null
-    private var exportDate: LocalDate? = null
-    private var exporting = false
+    private val refreshGate = LearningRefreshGate()
+    private val exportSession = LearningExportSession()
+    private var lostExportRequestCode = -1
+    private var exportDialog: AlertDialog? = null
+    private var exportButton: Button? = null
+    private var inlineDetail: WordDetailBinding? = null
+    private var dialogDetail: WordDetailBinding? = null
+    private val dataListener: (Long) -> Unit = { version -> main.post { refresh(version) } }
     private var floatingSwitch: Switch? = null
     private var floatingText: TextView? = null
     private var syncSwitch = false
@@ -85,14 +88,33 @@ class MainActivity : Activity() {
         currentTab = savedInstanceState?.getInt("tab") ?: 0
         search = savedInstanceState?.getString("search") ?: ""
         consentGeneration = savedInstanceState?.getLong("consent", -1L) ?: -1L
+        lostExportRequestCode = savedInstanceState?.getInt("export_request", -1) ?: -1
+        if (lostExportRequestCode >= 0) LearningExportSession.reserveRequestCode(lostExportRequestCode)
         buildShell()
     }
-    override fun onStart() { super.onStart(); CaptureStatus.observe(statusListener); refresh() }
-    override fun onStop() { CaptureStatus.remove(statusListener); super.onStop() }
-    override fun onDestroy() { demoGate.next(); activeDialog?.dismiss(); activeDialog = null; renderGeneration += 1; super.onDestroy() }
+    override fun onStart() {
+        super.onStart()
+        refreshGate.start()
+        CaptureStatus.observe(statusListener)
+        app.repository.changes.observe(dataListener)
+        refresh()
+    }
+    override fun onStop() {
+        app.repository.changes.remove(dataListener)
+        refreshGate.stop()
+        if (exportSession.cancelPreparation()) { exportDialog?.dismiss(); updateExportButton() }
+        CaptureStatus.remove(statusListener)
+        super.onStop()
+    }
+    override fun onDestroy() {
+        refreshGate.stop(); exportSession.clear(); demoGate.next()
+        activeDialog?.dismiss(); activeDialog = null
+        super.onDestroy()
+    }
     override fun onSaveInstanceState(outState: Bundle) {
         outState.putInt("tab", currentTab); outState.putString("search", search)
         outState.putLong("consent", consentGeneration)
+        outState.putInt("export_request", exportSession.fileRequestCode ?: lostExportRequestCode)
         super.onSaveInstanceState(outState)
     }
 
@@ -131,24 +153,31 @@ class MainActivity : Activity() {
         render()
     }
 
-    private fun refresh() {
-        val revision = ++renderGeneration
+    private fun refresh(version: Long = app.repository.changes.version, force: Boolean = false) {
+        val request = refreshGate.request(version, force) ?: return
         app.worker.execute {
-            val result = runCatching {
-                val list = app.repository.words()
-                list to LearningRules.summarize(list, app.repository.events(), LocalDate.now(), ZoneId.systemDefault())
-            }
+            val result = runCatching { app.repository.snapshot() }
             main.post {
-                if (!isDestroyed && revision == renderGeneration) {
-                    result.onSuccess { (list, summary) -> words = list; stats = summary; render() }
-                        .onFailure { toast("读取失败：${it.message}") }
-                }
+                if (isDestroyed || !refreshGate.isCurrent(request)) return@post
+                result.onSuccess { snapshot ->
+                    if (!refreshGate.accept(request, snapshot.version, app.repository.changes.version)) {
+                        refresh(); return@onSuccess
+                    }
+                    words = snapshot.words; stats = snapshot.stats
+                    dialogDetail?.update(words.firstOrNull { it.entry.key == dialogDetail?.key })
+                    when (currentTab) {
+                        1 -> { renderWords(preserveDetail = true); updateExportButton() }
+                        3 -> Unit // Keep an in-progress demo/correction input intact.
+                        else -> render()
+                    }
+                }.onFailure { toast("读取失败：${it.message}") }
             }
         }
     }
 
     private fun render() {
         floatingSwitch = null; floatingText = null; stopCaptureButton = null; searchList = null; detailPanel = null
+        exportButton = null; inlineDetail = null
         body.removeAllViews()
         val navOffset = if (wide) 3 else 0
         repeat(4) { index ->
@@ -186,7 +215,7 @@ class MainActivity : Activity() {
         session.addView(heading)
         floatingText = text(CaptureStatus.state.message, 16f, Paper.secondary)
         session.addView(floatingText)
-        session.addView(text("开启后，可在题目页面框选查词", 16f, Paper.secondary))
+        session.addView(text("开启后，可在题目页面用荧光笔划选查词", 16f, Paper.secondary))
         session.divider()
         val numbers = row()
         addMetric(numbers, "今日查询", stats.todayQueries); addMetric(numbers, "今日新增", stats.todayNew)
@@ -206,7 +235,7 @@ class MainActivity : Activity() {
             addView(text("仅 ${DemoDictionary.entries.size} 个自编示例词条。未收录不生成，不是牛津或正式考研词库。", 16f, Paper.secondary))
         }
         content.addView(demo); content.space()
-        content.addView(text("打开悬浮查词 → 回到题目 → 框选单词", 16f, Paper.secondary))
+        content.addView(text("打开悬浮查词 → 划过文字 → 完成", 16f, Paper.secondary))
         statusListener(CaptureStatus.state)
     }
     private fun addMetric(row: LinearLayout, label: String, value: Int) {
@@ -220,7 +249,8 @@ class MainActivity : Activity() {
         val header = (if (inline) row() else column()).apply { gravity = Gravity.CENTER_VERTICAL }
         header.addView(text("生词本", 28f, bold = true),
             if (inline) LinearLayout.LayoutParams(0, -2, 1f) else LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
-        val exportButton = button("导出 PDF", true) { export() }.apply { isEnabled = filteredWords().isNotEmpty() && !exporting }
+        exportButton = button("导出 PDF", true) { export() }
+        updateExportButton()
         header.addView(exportButton, LinearLayout.LayoutParams(if (inline) -2 else -1, -2))
         content.addView(header); content.space(16)
         val input = inputField("搜索单词、释义或笔记", true).apply { setText(search) }
@@ -236,7 +266,7 @@ class MainActivity : Activity() {
         input.addTextChangedListener(object : TextWatcher {
             override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
             override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
-                search = s.toString(); exportButton.isEnabled = filteredWords().isNotEmpty() && !exporting
+                search = s.toString(); updateExportButton()
                 renderWords()
             }
             override fun afterTextChanged(s: Editable?) {}
@@ -245,7 +275,11 @@ class MainActivity : Activity() {
     }
     private fun filteredWords() = words.filter { word -> search.isBlank() ||
         listOf(word.entry.headword, word.entry.meaning, word.lastForm, word.note).any { it.contains(search.trim(), true) } }
-    private fun renderWords() {
+    private fun updateExportButton() {
+        // Eligibility is checked against a fresh repository read, never against the UI cache.
+        exportButton?.isEnabled = !exportSession.busy && lostExportRequestCode < 0
+    }
+    private fun renderWords(preserveDetail: Boolean = false) {
         val list = filteredWords()
         searchList?.removeAllViews()
         searchList?.addView(text("${list.size} 个词 · 最近查询优先", 14f, Paper.secondary))
@@ -260,13 +294,18 @@ class MainActivity : Activity() {
             searchList?.divider()
         }
         detailPanel?.let { detail ->
+            if (preserveDetail && inlineDetail != null) {
+                inlineDetail?.update(words.firstOrNull { it.entry.key == inlineDetail?.key })
+                return@let
+            }
+            inlineDetail = null
             detail.removeAllViews()
             val selected = list.firstOrNull { it.entry.key == selectedKey } ?: list.firstOrNull()
             if (selected == null) detail.addView(text("选择一个生词，查看释义和记录", 18f, Paper.secondary))
             else {
                 selectedKey = selected.entry.key
                 detail.addView(text("生词详情", 18f, bold = true)); detail.space(12)
-                val card = panel(); detail.addView(card); wordDetail(card, selected)
+                val card = panel(); detail.addView(card); inlineDetail = wordDetail(card, selected)
             }
         }
     }
@@ -277,17 +316,36 @@ class MainActivity : Activity() {
         addView(text("查询 ${word.queryCount} 次 · ${if (word.mastered) "已掌握" else "待复习"}", 14f, Paper.secondary))
         isClickable = true; isFocusable = true; setOnClickListener { action() }
     }
-    private fun wordDetail(content: LinearLayout, word: LearnedWord, close: (() -> Unit)? = null) {
+    private class WordDetailBinding(
+        val key: String, private val form: TextView, private val count: TextView, private val dates: TextView,
+        private val mastery: Switch, private val note: EditText, private val undo: Button,
+        private var savedMastered: Boolean, private var savedNote: String
+    ) {
+        fun update(word: LearnedWord?) {
+            form.text = if (word == null) "原词形：暂无有效查询" else "原词形：${word.lastForm}"
+            count.text = "${word?.queryCount ?: 0} 次"
+            undo.isEnabled = word != null
+            if (word == null) { dates.text = "当前已无有效查询；已保存的笔记仍保留。"; return }
+            val formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")
+            fun date(time: Long) = Instant.ofEpochMilli(time).atZone(ZoneId.systemDefault()).format(formatter)
+            dates.text = "首次查询：${date(word.firstAt)}\n最近查询：${date(word.lastAt)}"
+            if (note.text.toString() == savedNote && savedNote != word.note) note.setText(word.note)
+            if (mastery.isChecked == savedMastered) mastery.isChecked = word.mastered
+            savedNote = word.note; savedMastered = word.mastered
+        }
+    }
+    private fun wordDetail(content: LinearLayout, word: LearnedWord, close: (() -> Unit)? = null): WordDetailBinding {
         val detailWidth = if (close != null) minOf(resources.configuration.screenWidthDp - 32, 640)
             else (contentWidthDp * 0.56f).toInt() - 24
         content.addView(text(word.entry.headword, 30f, bold = true).apply { typeface = Typeface.create("serif", Typeface.BOLD) })
         content.addView(text("${word.entry.partOfSpeech} ${word.entry.meaning}", 18f)); content.space(8)
         content.addView(badge("演示词库"), LinearLayout.LayoutParams(-2, -2)); content.divider()
-        content.addView(text("原词形：${word.lastForm}", 16f, Paper.secondary))
+        val form = text("原词形：${word.lastForm}", 16f, Paper.secondary)
+        content.addView(form)
         content.addView(text("来源：${word.source} · ${word.version}", 16f, Paper.secondary)); content.space(16)
+        val count = text("${word.queryCount} 次", 28f, bold = true)
         val queries = column().apply {
-            addView(text("查询次数", 16f, Paper.secondary))
-            addView(text("${word.queryCount} 次", 28f, bold = true))
+            addView(text("查询次数", 16f, Paper.secondary)); addView(count)
         }
         val mastered = Switch(this).apply {
             text = if (word.mastered) "已掌握" else "待复习"; textSize = 16f; setTextColor(Paper.ink)
@@ -300,7 +358,8 @@ class MainActivity : Activity() {
         }
         content.addView(pair(queries, mastery, inlineAt(detailWidth - 48)))
         content.space(12)
-        content.addView(text("首次查询：${date(word.firstAt)}\n最近查询：${date(word.lastAt)}", 16f, Paper.secondary))
+        val dates = text("首次查询：${date(word.firstAt)}\n最近查询：${date(word.lastAt)}", 16f, Paper.secondary)
+        content.addView(dates)
         content.divider()
         content.addView(text("我的记忆笔记", 18f, bold = true)); content.space(8)
         val note = inputField("添加自己的记忆方法或做题提示…").apply {
@@ -312,12 +371,13 @@ class MainActivity : Activity() {
             val noteText = note.text.toString()
             app.worker.execute {
                 val error = runCatching { app.repository.updateWord(word.entry.key, marked, noteText) }.exceptionOrNull()
-                main.post { if (!isDestroyed) { if (error == null) { toast("已保存"); close?.invoke(); refresh() } else toast("保存失败：${error.message}") } }
+                main.post { if (!isDestroyed) { if (error == null) { toast("已保存"); close?.invoke() } else toast("保存失败：${error.message}") } }
             }
         }
         val undo = button("撤销最近一次查询") { revokeLast(word, close) }
         content.addView(pair(save, undo, inlineAt(detailWidth - 48), 8)); content.space(8)
         content.addView(text("撤销只影响最近一次成功查询；之前的查询与已保存的笔记保留。", 16f, Paper.secondary))
+        return WordDetailBinding(word.entry.key, form, count, dates, mastered, note, undo, word.mastered, word.note)
     }
     private fun revokeLast(word: LearnedWord, close: (() -> Unit)?) {
         AlertDialog.Builder(this).setTitle("撤销最近一次查询？")
@@ -329,7 +389,7 @@ class MainActivity : Activity() {
                         app.repository.revoke(id)
                     }.exceptionOrNull()
                     main.post { if (!isDestroyed) {
-                        if (error == null) { close?.invoke(); refresh(); toast("最近一次查询已撤销") }
+                        if (error == null) { close?.invoke(); toast("最近一次查询已撤销") }
                         else toast("撤销失败：${error.message}")
                     } }
                 }
@@ -342,20 +402,21 @@ class MainActivity : Activity() {
         header.addView(text("生词详情", 18f, bold = true), LinearLayout.LayoutParams(0, -2, 1f))
         header.addView(button("关闭") { dialog.dismiss() }.apply { contentDescription = "关闭生词详情" })
         content.addView(header); content.divider()
-        wordDetail(content, word) { dialog.dismiss() }
-        showPaperDialog(dialog, 640)
+        val binding = wordDetail(content, word) { dialog.dismiss() }
+        showPaperDialog(dialog, 640) { if (dialogDetail === binding) dialogDetail = null }
+        dialogDetail = binding
     }
     private fun paperDialog(content: LinearLayout): AlertDialog = AlertDialog.Builder(this).create().apply {
         setView(ScrollView(this@MainActivity).apply { addView(content) }, 0, 0, 0, 0)
     }
-    private fun showPaperDialog(dialog: AlertDialog, maxWidth: Int) {
+    private fun showPaperDialog(dialog: AlertDialog, maxWidth: Int, onDismiss: () -> Unit = {}) {
         activeDialog?.dismiss(); activeDialog = dialog; dialog.show()
         dialog.window?.apply {
             setBackgroundDrawable(shape(Paper.surface, border = true))
             setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
             setLayout(dp(minOf(resources.configuration.screenWidthDp - 32, maxWidth)), ViewGroup.LayoutParams.WRAP_CONTENT)
         }
-        dialog.setOnDismissListener { if (activeDialog === dialog) activeDialog = null }
+        dialog.setOnDismissListener { if (activeDialog === dialog) activeDialog = null; onDismiss() }
     }
     private fun statisticMetrics(values: List<Pair<String, Int>>, inline: Boolean): LinearLayout {
         val metrics = if (inline) row() else column()
@@ -379,7 +440,7 @@ class MainActivity : Activity() {
             addView(text("只记录你的真实查询。", 16f, Paper.secondary))
         }
         header.addView(heading, if (inline) LinearLayout.LayoutParams(0, -2, 1f) else LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(12) })
-        header.addView(button("刷新统计", true) { refresh() }, LinearLayout.LayoutParams(if (inline) -2 else -1, -2))
+        header.addView(button("刷新统计", true) { refresh(force = true) }, LinearLayout.LayoutParams(if (inline) -2 else -1, -2))
         content.addView(header); content.space(24)
         val queries = panel().apply {
             addView(statisticMetrics(listOf("今日查询" to stats.todayQueries, "今日新增" to stats.todayNew,
@@ -444,12 +505,12 @@ class MainActivity : Activity() {
             addView(text("仅用于在其他应用上显示查词浮层。这是权限状态展示，不是授权开关。", 16f, Paper.secondary)); divider()
             addView(text("查词会话", 18f, bold = true))
             floatingText = text(CaptureStatus.state.message, 16f, Paper.secondary); addView(floatingText)
-            addView(text("只在首页主动开启时申请悬浮窗、屏幕捕获及通知权限。全屏捕获可看到整个屏幕；框选时的静态画面不会暂停题目计时。", 16f, Paper.secondary)); space(12)
+            addView(text("只在首页主动开启时申请悬浮窗、屏幕捕获及通知权限。全屏捕获可看到整个屏幕；荧光笔划选时的静态画面不会暂停题目计时。", 16f, Paper.secondary)); space(12)
             stopCaptureButton = button("关闭悬浮查词") { stopCapture(); toast("已请求停止查词") }
             addView(stopCaptureButton); space(8)
             addView(text("关闭会释放捕获和浮层，不会撤销系统悬浮窗权限。若需撤销，请在系统设置中操作。", 16f, Paper.secondary)); divider()
             addView(text("数据保存在本机", 18f, bold = true))
-            addView(text("截图仅临时保存在内存；框选区域在本机识别，不写截图文件、不上传。查询记录、释义快照、个人笔记与掌握状态保存在本机数据库。PDF 写入你选择的位置。", 16f, Paper.secondary))
+            addView(text("截图仅临时保存在内存；荧光笔划选可累积多笔，点“完成”后在本机识别；多个词可选一个查词，尚无翻译。不写截图文件、不上传。查询记录、释义快照、个人笔记与掌握状态保存在本机数据库。PDF 写入你选择的位置。", 16f, Paper.secondary))
         }
         boundaries.addView(privacy); boundaries.space(16)
         val limits = panel().apply {
@@ -467,7 +528,7 @@ class MainActivity : Activity() {
             CaptureStatus.state.phase == CapturePhase.STOPPING) { statusListener(CaptureStatus.state); return }
         consentGeneration = CaptureStatus.prepare()
         AlertDialog.Builder(this).setTitle("开启全屏悬浮查词")
-            .setMessage("系统会授予本工具整个屏幕的捕获权限。截图仅临时保存在内存，在本机识别，不上传；框选时显示的静态画面不会暂停题目或视频。关闭开关或通知中的停止会释放捕获和浮层。")
+            .setMessage("系统会授予本工具整个屏幕的捕获权限。截图仅临时保存在内存，在本机识别，不上传；荧光笔划选时显示的静态画面不会暂停题目或视频。关闭开关或通知中的停止会释放捕获和浮层。")
             .setPositiveButton("继续") { _, _ ->
                 if (consentIsCurrent()) {
                     if (!Settings.canDrawOverlays(this)) {
@@ -514,11 +575,16 @@ class MainActivity : Activity() {
                     runCatching { startForegroundService(intent) }.onFailure { permissionError("无法启动捕获服务：${it.message}") }
                 } else permissionError("已取消屏幕捕获，查词未开启")
             }
-            EXPORT_FILE -> {
-                val snapshot = pendingExport; pendingExport = null
-                val frozenDate = exportDate ?: LocalDate.now(); exportDate = null
-                if (resultCode == RESULT_OK && data?.data != null && snapshot != null) savePdf(data.data!!, snapshot, frozenDate)
-                else { exporting = false; toast(if (snapshot == null && resultCode == RESULT_OK) "导出状态因重建丢失，请重新导出；没有写入文件" else "已取消导出"); render() }
+            else -> if (requestCode == lostExportRequestCode) {
+                lostExportRequestCode = -1
+                toast("导出状态因重建丢失，请重新导出；没有写入文件")
+                updateExportButton()
+            } else if (requestCode == exportSession.fileRequestCode) {
+                val snapshot = exportSession.takeResult(requestCode) ?: return
+                if (resultCode == RESULT_OK && data?.data != null) savePdf(data.data!!, snapshot, requestCode)
+                else {
+                    exportSession.cancel(requestCode); toast("已取消导出"); updateExportButton()
+                }
             }
         }
     }
@@ -563,7 +629,6 @@ class MainActivity : Activity() {
                         undo.isEnabled = error == null; correct.isEnabled = error == null
                         retry.visibility = if (error == null) View.GONE else View.VISIBLE
                     }
-                    if (!isDestroyed) refresh()
                 }
             }
         }
@@ -577,7 +642,6 @@ class MainActivity : Activity() {
                         status.text = if (error == null) "本次已撤销，历史查询保留" else "撤销失败：${error.message}"
                         if (error == null) undo.text = "已撤销" else { undo.isEnabled = true; correct.isEnabled = true }
                     }
-                    if (!isDestroyed) refresh()
                 }
             }
         }
@@ -590,14 +654,30 @@ class MainActivity : Activity() {
         save()
     }
     private fun export() {
-        if (exporting) return
-        val snapshot = filteredWords().toList()
-        if (snapshot.isEmpty()) { toast("没有可导出的生词"); return }
-        val frozenDate = LocalDate.now()
+        if (lostExportRequestCode >= 0) return
+        val request = exportSession.begin(search) ?: return
+        updateExportButton()
+        app.worker.execute {
+            val result = runCatching { app.repository.exportSnapshot(request.search) }
+            main.post {
+                if (isDestroyed) return@post
+                result.onSuccess { snapshot ->
+                    if (!exportSession.freeze(request, snapshot)) return@onSuccess
+                    if (snapshot.words.isEmpty()) {
+                        exportSession.cancel(request.id); updateExportButton(); toast("没有可导出的生词")
+                    } else confirmExport(request, snapshot)
+                }.onFailure {
+                    if (exportSession.cancel(request.id)) { updateExportButton(); toast("读取导出数据失败：${it.message}") }
+                }
+            }
+        }
+    }
+    private fun confirmExport(request: LearningExportSession.Request, snapshot: LearningExportSnapshot) {
         val content = panel()
         val dialog = paperDialog(content)
         content.addView(text("导出生词记忆单", 24f, bold = true)); content.space(12)
-        content.addView(text("当前搜索结果 · ${snapshot.size} 个单词", 18f))
+        content.addView(text("当前搜索结果 · ${snapshot.words.size} 个单词", 18f))
+        if (snapshot.search.isNotBlank()) content.addView(text("搜索条件：${snapshot.search}", 16f, Paper.secondary))
         content.addView(text("A4 · 记忆版 · 最近查询优先", 16f, Paper.secondary)); content.space(16)
         val notice = column().apply {
             setPadding(dp(16), dp(12), dp(16), dp(12)); background = shape(Paper.background, 8)
@@ -605,30 +685,35 @@ class MainActivity : Activity() {
             addView(text("使用自编演示词库，不是牛津或正式考研词典。导出包含词头、释义、原词形、查询次数、掌握状态和已保存的笔记，不包含自测题。", 16f, Paper.secondary))
         }
         content.addView(notice); content.space(12)
-        content.addView(text("按此刻的搜索结果冻结内容；尚未保存的笔记与状态不会导出。取消不会创建导出文件。", 16f, Paper.secondary)); content.space(24)
+        content.addView(text("已从数据库读取并按本次搜索条件冻结内容；尚未保存的笔记与状态不会导出。取消不会创建导出文件。", 16f, Paper.secondary)); content.space(24)
         val cancel = button("取消") { dialog.dismiss() }.apply { background = shape(Paper.background, 8); setTextColor(Paper.ink) }
         val choose = button("选择保存位置", true) {
-            if (!exporting) {
-                dialog.dismiss()
-                exporting = true; pendingExport = snapshot; exportDate = frozenDate
-                val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE)
-                    .setType("application/pdf").putExtra(Intent.EXTRA_TITLE, "拾词-生词记忆单-${exportDate}.pdf")
-                runCatching { startActivityForResult(intent, EXPORT_FILE) }.onFailure {
-                    pendingExport = null; exportDate = null; exporting = false; toast("无法打开文件保存：${it.message}")
-                }
-                render()
+            val frozen = exportSession.choose(request) ?: return@button
+            dialog.dismiss()
+            val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE)
+                .setType("application/pdf").putExtra(Intent.EXTRA_TITLE, "拾词-生词记忆单-${frozen.date}.pdf")
+            runCatching { startActivityForResult(intent, request.id) }.onFailure {
+                exportSession.cancel(request.id); toast("无法打开文件保存：${it.message}")
             }
+            updateExportButton()
         }
         content.addView(pair(cancel, choose, inlineAt(minOf(resources.configuration.screenWidthDp - 32, 560) - 48), 12))
-        showPaperDialog(dialog, 560)
+        showPaperDialog(dialog, 560) {
+            if (exportDialog === dialog) exportDialog = null
+            if (exportSession.cancelPreparation(request.id)) updateExportButton()
+        }
+        exportDialog = dialog
     }
-    private fun savePdf(uri: Uri, snapshot: List<LearnedWord>, date: LocalDate) {
+    private fun savePdf(uri: Uri, snapshot: LearningExportSnapshot, requestCode: Int) {
         app.worker.execute {
             val error = runCatching {
                 val output = contentResolver.openOutputStream(uri, "wt") ?: error("无法写入所选位置")
-                output.use { PdfExporter.write(snapshot, it, date) }
+                output.use { PdfExporter.write(snapshot.words, it, snapshot.date) }
             }.exceptionOrNull()
-            main.post { if (!isDestroyed) { exporting = false; toast(if (error == null) "PDF 已写入所选位置" else "导出失败：${error.message}；目标文件可能不完整，请删除后重试"); render() } }
+            main.post { if (!isDestroyed && exportSession.cancel(requestCode)) {
+                toast(if (error == null) "PDF 已写入所选位置" else "导出失败：${error.message}；目标文件可能不完整，请删除后重试")
+                updateExportButton()
+            } }
         }
     }
     private fun date(time: Long) = Instant.ofEpochMilli(time).atZone(ZoneId.systemDefault()).format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm"))
