@@ -22,6 +22,7 @@ import com.shici.app.ShiciApplication
 import com.shici.app.capture.*
 import com.shici.app.core.*
 import com.shici.app.export.PdfExporter
+import com.shici.app.export.LostPdfFileCleanup
 import java.time.*
 import java.time.format.DateTimeFormatter
 import java.util.UUID
@@ -46,6 +47,7 @@ class MainActivity : Activity() {
     private val refreshGate = LearningRefreshGate()
     private val exportSession = LearningExportSession()
     private var lostExportRequestCode = -1
+    private var cleaningLostExport = false
     private var exportDialog: AlertDialog? = null
     private var exportButton: Button? = null
     private var inlineDetail: WordDetailBinding? = null
@@ -277,7 +279,7 @@ class MainActivity : Activity() {
         listOf(word.entry.headword, word.entry.meaning, word.lastForm, word.note).any { it.contains(search.trim(), true) } }
     private fun updateExportButton() {
         // Eligibility is checked against a fresh repository read, never against the UI cache.
-        exportButton?.isEnabled = !exportSession.busy && lostExportRequestCode < 0
+        exportButton?.isEnabled = !exportSession.busy && lostExportRequestCode < 0 && !cleaningLostExport
     }
     private fun renderWords(preserveDetail: Boolean = false) {
         val list = filteredWords()
@@ -575,10 +577,12 @@ class MainActivity : Activity() {
                     runCatching { startForegroundService(intent) }.onFailure { permissionError("无法启动捕获服务：${it.message}") }
                 } else permissionError("已取消屏幕捕获，查词未开启")
             }
-            else -> if (requestCode == lostExportRequestCode) {
+            else -> if (lostExportRequestCode >= 0 && requestCode == lostExportRequestCode) {
+                // Consume before IO: another recreation must not wait for this result again.
                 lostExportRequestCode = -1
-                toast("导出状态因重建丢失，请重新导出；没有写入文件")
-                updateExportButton()
+                if (resultCode != RESULT_OK) { toast("已取消导出"); updateExportButton() }
+                else if (data?.data == null) { toast(PdfPlaceholderCleanup.Result.NO_URI.message); updateExportButton() }
+                else cleanLostPdf(data.data!!)
             } else if (requestCode == exportSession.fileRequestCode) {
                 val snapshot = exportSession.takeResult(requestCode) ?: return
                 if (resultCode == RESULT_OK && data?.data != null) savePdf(data.data!!, snapshot, requestCode)
@@ -654,7 +658,7 @@ class MainActivity : Activity() {
         save()
     }
     private fun export() {
-        if (lostExportRequestCode >= 0) return
+        if (lostExportRequestCode >= 0 || cleaningLostExport) return
         val request = exportSession.begin(search) ?: return
         updateExportButton()
         app.worker.execute {
@@ -703,6 +707,20 @@ class MainActivity : Activity() {
             if (exportSession.cancelPreparation(request.id)) updateExportButton()
         }
         exportDialog = dialog
+    }
+    private fun cleanLostPdf(uri: Uri) {
+        cleaningLostExport = true
+        updateExportButton()
+        val resolver = applicationContext.contentResolver
+        app.worker.execute {
+            val result = LostPdfFileCleanup.clean(resolver, uri)
+            main.post {
+                if (isDestroyed || isFinishing) return@post
+                cleaningLostExport = false
+                toast(result.message)
+                updateExportButton()
+            }
+        }
     }
     private fun savePdf(uri: Uri, snapshot: LearningExportSnapshot, requestCode: Int) {
         app.worker.execute {

@@ -7,6 +7,7 @@ import android.content.res.Configuration
 import android.graphics.*
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
+import android.media.Image
 import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
@@ -42,7 +43,7 @@ class CaptureService : Service() {
     private lateinit var frames: Handler
     private var projection: MediaProjection? = null
     private var display: VirtualDisplay? = null
-    private var reader: ImageReader? = null
+    @Volatile private var reader: ImageReader? = null
     private var recognizer: TextRecognizer? = null
     private var bubble: View? = null
     private var panel: View? = null
@@ -54,8 +55,8 @@ class CaptureService : Service() {
     private var bubbleX = 20
     private var bubbleY = 160
     @Volatile private var stopped = false
-    private val requestedToken = AtomicReference<Long?>(null)
-    @Volatile private var frameAfter = Long.MAX_VALUE
+    private val requestedFrame = AtomicReference<FreshFrameRequest?>(null)
+    private var frameTimeout: Runnable? = null
     private val app get() = application as ShiciApplication
 
     override fun onCreate() {
@@ -132,30 +133,57 @@ class CaptureService : Service() {
         setOnImageAvailableListener({ source ->
             val image = try { source.acquireLatestImage() } catch (_: IllegalStateException) { null }
             if (image != null) {
-                val token = requestedToken.get()
+                val request = requestedFrame.get()
+                var bitmap: Bitmap? = null
                 try {
-                    if (sessionIsActive() && token != null && gate.accepts(token) && image.timestamp >= frameAfter && requestedToken.compareAndSet(token, null)) {
-                        val plane = image.planes[0]
-                        val paddedWidth = plane.rowStride / plane.pixelStride
-                        val padded = Bitmap.createBitmap(paddedWidth, image.height, Bitmap.Config.ARGB_8888)
-                        padded.copyPixelsFromBuffer(plane.buffer)
-                        val bitmap = Bitmap.createBitmap(padded, 0, 0, image.width, image.height)
-                        if (bitmap !== padded) padded.recycle()
-                        main.post {
-                            if (sessionIsActive() && gate.accepts(token)) {
-                                main.removeCallbacks(frameTimeout)
-                                screenshot = bitmap
-                                showSelection(token, bitmap)
-                            } else bitmap.recycle()
+                    if (request != null && source === reader && image.width == source.width && image.height == source.height &&
+                        frameIsCurrent(request) &&
+                        request.canInspect(image.timestamp, SystemClock.elapsedRealtime())) {
+                        val captured = imageBitmap(image)
+                        bitmap = captured
+                        val black = FrameContent.isClearlyBlack(captured.width, captured.height, request.body) { x, y, row ->
+                            captured.getPixels(row, 0, row.size, x, y, row.size, 1)
+                        }
+                        val firstBlack = black && !request.rejectedBlack
+                        if (request.offer(image.timestamp, SystemClock.elapsedRealtime(), black)) {
+                            if (main.post {
+                                if (source === reader && frameIsCurrent(request) &&
+                                    request.complete(SystemClock.elapsedRealtime()) && requestedFrame.compareAndSet(request, null)) {
+                                    clearFrameTimeout()
+                                    screenshot = captured
+                                    showSelection(request.token, captured)
+                                } else {
+                                    captured.recycle()
+                                    if (frameIsCurrent(request)) expireFrame(request)
+                                }
+                            }) bitmap = null // The main-thread callback now owns this bitmap.
+                        } else if (firstBlack && request.rejectedBlack) {
+                            main.post { if (frameIsCurrent(request)) perf.stage("frame_rejected", "black") }
                         }
                     }
                 } catch (e: Exception) {
-                    if (token != null) requestedToken.compareAndSet(token, null)
-                    main.post { if (sessionIsActive() && token != null && gate.accepts(token)) { perf.end("failed", "frame_conversion"); dismissPanel(); showMessage("取词失败：${e.message}") } }
-                } finally { image.close() }
+                    main.post {
+                        if (request != null && frameIsCurrent(request)) {
+                            perf.end("failed", "frame_conversion")
+                            dismissPanel()
+                            showMessage("取词失败：${e.message}")
+                        }
+                    }
+                } finally { bitmap?.recycle(); image.close() }
             }
         }, frames)
         }
+    }
+
+    private fun imageBitmap(image: Image): Bitmap {
+        val plane = image.planes[0]
+        val padded = Bitmap.createBitmap(plane.rowStride / plane.pixelStride, image.height, Bitmap.Config.ARGB_8888)
+        var bitmap: Bitmap? = null
+        try {
+            padded.copyPixelsFromBuffer(plane.buffer)
+            bitmap = Bitmap.createBitmap(padded, 0, 0, image.width, image.height)
+            return bitmap
+        } finally { if (bitmap !== padded) padded.recycle() }
     }
 
     private fun resize(width: Int, height: Int) {
@@ -189,28 +217,52 @@ class CaptureService : Service() {
         }
     }
 
-    private val frameTimeout = Runnable {
-        if (!stopped && requestedToken.get() != null) {
-            requestedToken.set(null); gate.next()
-            perf.end("failed", "frame_timeout")
-            showMessage("未收到新的屏幕画面。安全页面可能禁止截图；不会复用旧截图。请关闭取词后重试。")
+    private fun frameIsCurrent(request: FreshFrameRequest): Boolean =
+        sessionIsActive() && requestedFrame.get() === request && gate.accepts(request.token)
+
+    private fun clearFrameTimeout() {
+        frameTimeout?.let { main.removeCallbacks(it) }
+        frameTimeout = null
+    }
+    private fun expireFrame(request: FreshFrameRequest) {
+        if (frameIsCurrent(request) && requestedFrame.compareAndSet(request, null)) {
+            request.cancel(); gate.next(); clearFrameTimeout()
+            perf.end("failed", if (request.rejectedBlack) "frame_black_timeout" else "frame_timeout")
+            showMessage(if (request.rejectedBlack)
+                "已丢弃主体黑帧，等待有效新画面超时。页面可能尚未就绪或禁止截图；不会复用旧截图或绕过保护。请返回做题后重试。"
+                else "未收到新的有效屏幕画面。安全页面可能禁止截图；不会复用旧截图。请返回做题后重试。")
         }
     }
+
+    @Suppress("DEPRECATION")
+    private fun frameBody(): PixelBox {
+        val body = if (Build.VERSION.SDK_INT >= 30) {
+            val insets = windows.maximumWindowMetrics.windowInsets.getInsets(
+                WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout())
+            PixelBox(insets.left, insets.top, screenWidth - insets.right, screenHeight - insets.bottom)
+        } else {
+            val insets = bubble?.rootWindowInsets
+            PixelBox(insets?.systemWindowInsetLeft ?: 0, insets?.systemWindowInsetTop ?: 0,
+                screenWidth - (insets?.systemWindowInsetRight ?: 0), screenHeight - (insets?.systemWindowInsetBottom ?: 0))
+        }
+        return body.takeIf { it.width > 0 && it.height > 0 } ?: PixelBox(0, 0, screenWidth, screenHeight)
+    }
+
     private fun requestFrame() {
-        if (!sessionIsActive() || requestedToken.get() != null) return
+        if (!sessionIsActive() || requestedFrame.get() != null) return
+        val body = frameBody()
         dismissPanel()
         perf.click()
-        val token = gate.next()
+        val request = FreshFrameRequest(gate.next(), SystemClock.elapsedRealtime() + 4000, body)
         removeBubble()
-        frameAfter = Long.MAX_VALUE
-        requestedToken.set(token)
+        requestedFrame.set(request)
         // Observe compositor frames rather than sleeping a fixed number of milliseconds.
         Choreographer.getInstance().postFrameCallback {
-            if (sessionIsActive() && gate.accepts(token)) {
-                frameAfter = System.nanoTime()
-            }
+            if (frameIsCurrent(request)) request.arm(System.nanoTime())
         }
-        main.postDelayed(frameTimeout, 4000)
+        val timeout = Runnable { expireFrame(request) }
+        frameTimeout = timeout
+        main.postDelayed(timeout, (request.deadlineMillis - SystemClock.elapsedRealtime()).coerceAtLeast(0))
     }
 
     private fun showBubble(): Boolean {
@@ -256,7 +308,7 @@ class CaptureService : Service() {
     private fun removePanelView() { panel?.let { runCatching { windows.removeViewImmediate(it) } }; panel = null }
     private fun dismissPanel() {
         perf.end("closed", "dismiss")
-        gate.next(); requestedToken.set(null); main.removeCallbacks(frameTimeout)
+        gate.next(); requestedFrame.getAndSet(null)?.cancel(); clearFrameTimeout()
         removePanelView(); screenshot?.recycle(); screenshot = null
     }
 
