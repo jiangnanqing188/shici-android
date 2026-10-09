@@ -14,7 +14,7 @@ COMMIT = "3992bcb94c800a2fd38a9fd6ff95b2353e755363"
 REFERENCE_HOSTS = {"www.oxfordlearnersdictionaries.com", "oxfordlearnersdictionaries.com",
                    "www.oxfordlearnersdictionaries.co.uk", "oxfordlearnersdictionaries.co.uk",
                    "dictionary.cambridge.org", "www.merriam-webster.com", "www.collinsdictionary.com",
-                   "api.collinsdictionary.com", "www.dictionary.com"}
+                   "api.collinsdictionary.com", "www.dictionary.com", "ahdictionary.com", "www.ahdictionary.com"}
 STATUSES = {"supported", "needs_revision", "unresolved"}
 
 

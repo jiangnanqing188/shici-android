@@ -107,6 +107,13 @@ class ReviewKajwebMeaningsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "duplicate"):
             review.summarize(self.output)
 
+    def test_observed_american_heritage_entry_is_valid_reference(self):
+        record = self.record()
+        record["references"][0]["url"] = "https://www.ahdictionary.com/word/search.html?q=word"
+        review.validate_review(record, self.original())
+        record["references"][0]["url"] = "https://ahdictionary.com/word/search.html?q=word"
+        review.validate_review(record, self.original())
+
     def test_missing_reviews_and_assignment_tampering_detected(self):
         review.prepare(self.manifest, self.root, self.output)
         result = review.summarize(self.output)
