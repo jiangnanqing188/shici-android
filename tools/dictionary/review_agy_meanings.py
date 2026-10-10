@@ -13,7 +13,7 @@ import audit_exam_sources as audit
 import review_exam_meanings as exam_review
 import review_kajweb_meanings as review
 
-MODEL = 'gemini-3.1-pro-high'
+MODEL = 'gemini-3.8-flash-high'
 PILOT = 'agy-pilot-001'
 
 
@@ -172,7 +172,7 @@ def run(root, inventory, batches, max_batches, resume_blocked=False, cli='/mnt/a
             raise ValueError('another AGY dispatcher is active') from error
         state = read_json(root / 'run-state.json')
         if state['state'].startswith(('blocked_', 'failed_', 'pilot_cli_running', 'batch_running')) and not resume_blocked:
-            raise ValueError('previous run blocked/interrupted; resolve cause before explicit resume')
+            raise ValueError('previous run blocked/interrupted; explicit resume needs a resolved cause or user-authorized bounded retry')
         if state['model'] != MODEL or state.get('gpt_review_enabled') is not False:
             raise ValueError('GPT disabled and fixed AGY model required')
         if not state.get('conversation_id'):
@@ -246,7 +246,7 @@ def main():
                          help='Only after coordinator has actually checked the pilot dictionary evidence')
     launch = commands.add_parser('run')
     launch.add_argument('--max-batches', type=int, default=1)
-    launch.add_argument('--resume-blocked', action='store_true', help='Only after resolving the saved blocking cause')
+    launch.add_argument('--resume-blocked', action='store_true', help='Only after resolving the cause or receiving explicit user authorization for a bounded retry')
     args = parser.parse_args()
     root = args.handoff_dir.resolve()
     try:

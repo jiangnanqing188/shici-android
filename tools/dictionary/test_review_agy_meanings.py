@@ -60,6 +60,9 @@ class AgyMeaningReviewTest(unittest.TestCase):
         path = self.root / 'results' / (batch['handoff_batch_id'] + '.jsonl')
         path.write_text('\n'.join(json.dumps(self.row(batch, entry, status)) for entry in batch['entries'])+'\n')
 
+    def test_user_requested_flash_high_is_fixed(self):
+        self.assertEqual('gemini-3.8-flash-high', agy.MODEL)
+
     def test_queue_progress_is_not_fake_completion(self):
         inventory, batches = self.queue()
         progress = agy.progress(self.root, inventory, batches)
@@ -108,7 +111,7 @@ class AgyMeaningReviewTest(unittest.TestCase):
         batch = batches[agy.PILOT]
         original = self.row(batch, batch['entries'][0])
         path = self.root / 'results' / (agy.PILOT + '.jsonl')
-        for patch in ({'batch_id': 'wrong'}, {'handoff_batch_id': 'wrong'}, {'model': 'gpt-6-luna'},
+        for patch in ({'batch_id': 'wrong'}, {'handoff_batch_id': 'wrong'}, {'model': 'gpt-6-luna'}, {'model': 'gemini-3.1-pro-high'},
                       {'original_senses': []}, {'lookup_attempted': False}, {'references': []}):
             path.write_text(json.dumps(dict(original, **patch))+'\n')
             with self.subTest(patch=patch), self.assertRaises(ValueError):
@@ -180,7 +183,7 @@ class AgyMeaningReviewTest(unittest.TestCase):
                 state = agy.run(self.root, inventory, batches, 493)
             self.assertEqual(expected, state['state'])
             self.assertEqual(1, cli.call_count)
-            with self.assertRaisesRegex(ValueError, 'resolve cause'):
+            with self.assertRaisesRegex(ValueError, 'explicit resume'):
                 agy.run(self.root, inventory, batches, 493)
 
     def test_cli_error_preserves_partial_rows_but_does_not_count_them_as_supported(self):
