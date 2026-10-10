@@ -10,3 +10,4 @@ local.properties
 artifacts/
 docs/design/*.png
 docs/design/*.webp
+/app/src/main/assets/dictionary/kajweb.tsv.bin

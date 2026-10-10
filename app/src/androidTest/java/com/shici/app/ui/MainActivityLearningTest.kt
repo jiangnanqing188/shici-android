@@ -68,4 +68,28 @@ class MainActivityLearningTest {
             }
         }
     }
+    @Test fun sourceRefreshPreservesUnsavedPersonalFieldsAndUpdatesMeaningAndProvenance() {
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            scenario.onActivity { activity ->
+                val content = LinearLayout(activity)
+                val binding = detail(activity, content)
+                val views = descendants(content)
+                val note = views.filterIsInstance<EditText>().single()
+                val mastery = views.filterIsInstance<Switch>().single()
+                assertTrue(views.filterIsInstance<TextView>().any { it.text.contains(DemoDictionary.VERSION) })
+                note.setText("正在编辑的个人笔记")
+                mastery.isChecked = true
+                val raw = word.entry.copy(meaning = "新词源快照夹具", source = RawKajwebDictionary.SOURCE,
+                    version = RawKajwebDictionary.VERSION)
+                update(binding, word.copy(entry = raw, source = raw.source, version = raw.version, queryCount = 3))
+                assertEquals("正在编辑的个人笔记", note.text.toString())
+                assertTrue(mastery.isChecked)
+                val labels = views.filterIsInstance<TextView>().map { it.text.toString() }
+                assertTrue(labels.any { it.contains("新词源快照夹具") })
+                assertTrue(labels.any { it.contains(RawKajwebDictionary.VERSION) && it.contains("未逐条核对") })
+                assertFalse(labels.any { it.contains(DemoDictionary.VERSION) })
+            }
+        }
+    }
+
 }
