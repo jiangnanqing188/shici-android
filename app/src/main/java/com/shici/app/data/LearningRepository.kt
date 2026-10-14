@@ -48,15 +48,11 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
                     require(eventById(db, replaces) != null) { "原查询已不存在" }
                     db.update("events", ContentValues().apply { put("revoked", 1) }, "id=?", arrayOf(replaces))
                 }
-                val dictionaryFields = ContentValues().apply {
-                    put("headword", entry.headword); put("pos", entry.partOfSpeech); put("meaning", entry.meaning)
-                    put("source", entry.source); put("version", entry.version)
-                }
-                db.insertWithOnConflict("words", null, ContentValues(dictionaryFields).apply {
-                    put("entry_key", entry.key)
+                db.insertWithOnConflict("words", null, ContentValues().apply {
+                    put("entry_key", entry.key); put("headword", entry.headword)
+                    put("pos", entry.partOfSpeech); put("meaning", entry.meaning)
+                    put("source", DemoDictionary.SOURCE); put("version", DemoDictionary.VERSION)
                 }, SQLiteDatabase.CONFLICT_IGNORE)
-                // Only a new successful event refreshes the dictionary snapshot. Preserve personal fields.
-                db.update("words", dictionaryFields, "entry_key=?", arrayOf(entry.key))
                 db.insertOrThrow("events", null, ContentValues().apply {
                     put("id", event.id); put("entry_key", event.entryKey); put("raw_text", event.rawText)
                     put("final_form", event.finalForm); put("time", event.time); put("revoked", 0)
@@ -119,7 +115,7 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
             GROUP BY w.entry_key ORDER BY last_at DESC, w.headword""", null).use { c ->
             while (c.moveToNext()) {
                 val word = LearnedWord(
-                    DictionaryEntry(c.text("headword"), c.text("pos"), c.text("meaning"), c.text("source"), c.text("version")),
+                    DictionaryEntry(c.text("headword"), c.text("pos"), c.text("meaning")),
                     c.text("source"), c.text("version"), c.text("last_form"), c.int("query_count"),
                     c.long("first_at"), c.long("last_at"), c.int("mastered") == 1, c.text("note")
                 )

@@ -13,7 +13,10 @@ object PdfExporter {
         require(words.isNotEmpty()) { "没有可导出的生词" }
         val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.BLACK; textSize = 12f; typeface = Typeface.DEFAULT }
         val lines = words.mapIndexed { index, word ->
-            ExportLayout.wrap(LearningExportText.row(index, word), 499f, paint::measureText)
+            val content = "${index + 1}. ${word.entry.headword}  ${word.entry.partOfSpeech}\n" +
+                "原词形：${word.lastForm} · 查询 ${word.queryCount} 次 · ${if (word.mastered) "已掌握" else "待复习"}\n" +
+                word.entry.meaning + if (word.note.isBlank()) "" else "\n笔记：${word.note}"
+            ExportLayout.wrap(content, 499f, paint::measureText)
         }
         val pages = ExportLayout.paginate(lines.map { it.size })
         val pdf = PdfDocument()
@@ -25,7 +28,7 @@ object PdfExporter {
                 canvas.drawText("拾词 · 生词记忆单", 48f, 48f, paint)
                 paint.textSize = 10f; paint.typeface = Typeface.DEFAULT
                 canvas.drawText("$date · 当前搜索结果 · 最近查询优先 · ${words.size} 词", 48f, 70f, paint)
-                canvas.drawText(LearningExportText.notice(words), 48f, 86f, paint)
+                canvas.drawText("演示词库 / 自编示例，仅用于原型流程验证", 48f, 86f, paint)
                 paint.textSize = 12f
                 layout.slices.forEach { slice ->
                     repeat(slice.lineCount) { offset ->
@@ -34,7 +37,7 @@ object PdfExporter {
                     }
                 }
                 paint.textSize = 10f
-                canvas.drawText("非官方词库 · 不保证大纲全覆盖 · 请核对释义", 48f, 815f, paint)
+                canvas.drawText("演示数据，不是正式考试词典", 48f, 815f, paint)
                 canvas.drawText("${pageIndex + 1} / ${pages.size}", 510f, 815f, paint)
                 pdf.finishPage(page)
             }

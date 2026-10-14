@@ -11,7 +11,7 @@
         android:allowBackup="false"
         android:fullBackupContent="@xml/backup_rules"
         android:dataExtractionRules="@xml/data_extraction_rules"
-        android:label="拾词 · 离线学习"
+        android:label="拾词 · 演示原型"
         android:icon="@drawable/ic_shici"
         android:supportsRtl="true"
         android:theme="@style/AppTheme">

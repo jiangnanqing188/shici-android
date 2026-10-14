@@ -384,7 +384,7 @@ class CaptureService : Service() {
                         perf.stage("ocr_empty", "failed")
                         showMessage("笔迹没有命中可识别文字。没有查询或新增记录；请沿字形重新划选，或手动纠错。")
                     }
-                    selected.size == 1 && RawKajwebDictionary.normalize(selected.first().text) != null -> lookup(selected.first().text, raw)
+                    selected.size == 1 && DemoDictionary.normalize(selected.first().text) != null -> lookup(selected.first().text, raw)
                     else -> {
                         perf.stage("ocr_multiple", "needs_confirmation")
                         showSelectedText(raw, selected.map { it.text })
@@ -401,7 +401,7 @@ class CaptureService : Service() {
         val content = card("选中原文")
         content.addView(text(raw, 18f)); content.space()
         content.addView(text("译句未接入 · 请选择一个词查词；不会批量自动加入生词本。", 16f, Paper.warning)); content.space()
-        words.filter { RawKajwebDictionary.normalize(it) != null }.distinct().forEach { word ->
+        words.filter { DemoDictionary.normalize(it) != null }.distinct().forEach { word ->
             content.addView(button("查词：$word") { lookup(word, raw) }); content.space(8)
         }
         content.addView(button("纠正选中文字") { showTextCorrection(raw) }); content.space(8)
@@ -426,24 +426,28 @@ class CaptureService : Service() {
     }
 
     private fun lookup(form: String, raw: String, replaces: String? = null) {
-        val token = gate.next()
-        app.worker.execute {
-            if (!sessionIsActive() || !gate.accepts(token)) return@execute
-            val lookup = runCatching { app.dictionary.getOrThrow().lookup(form) }
-            main.post {
-                if (!sessionIsActive() || !gate.accepts(token)) return@post
-                lookup.onSuccess { result ->
-                    when (result) {
-                        LookupResult.Invalid -> { perf.stage("dictionary", "invalid"); showMessage("请输入一个有效词头，不自动拼接多个词。", raw, replaces) }
-                        is LookupResult.Missing -> { perf.stage("dictionary", "missing"); showMessage("「${result.form}」未收录于原始词库。没有生成释义，也没有新增记录。", raw, replaces) }
-                        is LookupResult.Match -> showDefinition(result.form, raw, result.entries.single(), replaces)
-                    }
-                }.onFailure {
-                    perf.stage("dictionary", "failed")
-                    showMessage("原始词库不可用：${it.message}。没有生成释义，也没有新增记录。", raw, replaces)
-                }
+        when (val result = DemoDictionary.lookup(form)) {
+            LookupResult.Invalid -> { perf.stage("dictionary", "invalid"); showMessage("请输入一个英文单词，不自动拼接多个词。", raw, replaces) }
+            is LookupResult.Missing -> { perf.stage("dictionary", "missing"); showMessage("「${result.form}」未收录于演示词库。没有生成释义，也没有新增记录。", raw, replaces) }
+            is LookupResult.Match -> {
+                if (result.entries.size > 1) {
+                    perf.stage("dictionary_ambiguity", "needs_confirmation")
+                    showChoices("「${result.form}」存在词形歧义，请确认词头", result.entries.map { entry ->
+                        "${entry.headword} · ${entry.meaning}" to { showDefinition(result.form, raw, entry, replaces) }
+                    }, raw, replaces)
+                } else showDefinition(result.form, raw, result.entries.first(), replaces)
             }
         }
+    }
+    private fun showChoices(title: String, choices: List<Pair<String, () -> Unit>>, raw: String, replaces: String?) {
+        gate.next()
+        val content = card(title)
+        content.addView(text("选中原文：\n$raw")); content.space()
+        choices.forEach { (label, action) -> content.addView(button(label, action = action)); content.space(8) }
+        content.addView(button("手动纠错") { showCorrection(raw, replaces) }); content.space(8)
+        content.addView(button("重新划选") { requestFrame() }); content.space(8)
+        content.addView(button("取消") { dismissPanel(); showBubble() })
+        addPanel(scroll(content))
     }
     private fun showMessage(message: String, raw: String = "", replaces: String? = null) {
         gate.next()
@@ -458,7 +462,7 @@ class CaptureService : Service() {
     private fun showCorrection(raw: String, replaces: String?, originalRaw: String = raw) {
         gate.next()
         val content = card("确认正确词形")
-        content.addView(text("只查询本地原始未逐条核对词库；确认成功后原事件撤销，不双计。"))
+        content.addView(text("只查询本地演示词库；确认成功后原事件撤销，不双计。"))
         val input = EditText(this).apply { setText(raw); hint = "一个英文单词"; setSingleLine(true) }
         content.addView(input)
         content.addView(button("确认查询", true) { lookup(input.text.toString(), originalRaw, replaces) }); content.space(8)
@@ -474,7 +478,7 @@ class CaptureService : Service() {
         content.addView(text("原词形：$form · ${entry.partOfSpeech}"))
         content.addView(text("选中原文：\n$raw"))
         content.addView(text(entry.meaning, 18f)); content.space()
-        content.addView(text(RawKajwebDictionary.provenance(entry.source, entry.version), 14f, Paper.warning))
+        content.addView(text("演示词库 · ${DemoDictionary.SOURCE}\n${DemoDictionary.VERSION}", 14f, Paper.warning))
         val status = text("保存中…", 16f, Paper.secondary)
         content.addView(status)
         val undo = button("撤销本次收录") {}

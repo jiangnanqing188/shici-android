@@ -2,9 +2,7 @@ package com.shici.app.core
 
 import java.util.Locale
 
-data class DictionaryEntry(val headword: String, val partOfSpeech: String, val meaning: String,
-                           val source: String = DemoDictionary.SOURCE,
-                           val version: String = DemoDictionary.VERSION) {
+data class DictionaryEntry(val headword: String, val partOfSpeech: String, val meaning: String) {
     val key: String get() = headword
 }
 
