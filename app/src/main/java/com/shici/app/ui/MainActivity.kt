@@ -58,7 +58,9 @@ class MainActivity : Activity() {
     private var syncSwitch = false
     private var searchList: LinearLayout? = null
     private var detailPanel: LinearLayout? = null
-    private val demoGate = QueryGate()
+    private val manualGate = QueryGate()
+    private var dictionarySummary = "词库尚未校验；正在后台加载"
+    private var dictionaryStatusView: TextView? = null
     private var activeDialog: AlertDialog? = null
     private var stopCaptureButton: Button? = null
     private val wide get() = resources.configuration.screenWidthDp >= 840
@@ -100,8 +102,10 @@ class MainActivity : Activity() {
         CaptureStatus.observe(statusListener)
         app.repository.changes.observe(dataListener)
         refresh()
+        loadDictionaryStatus()
     }
     override fun onStop() {
+        manualGate.next()
         app.repository.changes.remove(dataListener)
         refreshGate.stop()
         if (exportSession.cancelPreparation()) { exportDialog?.dismiss(); updateExportButton() }
@@ -109,7 +113,7 @@ class MainActivity : Activity() {
         super.onStop()
     }
     override fun onDestroy() {
-        refreshGate.stop(); exportSession.clear(); demoGate.next()
+        refreshGate.stop(); exportSession.clear(); manualGate.next()
         activeDialog?.dismiss(); activeDialog = null
         super.onDestroy()
     }
@@ -169,7 +173,7 @@ class MainActivity : Activity() {
                     dialogDetail?.update(words.firstOrNull { it.entry.key == dialogDetail?.key })
                     when (currentTab) {
                         1 -> { renderWords(preserveDetail = true); updateExportButton() }
-                        3 -> Unit // Keep an in-progress demo/correction input intact.
+                        3 -> Unit // Keep an in-progress manual/correction input intact.
                         else -> render()
                     }
                 }.onFailure { toast("读取失败：${it.message}") }
@@ -177,9 +181,25 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun loadDictionaryStatus() {
+        app.worker.execute {
+            val result = app.dictionary
+            main.post {
+                if (isDestroyed) return@post
+                dictionarySummary = result.fold(
+                    { "已校验 ${it.entryCount} 个原始词头 · ${it.aliasCount} 个词形别名（仅格式与完整性校验）" },
+                    { "词库不可用：${it.message}；不会生成释义或新增查询记录" })
+                dictionaryStatusView?.text = dictionarySummary
+            }
+        }
+    }
+
+    private fun dictionaryStatus() = text(dictionarySummary, 16f, Paper.secondary)
+        .also { dictionaryStatusView = it }
+
     private fun render() {
         floatingSwitch = null; floatingText = null; stopCaptureButton = null; searchList = null; detailPanel = null
-        exportButton = null; inlineDetail = null
+        exportButton = null; inlineDetail = null; dictionaryStatusView = null
         body.removeAllViews()
         val navOffset = if (wide) 3 else 0
         repeat(4) { index ->
@@ -227,14 +247,15 @@ class MainActivity : Activity() {
         if (words.isEmpty()) {
             val empty = panel()
             empty.addView(text("查到的第一个单词，会留在这里", 18f))
-            empty.addView(text("开启悬浮查词，或在设置中输入演示单词验证。", 16f, Paper.secondary))
+            empty.addView(text("开启悬浮查词，或在设置中手动输入单词。", 16f, Paper.secondary))
             content.addView(empty)
         } else words.take(5).forEach { word -> content.addView(wordRow(word) { showWordDialog(word) }); content.divider() }
         content.space(24)
         val demo = column().apply {
             setPadding(dp(20), dp(16), dp(20), dp(16)); background = shape(Paper.lightGreen)
-            addView(text("演示词库", 18f, Paper.green, true))
-            addView(text("仅 ${DemoDictionary.entries.size} 个自编示例词条。未收录不生成，不是牛津或正式考研词库。", 16f, Paper.secondary))
+            addView(text("原始离线词库 · 未逐条核对", 18f, Paper.green, true))
+            addView(dictionaryStatus())
+            addView(text(RawKajwebDictionary.provenance(RawKajwebDictionary.SOURCE, RawKajwebDictionary.VERSION), 16f, Paper.secondary))
         }
         content.addView(demo); content.space()
         content.addView(text("打开悬浮查词 → 划过文字 → 完成", 16f, Paper.secondary))
@@ -321,6 +342,7 @@ class MainActivity : Activity() {
     private class WordDetailBinding(
         val key: String, private val form: TextView, private val count: TextView, private val dates: TextView,
         private val mastery: Switch, private val note: EditText, private val undo: Button,
+        private val definition: TextView, private val source: TextView, private val sourceBadge: TextView,
         private var savedMastered: Boolean, private var savedNote: String
     ) {
         fun update(word: LearnedWord?) {
@@ -328,6 +350,9 @@ class MainActivity : Activity() {
             count.text = "${word?.queryCount ?: 0} 次"
             undo.isEnabled = word != null
             if (word == null) { dates.text = "当前已无有效查询；已保存的笔记仍保留。"; return }
+            definition.text = "${word.entry.partOfSpeech} ${word.entry.meaning}"
+            source.text = RawKajwebDictionary.provenance(word.source, word.version)
+            sourceBadge.text = RawKajwebDictionary.label(word.source, word.version)
             val formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")
             fun date(time: Long) = Instant.ofEpochMilli(time).atZone(ZoneId.systemDefault()).format(formatter)
             dates.text = "首次查询：${date(word.firstAt)}\n最近查询：${date(word.lastAt)}"
@@ -340,11 +365,14 @@ class MainActivity : Activity() {
         val detailWidth = if (close != null) minOf(resources.configuration.screenWidthDp - 32, 640)
             else (contentWidthDp * 0.56f).toInt() - 24
         content.addView(text(word.entry.headword, 30f, bold = true).apply { typeface = Typeface.create("serif", Typeface.BOLD) })
-        content.addView(text("${word.entry.partOfSpeech} ${word.entry.meaning}", 18f)); content.space(8)
-        content.addView(badge("演示词库"), LinearLayout.LayoutParams(-2, -2)); content.divider()
+        val definition = text("${word.entry.partOfSpeech} ${word.entry.meaning}", 18f)
+        content.addView(definition); content.space(8)
+        val sourceBadge = badge(RawKajwebDictionary.label(word.source, word.version))
+        content.addView(sourceBadge, LinearLayout.LayoutParams(-2, -2)); content.divider()
         val form = text("原词形：${word.lastForm}", 16f, Paper.secondary)
         content.addView(form)
-        content.addView(text("来源：${word.source} · ${word.version}", 16f, Paper.secondary)); content.space(16)
+        val source = text(RawKajwebDictionary.provenance(word.source, word.version), 16f, Paper.secondary)
+        content.addView(source); content.space(16)
         val count = text("${word.queryCount} 次", 28f, bold = true)
         val queries = column().apply {
             addView(text("查询次数", 16f, Paper.secondary)); addView(count)
@@ -379,7 +407,8 @@ class MainActivity : Activity() {
         val undo = button("撤销最近一次查询") { revokeLast(word, close) }
         content.addView(pair(save, undo, inlineAt(detailWidth - 48), 8)); content.space(8)
         content.addView(text("撤销只影响最近一次成功查询；之前的查询与已保存的笔记保留。", 16f, Paper.secondary))
-        return WordDetailBinding(word.entry.key, form, count, dates, mastered, note, undo, word.mastered, word.note)
+        return WordDetailBinding(word.entry.key, form, count, dates, mastered, note, undo,
+            definition, source, sourceBadge, word.mastered, word.note)
     }
     private fun revokeLast(word: LearnedWord, close: (() -> Unit)?) {
         AlertDialog.Builder(this).setTitle("撤销最近一次查询？")
@@ -478,22 +507,22 @@ class MainActivity : Activity() {
             addView(text("词库来源", 20f, bold = true)); space(12)
             val identity = column().apply {
                 setPadding(dp(16), dp(12), dp(16), dp(12)); background = shape(Paper.lightGreen, 8)
-                addView(text("演示词库", 18f, Paper.green, true))
-                addView(text("${DemoDictionary.entries.size} 个自编示例词头 · 本机离线查词", 16f, Paper.secondary))
+                addView(text("原始离线词库 · 未逐条核对", 18f, Paper.green, true))
+                addView(dictionaryStatus())
             }
             addView(identity); space(12)
-            addView(text("来源：${DemoDictionary.SOURCE}\n版本：${DemoDictionary.VERSION}", 16f, Paper.secondary))
-            addView(text("不是牛津或正式考研词典；只有显式收录的词形会映射，歧义需要人工确认。", 16f, Paper.warning))
+            addView(text(RawKajwebDictionary.provenance(RawKajwebDictionary.SOURCE, RawKajwebDictionary.VERSION), 16f, Paper.secondary))
+            addView(text("考研 / 四级 / 六级 / 专四 / 专八五本原始词书合并；未应用核验或候选修订。仅查原词头，不猜词形，不回退演示词库。", 16f, Paper.warning))
         }
         library.addView(source); library.space(16)
         val demo = panel().apply {
-            addView(text("演示输入查词", 20f, bold = true))
+            addView(text("手动输入查词", 20f, bold = true))
             addView(text("无需悬浮窗或屏幕捕获权限；成功查询会形成真实的本地记录。", 16f, Paper.secondary)); space(12)
-            val input = inputField("例如 evidence、studies、saw", true)
-            val query = button("查询演示词库", true) { demoLookup(input.text.toString()) }
+            val input = inputField("例如 evidence、quantum", true)
+            val query = button("查询原始词库", true) { manualLookup(input.text.toString()) }
             val sectionWidth = if (splitContent) (contentWidthDp - 24) / 2 else contentWidthDp
             addView(pair(input, query, inlineAt(sectionWidth - 48))); space(12)
-            addView(text("可查的演示词头：${DemoDictionary.entries.joinToString { it.headword }}", 16f, Paper.secondary))
+            addView(text("未知词或未收录词形不生成释义、不新增记录；旧演示记录仍按旧来源展示。", 16f, Paper.secondary))
         }
         library.addView(demo)
         val boundaries = column()
@@ -594,40 +623,45 @@ class MainActivity : Activity() {
     }
     private fun permissionError(message: String) { stopCapture(); CaptureStatus.update(CapturePhase.ERROR, message); toast(message) }
 
-    private fun demoLookup(raw: String, replaces: String? = null, originalRaw: String = raw) {
-        when (val result = DemoDictionary.lookup(raw)) {
-            LookupResult.Invalid -> toast("请输入一个英文单词")
-            is LookupResult.Missing -> toast("${result.form} 未收录于演示词库；未新增记录")
-            is LookupResult.Match -> if (result.entries.size > 1) {
-                AlertDialog.Builder(this).setTitle("词形有歧义，请选择词头")
-                    .setItems(result.entries.map { "${it.headword} · ${it.meaning}" }.toTypedArray()) { _, index ->
-                        showDemoDefinition(originalRaw, result.form, result.entries[index], replaces)
-                    }.setNegativeButton("取消", null).show()
-            } else showDemoDefinition(originalRaw, result.form, result.entries.first(), replaces)
+    private fun manualLookup(raw: String, replaces: String? = null, originalRaw: String = raw) {
+        val token = manualGate.next()
+        app.worker.execute {
+            if (!manualGate.accepts(token)) return@execute
+            val lookup = runCatching { app.dictionary.getOrThrow().lookup(raw) }
+            main.post {
+                if (isDestroyed || !manualGate.accepts(token)) return@post
+                lookup.onSuccess { result ->
+                    when (result) {
+                        LookupResult.Invalid -> toast("请输入一个有效英文词头")
+                        is LookupResult.Missing -> toast("${result.form} 未收录于原始词库；未新增记录")
+                        is LookupResult.Match -> showManualDefinition(originalRaw, result.form, result.entries.single(), replaces)
+                    }
+                }.onFailure { toast("词库不可用：${it.message}；未生成释义或新增记录") }
+            }
         }
     }
-    private fun showDemoDefinition(raw: String, form: String, entry: DictionaryEntry, replaces: String?) {
+    private fun showManualDefinition(raw: String, form: String, entry: DictionaryEntry, replaces: String?) {
         val content = panel()
         content.addView(text(entry.headword, 28f, bold = true).apply { typeface = Typeface.create("serif", Typeface.BOLD) })
         content.addView(text("原词形：$form · ${entry.partOfSpeech}")); content.addView(text(entry.meaning, 18f))
-        content.addView(text("演示词库 · ${DemoDictionary.SOURCE}", 14f, Paper.warning))
+        content.addView(text(RawKajwebDictionary.provenance(entry.source, entry.version), 14f, Paper.warning))
         val status = text("保存中…", 16f, Paper.secondary); content.addView(status)
         val undo = button("撤销本次收录") {}; undo.isEnabled = false; content.addView(undo); content.space(8)
         val correct = button("纠错") {}; correct.isEnabled = false; content.addView(correct); content.space(8)
         val retry = button("重试保存") {}; retry.visibility = View.GONE; content.addView(retry)
         val dialog = AlertDialog.Builder(this).setView(ScrollView(this).apply { addView(content) }).setNegativeButton("关闭", null).create()
         activeDialog?.dismiss(); activeDialog = dialog
-        val token = demoGate.next()
-        dialog.setOnDismissListener { if (demoGate.accepts(token)) demoGate.next() }
+        val token = manualGate.next()
+        dialog.setOnDismissListener { if (manualGate.accepts(token)) manualGate.next() }
         dialog.show()
         val event = QueryEvent(UUID.randomUUID().toString(), entry.key, raw, form, System.currentTimeMillis())
         fun save() {
             retry.visibility = View.GONE; status.text = "保存中…"
             app.worker.execute {
-                if (!demoGate.accepts(token)) return@execute
-                val error = runCatching { app.repository.record(event, entry, replaces) { demoGate.accepts(token) } }.exceptionOrNull()
+                if (!manualGate.accepts(token)) return@execute
+                val error = runCatching { app.repository.record(event, entry, replaces) { manualGate.accepts(token) } }.exceptionOrNull()
                 main.post {
-                    if (!isDestroyed && dialog.isShowing) {
+                    if (!isDestroyed && manualGate.accepts(token) && dialog.isShowing) {
                         status.text = if (error == null) "已收录" else "保存失败：${error.message}"
                         status.setTextColor(if (error == null) Paper.green else Paper.error)
                         undo.isEnabled = error == null; correct.isEnabled = error == null
@@ -642,7 +676,7 @@ class MainActivity : Activity() {
             app.worker.execute {
                 val error = runCatching { app.repository.revoke(event.id) }.exceptionOrNull()
                 main.post {
-                    if (!isDestroyed && dialog.isShowing) {
+                    if (!isDestroyed && manualGate.accepts(token) && dialog.isShowing) {
                         status.text = if (error == null) "本次已撤销，历史查询保留" else "撤销失败：${error.message}"
                         if (error == null) undo.text = "已撤销" else { undo.isEnabled = true; correct.isEnabled = true }
                     }
@@ -653,7 +687,7 @@ class MainActivity : Activity() {
             dialog.dismiss()
             val input = EditText(this).apply { setText(form); setSingleLine(true) }
             AlertDialog.Builder(this).setTitle("纠正词形").setView(input).setMessage("确认成功后撤销原事件，不重复累计。")
-                .setPositiveButton("确认查询") { _, _ -> demoLookup(input.text.toString(), event.id, raw) }.setNegativeButton("取消", null).show()
+                .setPositiveButton("确认查询") { _, _ -> manualLookup(input.text.toString(), event.id, raw) }.setNegativeButton("取消", null).show()
         }
         save()
     }
@@ -685,8 +719,11 @@ class MainActivity : Activity() {
         content.addView(text("A4 · 记忆版 · 最近查询优先", 16f, Paper.secondary)); content.space(16)
         val notice = column().apply {
             setPadding(dp(16), dp(12), dp(16), dp(12)); background = shape(Paper.background, 8)
-            addView(text("演示数据，仅用于原型流程验证。", 16f, Paper.warning, true))
-            addView(text("使用自编演示词库，不是牛津或正式考研词典。导出包含词头、释义、原词形、查询次数、掌握状态和已保存的笔记，不包含自测题。", 16f, Paper.secondary))
+            addView(text(LearningExportText.notice(snapshot.words), 16f, Paper.warning, true))
+            snapshot.words.map { it.source to it.version }.distinct().forEach { (source, version) ->
+                addView(text(RawKajwebDictionary.provenance(source, version), 16f, Paper.secondary))
+            }
+            addView(text("导出包含词头、原始释义、各自来源版本与核对状态、原词形、查询次数、掌握状态和已保存的笔记；不包含自测题。", 16f, Paper.secondary))
         }
         content.addView(notice); content.space(12)
         content.addView(text("已从数据库读取并按本次搜索条件冻结内容；尚未保存的笔记与状态不会导出。取消不会创建导出文件。", 16f, Paper.secondary)); content.space(24)

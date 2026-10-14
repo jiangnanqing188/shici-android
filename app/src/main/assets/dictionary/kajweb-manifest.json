@@ -1,0 +1,103 @@
+{
+  "alias_count": 0,
+  "asset_sha256": "de7fef8327f569d6bd4bd8ef24258e33839e42f2f5a3d3d9b24ea216b8539c0c",
+  "compressed_bytes": 407621,
+  "content_review_status": "unreviewed",
+  "domain_counts": {
+    "cet4": 3739,
+    "cet6": 2078,
+    "ky": 4533,
+    "tem4": 4025,
+    "tem8": 12197
+  },
+  "entry_count": 12652,
+  "format": "SHICI_KAJWEB",
+  "format_version": 1,
+  "kaoyan_count": 4533,
+  "local_candidate_only": true,
+  "normalization": "NFC+lowercase+curly-apostrophe+whitespace; no lemmatization",
+  "redistribution_status": "unresolved",
+  "source": "kajweb/dict · 有道来源备考词书",
+  "source_count": 5,
+  "source_entry_count": 26572,
+  "source_inventory": {
+    "schema_version": 1,
+    "sources": [
+      {
+        "book": "考研有道词书",
+        "commit": "3992bcb94c800a2fd38a9fd6ff95b2353e755363",
+        "exam": "ky",
+        "file": "KaoYan_2.zip",
+        "format": "kajweb-zip",
+        "group": "kajweb",
+        "member": "KaoYan_2.json",
+        "redistribution_status": "unresolved",
+        "sha256": "8f0670da980d55aee3e63a140633d33f78df04738ad18dbc6cfd552b63da0a5d",
+        "syllabus_verified": false,
+        "url": "https://raw.githubusercontent.com/kajweb/dict/3992bcb94c800a2fd38a9fd6ff95b2353e755363/book/1521164654696_KaoYan_2.zip"
+      },
+      {
+        "book": "四级有道词书",
+        "commit": "3992bcb94c800a2fd38a9fd6ff95b2353e755363",
+        "exam": "cet4",
+        "file": "CET4luan_2.zip",
+        "format": "kajweb-zip",
+        "group": "kajweb",
+        "member": "CET4luan_2.json",
+        "redistribution_status": "unresolved",
+        "sha256": "a57da774dcabcf154567c0526fd8871d9c61cb6536f993b146330f0c2fd73b37",
+        "syllabus_verified": false,
+        "url": "https://raw.githubusercontent.com/kajweb/dict/3992bcb94c800a2fd38a9fd6ff95b2353e755363/book/1524052539052_CET4luan_2.zip"
+      },
+      {
+        "book": "六级有道词书",
+        "commit": "3992bcb94c800a2fd38a9fd6ff95b2353e755363",
+        "exam": "cet6",
+        "file": "CET6_2.zip",
+        "format": "kajweb-zip",
+        "group": "kajweb",
+        "member": "CET6_2.json",
+        "redistribution_status": "unresolved",
+        "sha256": "fe12c5a331510e86da4a187a829d9d72e2785588e60ce45d830f349c30fc3866",
+        "syllabus_verified": false,
+        "url": "https://raw.githubusercontent.com/kajweb/dict/3992bcb94c800a2fd38a9fd6ff95b2353e755363/book/1524052554766_CET6_2.zip"
+      },
+      {
+        "book": "专四核心词书",
+        "commit": "3992bcb94c800a2fd38a9fd6ff95b2353e755363",
+        "exam": "tem4",
+        "file": "Level4luan_2.zip",
+        "format": "kajweb-zip",
+        "group": "kajweb",
+        "member": "Level4luan_2.json",
+        "redistribution_status": "unresolved",
+        "sha256": "c7ff8c70668597e3e9c26349b998d9c8ebe9da5f24e7a728484f2963d737b05f",
+        "syllabus_verified": false,
+        "url": "https://raw.githubusercontent.com/kajweb/dict/3992bcb94c800a2fd38a9fd6ff95b2353e755363/book/1521164625401_Level4luan_2.zip"
+      },
+      {
+        "book": "专八核心词书",
+        "commit": "3992bcb94c800a2fd38a9fd6ff95b2353e755363",
+        "exam": "tem8",
+        "file": "Level8luan_2.zip",
+        "format": "kajweb-zip",
+        "group": "kajweb",
+        "member": "Level8luan_2.json",
+        "redistribution_status": "unresolved",
+        "sha256": "6ae970809b5abdc2b02ea8a6fe9c8e9767c7ac08b391c89f9e33958fc4ef31c1",
+        "syllabus_verified": false,
+        "url": "https://raw.githubusercontent.com/kajweb/dict/3992bcb94c800a2fd38a9fd6ff95b2353e755363/book/1521164650006_Level8luan_2.zip"
+      }
+    ]
+  },
+  "source_priority": [
+    "ky",
+    "cet4",
+    "cet6",
+    "tem4",
+    "tem8"
+  ],
+  "syllabus_verified": false,
+  "uncompressed_bytes": 1031550,
+  "version": "3992bcb94c800a2fd38a9fd6ff95b2353e755363"
+}

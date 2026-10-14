@@ -56,3 +56,18 @@ class LearningExportSession {
     }
     fun clear() { request = null; snapshot = null; stage = Stage.IDLE }
 }
+
+/** Shared with PDF rendering so every saved word keeps its actual source/version and review notice. */
+object LearningExportText {
+    fun row(index: Int, word: LearnedWord): String =
+        "${index + 1}. ${word.entry.headword}  ${word.entry.partOfSpeech}\n" +
+            "原词形：${word.lastForm} · 查询 ${word.queryCount} 次 · ${if (word.mastered) "已掌握" else "待复习"}\n" +
+            word.entry.meaning + (if (word.note.isBlank()) "" else "\n笔记：${word.note}") +
+            "\n${RawKajwebDictionary.provenance(word.source, word.version)}"
+
+    fun notice(words: List<LearnedWord>): String = when {
+        words.any { it.source == RawKajwebDictionary.SOURCE } -> "原始词库未逐条核对；历史记录按各自来源标注"
+        words.all { it.source == DemoDictionary.SOURCE && it.version == DemoDictionary.VERSION } -> "自编演示数据，仅用于原型流程验证"
+        else -> "历史词源核对状态未确认；按各自来源版本标注"
+    }
+}
