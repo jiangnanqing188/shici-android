@@ -22,6 +22,7 @@ import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import com.shici.app.R
 import com.shici.app.ShiciApplication
 import com.shici.app.core.*
+import com.shici.app.data.RevokeOutcome
 import com.shici.app.ui.*
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicReference
@@ -49,6 +50,8 @@ class CaptureService : Service() {
     private var panel: View? = null
     private var screenshot: Bitmap? = null
     private var sessionGeneration = -1L
+    // Captured once per capture session and carried through OCR, display, save and retry.
+    private var deletionCredential = 0L
     private var pendingError: String? = null
     private var screenWidth = 1
     private var screenHeight = 1
@@ -58,12 +61,25 @@ class CaptureService : Service() {
     private val requestedFrame = AtomicReference<FreshFrameRequest?>(null)
     private var frameTimeout: Runnable? = null
     private val app get() = application as ShiciApplication
+    // The visible "已收录" card; invalidated if its word is deleted while the card is still on screen.
+    private class DefinitionGuard(
+        val key: String, val credential: Long,
+        val status: TextView, val undo: Button, val correct: Button, val retry: Button
+    ) { @Volatile var invalid = false }
+    @Volatile private var definitionGuard: DefinitionGuard? = null
+    private val deletionListener: (Long) -> Unit = {
+        val guard = definitionGuard
+        if (guard != null && !guard.invalid && app.repository.deletions.isStale(guard.key, guard.credential)) {
+            main.post { if (definitionGuard === guard) invalidateDefinition(guard) }
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
         windows = getSystemService(WindowManager::class.java)
         framesThread = HandlerThread("shici-capture").apply { start() }
         frames = Handler(framesThread.looper)
+        app.repository.changes.observe(deletionListener)
     }
     override fun onBind(intent: Intent?) = null
 
@@ -250,6 +266,8 @@ class CaptureService : Service() {
 
     private fun requestFrame() {
         if (!sessionIsActive() || requestedFrame.get() != null) return
+        // New capture session: take one deletion credential reused until the next 划选.
+        deletionCredential = app.repository.deletions.capture()
         val body = frameBody()
         dismissPanel()
         perf.click()
@@ -305,7 +323,16 @@ class CaptureService : Service() {
         try { windows.addView(view, params); panel = view; view.requestFocus() }
         catch (e: Exception) { fail("无法打开取词界面：${e.message}") }
     }
-    private fun removePanelView() { panel?.let { runCatching { windows.removeViewImmediate(it) } }; panel = null }
+    private fun removePanelView() { definitionGuard = null; panel?.let { runCatching { windows.removeViewImmediate(it) } }; panel = null }
+    private fun invalidateDefinition(guard: DefinitionGuard) {
+        guard.invalid = true
+        guard.status.text = "未收录：该词已删除或查询已失效"; guard.status.setTextColor(Paper.error)
+        guard.undo.isEnabled = false; guard.correct.isEnabled = false; guard.retry.visibility = View.GONE
+    }
+    // A floating card is out of date once it is invalidated or its word was deleted after the query
+    // credential was captured; both must win over any late success/failure result.
+    private fun definitionCardStale(guard: DefinitionGuard): Boolean =
+        guard.invalid || app.repository.deletions.isStale(guard.key, guard.credential)
     private fun dismissPanel() {
         perf.end("closed", "dismiss")
         gate.next(); requestedFrame.getAndSet(null)?.cancel(); clearFrameTimeout()
@@ -427,6 +454,7 @@ class CaptureService : Service() {
 
     private fun lookup(form: String, raw: String, replaces: String? = null) {
         val token = gate.next()
+        val credential = deletionCredential
         app.worker.execute {
             if (!sessionIsActive() || !gate.accepts(token)) return@execute
             val lookup = runCatching { app.dictionary.getOrThrow().lookup(form) }
@@ -436,7 +464,7 @@ class CaptureService : Service() {
                     when (result) {
                         LookupResult.Invalid -> { perf.stage("dictionary", "invalid"); showMessage("请输入一个有效词头，不自动拼接多个词。", raw, replaces) }
                         is LookupResult.Missing -> { perf.stage("dictionary", "missing"); showMessage("「${result.form}」未收录于原始词库。没有生成释义，也没有新增记录。", raw, replaces) }
-                        is LookupResult.Match -> showDefinition(result.form, raw, result.entries.single(), replaces)
+                        is LookupResult.Match -> showDefinition(result.form, raw, result.entries.single(), replaces, credential)
                     }
                 }.onFailure {
                     perf.stage("dictionary", "failed")
@@ -467,7 +495,7 @@ class CaptureService : Service() {
         addPanel(scroll(content))
     }
 
-    private fun showDefinition(form: String, raw: String, entry: DictionaryEntry, replaces: String?) {
+    private fun showDefinition(form: String, raw: String, entry: DictionaryEntry, replaces: String?, credential: Long) {
         val token = gate.next()
         val event = QueryEvent(UUID.randomUUID().toString(), entry.key, raw, form, System.currentTimeMillis())
         val content = card(entry.headword)
@@ -478,13 +506,20 @@ class CaptureService : Service() {
         val status = text("保存中…", 16f, Paper.secondary)
         content.addView(status)
         val undo = button("撤销本次收录") {}
-        val correct = button("纠错") { showCorrection(form, event.id, raw) }
+        val correct = button("纠错") {}
         val retry = button("重试保存") {}
         undo.isEnabled = false; correct.isEnabled = false; retry.visibility = View.GONE
         content.addView(undo); content.space(8); content.addView(correct); content.space(8); content.addView(retry); content.space(8)
         content.addView(button("重新划选") { requestFrame() }); content.space(8)
         content.addView(button("返回做题", true) { dismissPanel(); showBubble() })
         addPanel(scroll(content))
+        val guard = DefinitionGuard(entry.key, credential, status, undo, correct, retry)
+        definitionGuard = guard
+        correct.setOnClickListener {
+            // Reject an expired card at the entry: an old card must not start a new correction flow.
+            if (definitionCardStale(guard)) { invalidateDefinition(guard); return@setOnClickListener }
+            showCorrection(form, event.id, raw)
+        }
         val drawListener = object : ViewTreeObserver.OnDrawListener {
             var reported = false
             override fun onDraw() {
@@ -496,30 +531,61 @@ class CaptureService : Service() {
         }
         content.viewTreeObserver.addOnDrawListener(drawListener)
         fun save() {
+            // A stale card (word deleted after this query started) must not start/retry a save.
+            if (definitionCardStale(guard)) { invalidateDefinition(guard); return }
             retry.visibility = View.GONE; status.text = "保存中…"
             app.worker.execute {
                 if (!sessionIsActive() || !gate.accepts(token)) return@execute
-                val error = runCatching { app.repository.record(event, entry, replaces) { sessionIsActive() && gate.accepts(token) } }.exceptionOrNull()
+                val result = runCatching { app.repository.record(event, entry, replaces, credential) { sessionIsActive() && gate.accepts(token) } }
                 main.post {
-                    if (sessionIsActive() && gate.accepts(token)) {
-                        perf.stage("save", if (error == null) "ok" else "failed")
-                        status.text = if (error == null) "已收录 · 可撤销本次查询" else "保存失败：${error.message}"
-                        status.setTextColor(if (error == null) Paper.green else Paper.error)
-                        undo.isEnabled = error == null; correct.isEnabled = error == null
-                        retry.visibility = if (error == null) View.GONE else View.VISIBLE
+                    if (sessionIsActive() && gate.accepts(token) && definitionGuard === guard && !guard.invalid) {
+                        val error = result.exceptionOrNull()
+                        val saved = result.getOrNull() == true
+                        // A committed deletion (even before the invalidation message runs) wins over a
+                        // late error/success: never re-show retry nor overwrite the invalid text.
+                        val stale = definitionCardStale(guard)
+                        perf.stage("save", if (saved && !stale) "ok" else "failed")
+                        when {
+                            stale -> invalidateDefinition(guard)
+                            error != null -> {
+                                status.text = "保存失败：${error.message}"; status.setTextColor(Paper.error)
+                                undo.isEnabled = false; correct.isEnabled = false; retry.visibility = View.VISIBLE
+                            }
+                            saved -> {
+                                status.text = "已收录 · 可撤销本次查询"; status.setTextColor(Paper.green)
+                                undo.isEnabled = true; correct.isEnabled = true; retry.visibility = View.GONE
+                            }
+                            else -> invalidateDefinition(guard)
+                        }
                     }
                 }
             }
         }
         retry.setOnClickListener { save() }
         undo.setOnClickListener {
+            // Reject an expired card at the entry too, not only after the worker returns.
+            if (definitionCardStale(guard)) { invalidateDefinition(guard); return@setOnClickListener }
             undo.isEnabled = false; correct.isEnabled = false
             app.worker.execute {
-                val error = runCatching { app.repository.revoke(event.id) }.exceptionOrNull()
+                // A no-op revoke (word already deleted / event gone) must not be reported as success.
+                val result = runCatching { app.repository.revokeEvent(event.id, entry.key, credential) }
                 main.post {
-                    if (sessionIsActive() && gate.accepts(token)) {
-                        status.text = if (error == null) "本次查询已撤销；之前的记录保留" else "撤销失败：${error.message}"
-                        if (error == null) undo.text = "已撤销" else { undo.isEnabled = true; correct.isEnabled = true }
+                    if (sessionIsActive() && gate.accepts(token) && definitionGuard === guard) {
+                        // Deletion wins over a late revoke result: never re-enable undo/correct nor report REVOKED.
+                        if (definitionCardStale(guard)) invalidateDefinition(guard) else {
+                            val outcome = result.getOrNull()
+                            when {
+                                result.isFailure -> {
+                                    status.text = "撤销失败：${result.exceptionOrNull()?.message}"
+                                    undo.isEnabled = true; correct.isEnabled = true
+                                }
+                                outcome == RevokeOutcome.REVOKED -> { status.text = "本次查询已撤销；之前的记录保留"; undo.text = "已撤销" }
+                                else -> {
+                                    status.text = "撤销失败：该记录已不存在"; status.setTextColor(Paper.error)
+                                    undo.isEnabled = false; correct.isEnabled = false
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -544,6 +610,7 @@ class CaptureService : Service() {
     override fun onDestroy() {
         perf.end("stopped", "session_stop")
         stopped = true
+        app.repository.changes.remove(deletionListener)
         dismissPanel(); removeBubble()
         display?.release(); display = null
         projection?.stop(); projection = null

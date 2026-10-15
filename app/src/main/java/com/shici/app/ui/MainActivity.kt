@@ -21,6 +21,8 @@ import android.widget.*
 import com.shici.app.ShiciApplication
 import com.shici.app.capture.*
 import com.shici.app.core.*
+import com.shici.app.data.DeleteOutcome
+import com.shici.app.data.RevokeOutcome
 import com.shici.app.export.PdfExporter
 import com.shici.app.export.LostPdfFileCleanup
 import java.time.*
@@ -40,6 +42,13 @@ class MainActivity : Activity() {
     private lateinit var nav: LinearLayout
     private var currentTab = 0
     private var words = emptyList<LearnedWord>()
+    // Deletion generation of the snapshot the current [words] cache was read at; details opened from
+    // this cache stay bound to this data instead of capturing a newer epoch at construction time.
+    private var wordsCredential = 0L
+    // Committed revision of the snapshot the current [words] cache was read at. Kept separate from the
+    // deletion generation so a genuinely newer same-word snapshot (a change since this cache was read)
+    // can be told apart from an old-snapshot rebuild that happens to keep an equal deletion credential.
+    private var wordsVersion = 0L
     private var stats = LearningStats(0, 0, 0, 0, 0)
     private var search = ""
     private var selectedKey: String? = null
@@ -52,13 +61,30 @@ class MainActivity : Activity() {
     private var exportButton: Button? = null
     private var inlineDetail: WordDetailBinding? = null
     private var dialogDetail: WordDetailBinding? = null
-    private val dataListener: (Long) -> Unit = { version -> main.post { refresh(version) } }
+    // A save/revoke/delete in the open detail is in flight; every detail control is frozen, and a
+    // rebuilt view or a late refresh must not re-enable a button for the duration.
+    private var detailBusy = false
+    private val dataListener: (Long) -> Unit = { version ->
+        // A committed deletion may arrive while a manual "已收录" card is still open; invalidate it so
+        // its old undo/correct buttons cannot act on a re-collected record. Other words are untouched.
+        val guard = manualGuard
+        if (guard != null && !guard.invalid && app.repository.deletions.isStale(guard.key, guard.credential)) {
+            main.post { if (manualGuard === guard) invalidateManualCard(guard) }
+        }
+        main.post { refresh(version) }
+    }
     private var floatingSwitch: Switch? = null
     private var floatingText: TextView? = null
     private var syncSwitch = false
     private var searchList: LinearLayout? = null
     private var detailPanel: LinearLayout? = null
     private val manualGate = QueryGate()
+    // The visible manual "已收录" card, invalidated if its word is deleted while the card is still open.
+    private class ManualGuard(
+        val key: String, val credential: Long,
+        val status: TextView, val undo: Button, val correct: Button, val retry: Button
+    ) { @Volatile var invalid = false }
+    @Volatile private var manualGuard: ManualGuard? = null
     private var dictionarySummary = "词库尚未校验；正在后台加载"
     private var dictionaryStatusView: TextView? = null
     private var activeDialog: AlertDialog? = null
@@ -170,6 +196,7 @@ class MainActivity : Activity() {
                         refresh(); return@onSuccess
                     }
                     words = snapshot.words; stats = snapshot.stats
+                    wordsCredential = snapshot.deletionCredential; wordsVersion = snapshot.version
                     dialogDetail?.update(words.firstOrNull { it.entry.key == dialogDetail?.key })
                     when (currentTab) {
                         1 -> { renderWords(preserveDetail = true); updateExportButton() }
@@ -328,7 +355,7 @@ class MainActivity : Activity() {
             else {
                 selectedKey = selected.entry.key
                 detail.addView(text("生词详情", 18f, bold = true)); detail.space(12)
-                val card = panel(); detail.addView(card); inlineDetail = wordDetail(card, selected)
+                val card = panel(); detail.addView(card); inlineDetail = wordDetail(card, selected, wordsCredential, wordsVersion)
             }
         }
     }
@@ -339,29 +366,102 @@ class MainActivity : Activity() {
         addView(text("查询 ${word.queryCount} 次 · ${if (word.mastered) "已掌握" else "待复习"}", 14f, Paper.secondary))
         isClickable = true; isFocusable = true; setOnClickListener { action() }
     }
+    /**
+     * Holds one detail view's controls and its own operation state. [deletionCredential] and
+     * [snapshotVersion] come from the snapshot this detail was opened from and are kept until the
+     * binding/confirm dialog ends, so a save/undo/delete never edits a record that was re-collected after
+     * that snapshot, and a settled deletion can tell this detail apart from an old-snapshot rebuild that
+     * keeps the same deletion credential. While [busy] or [confirming] the controls stay disabled even if
+     * a background refresh calls [update].
+     */
     private class WordDetailBinding(
-        val key: String, private val form: TextView, private val count: TextView, private val dates: TextView,
-        private val mastery: Switch, private val note: EditText, private val undo: Button,
+        val key: String, val deletionCredential: Long, val snapshotVersion: Long,
+        private val save: Button, private val undo: Button, private val delete: Button,
+        private val mastery: Switch, private val note: EditText,
+        private val form: TextView, private val count: TextView, private val dates: TextView,
         private val definition: TextView, private val source: TextView, private val sourceBadge: TextView,
+        private val mutationAllowed: () -> Boolean,
+        private val stale: () -> Boolean,
+        private val onClose: (() -> Unit)?,
         private var savedMastered: Boolean, private var savedNote: String
     ) {
+        private var busy = false
+        private var confirming = false
+        private var invalidated = false
+        private var wordPresent = true
+
         fun update(word: LearnedWord?) {
+            // A binding whose own key/original credential is stale (the word was deleted after this
+            // detail's snapshot) or that was explicitly invalidated must never be repopulated as an
+            // operable record, even when a re-collected word with the same key now exists.
+            if (invalidated || stale()) {
+                wordPresent = false
+                form.text = "该词已删除或已重新收录，此详情已失效"
+                dates.text = "请重新打开详情查看当前记录。"
+                applyEnabled()
+                return
+            }
+            wordPresent = word != null
             form.text = if (word == null) "原词形：暂无有效查询" else "原词形：${word.lastForm}"
             count.text = "${word?.queryCount ?: 0} 次"
-            undo.isEnabled = word != null
-            if (word == null) { dates.text = "当前已无有效查询；已保存的笔记仍保留。"; return }
-            definition.text = "${word.entry.partOfSpeech} ${word.entry.meaning}"
-            source.text = RawKajwebDictionary.provenance(word.source, word.version)
-            sourceBadge.text = RawKajwebDictionary.label(word.source, word.version)
-            val formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")
-            fun date(time: Long) = Instant.ofEpochMilli(time).atZone(ZoneId.systemDefault()).format(formatter)
-            dates.text = "首次查询：${date(word.firstAt)}\n最近查询：${date(word.lastAt)}"
-            if (note.text.toString() == savedNote && savedNote != word.note) note.setText(word.note)
-            if (mastery.isChecked == savedMastered) mastery.isChecked = word.mastered
-            savedNote = word.note; savedMastered = word.mastered
+            if (word == null) {
+                dates.text = "当前已无有效查询；已保存的笔记仍保留。"
+            } else {
+                definition.text = "${word.entry.partOfSpeech} ${word.entry.meaning}"
+                source.text = RawKajwebDictionary.provenance(word.source, word.version)
+                sourceBadge.text = RawKajwebDictionary.label(word.source, word.version)
+                val formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")
+                fun date(time: Long) = Instant.ofEpochMilli(time).atZone(ZoneId.systemDefault()).format(formatter)
+                dates.text = "首次查询：${date(word.firstAt)}\n最近查询：${date(word.lastAt)}"
+                if (note.text.toString() == savedNote && savedNote != word.note) note.setText(word.note)
+                if (mastery.isChecked == savedMastered) mastery.isChecked = word.mastered
+                savedNote = word.note; savedMastered = word.mastered
+            }
+            applyEnabled()
+        }
+
+        fun isBusy() = busy || confirming
+        fun isStale() = stale()
+        fun dismiss() { onClose?.invoke() }
+        fun beginConfirm() { confirming = true; applyEnabled() }
+        fun cancelConfirm() { confirming = false; applyEnabled() }
+        fun beginBusy() { busy = true; applyEnabled() }
+        fun endBusy() { busy = false; confirming = false; applyEnabled() }
+        // Re-applies the control state after the shared mutation flag changed, still honoring this
+        // binding's own busy/confirming/invalidated state (so a frozen or invalidated card stays frozen).
+        fun refreshEnabled() = applyEnabled()
+        fun invalidate() {
+            invalidated = true
+            busy = true; confirming = true
+            save.isEnabled = false; undo.isEnabled = false; delete.isEnabled = false
+            mastery.isEnabled = false; note.isEnabled = false
+        }
+        fun masteredValue() = mastery.isChecked
+        fun noteValue() = note.text.toString()
+
+        private fun applyEnabled() {
+            // The binding's own key/original credential participates too: a stale or invalidated
+            // detail can never be re-enabled by endBusy, update or a shared-busy release.
+            val active = !invalidated && !stale() && !busy && !confirming && mutationAllowed()
+            save.isEnabled = active
+            undo.isEnabled = active && wordPresent
+            delete.isEnabled = active
+            mastery.isEnabled = active
+            note.isEnabled = active
         }
     }
-    private fun wordDetail(content: LinearLayout, word: LearnedWord, close: (() -> Unit)? = null): WordDetailBinding {
+    /**
+     * Re-applies the currently open details' control state once the shared [detailBusy] flag is
+     * cleared. A detail opened or refreshed while another word's operation was in flight is disabled
+     * by [mutationAllowed] together with that flag; a path that publishes no change notification
+     * (failure, STALE/NONE/NOT_FOUND, unchanged save) has nothing else to re-enable it. Each binding
+     * still keeps itself disabled while busy, confirming or invalidated.
+     */
+    private fun releaseDetailBusy() {
+        inlineDetail?.refreshEnabled()
+        dialogDetail?.refreshEnabled()
+    }
+    private fun wordDetail(content: LinearLayout, word: LearnedWord, deletionCredential: Long, snapshotVersion: Long, close: (() -> Unit)? = null): WordDetailBinding {
         val detailWidth = if (close != null) minOf(resources.configuration.screenWidthDp - 32, 640)
             else (contentWidthDp * 0.56f).toInt() - 24
         content.addView(text(word.entry.headword, 30f, bold = true).apply { typeface = Typeface.create("serif", Typeface.BOLD) })
@@ -396,35 +496,174 @@ class MainActivity : Activity() {
             setText(word.note); minLines = 3; gravity = Gravity.TOP
         }
         content.addView(note); content.space(16)
-        val save = button("保存笔记与状态", true) {
-            val marked = mastered.isChecked
-            val noteText = note.text.toString()
-            app.worker.execute {
-                val error = runCatching { app.repository.updateWord(word.entry.key, marked, noteText) }.exceptionOrNull()
-                main.post { if (!isDestroyed) { if (error == null) { toast("已保存"); close?.invoke() } else toast("保存失败：${error.message}") } }
-            }
-        }
-        val undo = button("撤销最近一次查询") { revokeLast(word, close) }
+        val save = button("保存笔记与状态", true) {}
+        val undo = button("撤销最近一次查询") {}
         content.addView(pair(save, undo, inlineAt(detailWidth - 48), 8)); content.space(8)
         content.addView(text("撤销只影响最近一次成功查询；之前的查询与已保存的笔记保留。", 16f, Paper.secondary))
-        return WordDetailBinding(word.entry.key, form, count, dates, mastered, note, undo,
-            definition, source, sourceBadge, word.mastered, word.note)
+        content.space(8)
+        val delete = button("删除生词") {}
+        delete.setTextColor(Paper.error)
+        content.addView(delete)
+        content.space(8)
+        content.addView(text("删除会清除该词的全部查询历史（含已撤销）、笔记与掌握状态，无法恢复；原始词库和其他生词不受影响。与“撤销最近一次查询”不同。", 16f, Paper.secondary))
+        val binding = WordDetailBinding(word.entry.key, deletionCredential, snapshotVersion, save, undo, delete, mastered, note,
+            form, count, dates, definition, source, sourceBadge, { !detailBusy },
+            { app.repository.deletions.isStale(word.entry.key, deletionCredential) }, close,
+            word.mastered, word.note)
+        save.setOnClickListener { saveDetail(binding, word, close) }
+        undo.setOnClickListener { revokeLast(binding, word, close) }
+        delete.setOnClickListener { confirmDelete(binding, word) }
+        binding.update(word)
+        return binding
     }
-    private fun revokeLast(word: LearnedWord, close: (() -> Unit)?) {
-        AlertDialog.Builder(this).setTitle("撤销最近一次查询？")
-            .setMessage("只撤销 ${word.entry.headword} 最近的一次成功事件，之前的查询和笔记保留。")
-            .setPositiveButton("撤销") { _, _ ->
-                app.worker.execute {
-                    val error = runCatching {
-                        val id = app.repository.latestEventId(word.entry.key) ?: error("没有可撤销的查询")
-                        app.repository.revoke(id)
-                    }.exceptionOrNull()
-                    main.post { if (!isDestroyed) {
-                        if (error == null) { close?.invoke(); toast("最近一次查询已撤销") }
-                        else toast("撤销失败：${error.message}")
-                    } }
+    private fun saveDetail(binding: WordDetailBinding, word: LearnedWord, close: (() -> Unit)?) {
+        if (binding.isBusy() || detailBusy) return
+        val marked = binding.masteredValue()
+        val noteText = binding.noteValue()
+        detailBusy = true
+        binding.beginBusy()
+        app.worker.execute {
+            val result = runCatching {
+                app.repository.updateWord(word.entry.key, marked, noteText, binding.deletionCredential)
+            }
+            main.post {
+                if (isDestroyed) return@post
+                detailBusy = false
+                binding.endBusy()
+                releaseDetailBusy()
+                val error = result.exceptionOrNull()
+                // Re-check the original deletion credential: a deletion may have committed between the
+                // worker result and this callback, so a late true must not be shown as saved nor re-enable old actions.
+                val stale = app.repository.deletions.isStale(word.entry.key, binding.deletionCredential)
+                when {
+                    // Deletion wins over a late failure: never re-enable old actions on an invalidated word.
+                    stale -> { binding.invalidate(); toast("未保存：该词已删除") }
+                    error != null -> toast("保存失败：${error.message}")
+                    result.getOrNull() == true -> { toast("已保存"); close?.invoke() }
+                    else -> { binding.invalidate(); toast("未保存：该词已删除") }
                 }
-            }.setNegativeButton("取消", null).show()
+            }
+        }
+    }
+    private fun revokeLast(binding: WordDetailBinding, word: LearnedWord, close: (() -> Unit)?) {
+        if (binding.isBusy() || detailBusy) return
+        binding.beginConfirm()
+        var proceed = false
+        val dialog = AlertDialog.Builder(this).setTitle("撤销最近一次查询？")
+            .setMessage("只撤销 ${word.entry.headword} 最近的一次成功事件，之前的查询和笔记保留。")
+            .setPositiveButton("撤销") { _, _ -> proceed = true; performRevoke(binding, word, close) }
+            .setNegativeButton("取消", null)
+            .create()
+        dialog.setOnDismissListener { if (!proceed) binding.cancelConfirm() }
+        dialog.show()
+    }
+    private fun performRevoke(binding: WordDetailBinding, word: LearnedWord, close: (() -> Unit)?) {
+        if (detailBusy) { binding.cancelConfirm(); return }
+        detailBusy = true
+        binding.beginBusy()
+        app.worker.execute {
+            // Resolve-and-revoke happens in the worker only after the stale check against the detail's
+            // original credential, so a stale confirm can never revoke an event of a re-collected word.
+            val result = runCatching { app.repository.revokeLatest(word.entry.key, binding.deletionCredential) }
+            main.post {
+                if (isDestroyed) return@post
+                detailBusy = false
+                binding.endBusy()
+                releaseDetailBusy()
+                val outcome = result.getOrNull()
+                // Deletion wins over a late result: a REVOKED that raced a committed deletion must not
+                // report success nor re-enable actions on an invalidated card.
+                if (app.repository.deletions.isStale(word.entry.key, binding.deletionCredential)) {
+                    binding.invalidate()
+                    toast("撤销失败：该词已删除，未撤销任何记录")
+                } else when {
+                    result.isFailure -> toast("撤销失败：${result.exceptionOrNull()?.message}")
+                    outcome == RevokeOutcome.REVOKED -> { close?.invoke(); toast("最近一次查询已撤销") }
+                    outcome == RevokeOutcome.STALE -> { binding.invalidate(); toast("撤销失败：该词已删除，未撤销任何记录") }
+                    else -> toast("没有可撤销的查询")
+                }
+            }
+        }
+    }
+    private fun confirmDelete(binding: WordDetailBinding, word: LearnedWord) {
+        if (binding.isBusy() || detailBusy) return
+        binding.beginConfirm()
+        var proceed = false
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("删除生词「${word.entry.headword}」？")
+            .setMessage("将永久删除「${word.entry.headword}」的全部查询历史（含已撤销）、笔记和掌握状态，删除后无法恢复；原始词库、其他生词和已导出的 PDF 不受影响。\n\n这与“撤销最近一次查询”不同：撤销只移除最近一次查询，保留其余历史和笔记。")
+            .setPositiveButton("删除") { _, _ -> proceed = true; performDelete(binding, word) }
+            .setNegativeButton("取消", null)
+            .create()
+        dialog.setOnDismissListener { if (!proceed) binding.cancelConfirm() }
+        dialog.show()
+    }
+    private fun performDelete(binding: WordDetailBinding, word: LearnedWord) {
+        if (detailBusy) { binding.cancelConfirm(); return }
+        detailBusy = true
+        binding.beginBusy()
+        app.worker.execute {
+            val result = runCatching { app.repository.deleteWord(word.entry.key, binding.deletionCredential) }
+            main.post {
+                if (isDestroyed) return@post
+                detailBusy = false
+                val error = result.exceptionOrNull()
+                val outcome = result.getOrNull()
+                when {
+                    error != null -> { binding.endBusy(); toast("删除失败：${error.message}") }
+                    else -> {
+                        // Every settled result (STALE/DELETED/NOT_FOUND) leaves the acting binding and
+                        // any current detail for this exact word bound to an old generation: freeze it
+                        // so it can never be re-enabled, and clear the current ones still showing the
+                        // old cache. A genuinely newer detail for the same word (fresh snapshot or a new
+                        // active query) is preserved; other words' selections and inputs are untouched.
+                        binding.invalidate()
+                        val cleared = clearStaleDetail(word.entry.key, binding)
+                        if (cleared && selectedKey == word.entry.key) selectedKey = null
+                        toast(when (outcome) {
+                            DeleteOutcome.STALE -> "未删除：该词已删除或已重新收录，请刷新后重新打开详情再操作"
+                            DeleteOutcome.DELETED -> "已删除「${word.entry.headword}」及全部记录"
+                            else -> "「${word.entry.headword}」已不在生词本"
+                        })
+                    }
+                }
+                // The acting binding settled above; re-enable whichever details are now current so a
+                // detail rebuilt/opened during this operation is no longer stuck on the shared busy flag.
+                releaseDetailBusy()
+            }
+        }
+    }
+    /**
+     * After a deletion settles, freeze and clear every currently open detail that still belongs to the
+     * settled word's old generation: the acting binding itself, or any same-key detail whose original data
+     * provenance is not newer than the acting binding's. Provenance is the pair of a detail's original
+     * snapshot revision and its original deletion credential, both taken when the binding was built and
+     * never re-read at render/rebuild time. A settled NOT_FOUND publishes no new revision and no deletion
+     * epoch, so a detail rebuilt from the same snapshot keeps the acting binding's provenance and must
+     * still be frozen rather than re-enabled on release; a stale same-key detail is always cleared. A
+     * genuinely newer detail for the same word (a fresh snapshot revision after a committed change, or a
+     * newer deletion credential after a committed deletion) keeps its inputs, and other words are never
+     * touched. Returns whether a current detail was cleared.
+     */
+    private fun clearStaleDetail(key: String, acting: WordDetailBinding): Boolean {
+        var cleared = false
+        inlineDetail?.let { current ->
+            if (current === acting ||
+                (current.key == key && (current.isStale() ||
+                    (current.snapshotVersion <= acting.snapshotVersion &&
+                        current.deletionCredential <= acting.deletionCredential)))) {
+                current.invalidate(); inlineDetail = null; cleared = true
+            }
+        }
+        dialogDetail?.let { current ->
+            if (current === acting ||
+                (current.key == key && (current.isStale() ||
+                    (current.snapshotVersion <= acting.snapshotVersion &&
+                        current.deletionCredential <= acting.deletionCredential)))) {
+                current.invalidate(); dialogDetail = null; current.dismiss(); cleared = true
+            }
+        }
+        return cleared
     }
     private fun showWordDialog(word: LearnedWord) {
         val content = panel()
@@ -433,7 +672,7 @@ class MainActivity : Activity() {
         header.addView(text("生词详情", 18f, bold = true), LinearLayout.LayoutParams(0, -2, 1f))
         header.addView(button("关闭") { dialog.dismiss() }.apply { contentDescription = "关闭生词详情" })
         content.addView(header); content.divider()
-        val binding = wordDetail(content, word) { dialog.dismiss() }
+        val binding = wordDetail(content, word, wordsCredential, wordsVersion) { dialog.dismiss() }
         showPaperDialog(dialog, 640) { if (dialogDetail === binding) dialogDetail = null }
         dialogDetail = binding
     }
@@ -625,6 +864,8 @@ class MainActivity : Activity() {
 
     private fun manualLookup(raw: String, replaces: String? = null, originalRaw: String = raw) {
         val token = manualGate.next()
+        // Captured at query start and carried through display, save and retry; never refreshed later.
+        val deletionCredential = app.repository.deletions.capture()
         app.worker.execute {
             if (!manualGate.accepts(token)) return@execute
             val lookup = runCatching { app.dictionary.getOrThrow().lookup(raw) }
@@ -634,13 +875,13 @@ class MainActivity : Activity() {
                     when (result) {
                         LookupResult.Invalid -> toast("请输入一个有效英文词头")
                         is LookupResult.Missing -> toast("${result.form} 未收录于原始词库；未新增记录")
-                        is LookupResult.Match -> showManualDefinition(originalRaw, result.form, result.entries.single(), replaces)
+                        is LookupResult.Match -> showManualDefinition(originalRaw, result.form, result.entries.single(), replaces, deletionCredential)
                     }
                 }.onFailure { toast("词库不可用：${it.message}；未生成释义或新增记录") }
             }
         }
     }
-    private fun showManualDefinition(raw: String, form: String, entry: DictionaryEntry, replaces: String?) {
+    private fun showManualDefinition(raw: String, form: String, entry: DictionaryEntry, replaces: String?, deletionCredential: Long) {
         val content = panel()
         content.addView(text(entry.headword, 28f, bold = true).apply { typeface = Typeface.create("serif", Typeface.BOLD) })
         content.addView(text("原词形：$form · ${entry.partOfSpeech}")); content.addView(text(entry.meaning, 18f))
@@ -652,44 +893,89 @@ class MainActivity : Activity() {
         val dialog = AlertDialog.Builder(this).setView(ScrollView(this).apply { addView(content) }).setNegativeButton("关闭", null).create()
         activeDialog?.dismiss(); activeDialog = dialog
         val token = manualGate.next()
-        dialog.setOnDismissListener { if (manualGate.accepts(token)) manualGate.next() }
+        val guard = ManualGuard(entry.key, deletionCredential, status, undo, correct, retry)
+        dialog.setOnDismissListener {
+            if (manualGuard === guard) manualGuard = null
+            if (manualGate.accepts(token)) manualGate.next()
+        }
         dialog.show()
+        manualGuard = guard
         val event = QueryEvent(UUID.randomUUID().toString(), entry.key, raw, form, System.currentTimeMillis())
         fun save() {
+            // A stale card (word deleted after this query started) must not start/retry a save.
+            if (manualCardStale(guard)) { invalidateManualCard(guard); return }
             retry.visibility = View.GONE; status.text = "保存中…"
             app.worker.execute {
                 if (!manualGate.accepts(token)) return@execute
-                val error = runCatching { app.repository.record(event, entry, replaces) { manualGate.accepts(token) } }.exceptionOrNull()
+                val result = runCatching { app.repository.record(event, entry, replaces, deletionCredential) { manualGate.accepts(token) } }
                 main.post {
-                    if (!isDestroyed && manualGate.accepts(token) && dialog.isShowing) {
-                        status.text = if (error == null) "已收录" else "保存失败：${error.message}"
-                        status.setTextColor(if (error == null) Paper.green else Paper.error)
-                        undo.isEnabled = error == null; correct.isEnabled = error == null
-                        retry.visibility = if (error == null) View.GONE else View.VISIBLE
+                    if (!isDestroyed && manualGate.accepts(token) && dialog.isShowing && manualGuard === guard && !guard.invalid) {
+                        val error = result.exceptionOrNull()
+                        val saved = result.getOrNull() == true
+                        when {
+                            // A committed deletion (even before the invalidation message runs) wins over a
+                            // late error/success: never re-show retry nor overwrite the invalid text.
+                            manualCardStale(guard) -> invalidateManualCard(guard)
+                            error != null -> {
+                                status.text = "保存失败：${error.message}"; status.setTextColor(Paper.error)
+                                undo.isEnabled = false; correct.isEnabled = false; retry.visibility = View.VISIBLE
+                            }
+                            saved -> {
+                                status.text = "已收录"; status.setTextColor(Paper.green)
+                                undo.isEnabled = true; correct.isEnabled = true; retry.visibility = View.GONE
+                            }
+                            else -> invalidateManualCard(guard)
+                        }
                     }
                 }
             }
         }
         retry.setOnClickListener { save() }
         undo.setOnClickListener {
+            // Reject an expired card at the entry too, not only after the worker returns.
+            if (manualCardStale(guard)) { invalidateManualCard(guard); return@setOnClickListener }
             undo.isEnabled = false; correct.isEnabled = false
             app.worker.execute {
-                val error = runCatching { app.repository.revoke(event.id) }.exceptionOrNull()
+                // A no-op revoke (word already deleted / event gone) must not be reported as success.
+                val result = runCatching { app.repository.revokeEvent(event.id, entry.key, deletionCredential) }
                 main.post {
-                    if (!isDestroyed && manualGate.accepts(token) && dialog.isShowing) {
-                        status.text = if (error == null) "本次已撤销，历史查询保留" else "撤销失败：${error.message}"
-                        if (error == null) undo.text = "已撤销" else { undo.isEnabled = true; correct.isEnabled = true }
+                    if (!isDestroyed && manualGate.accepts(token) && dialog.isShowing && manualGuard === guard) {
+                        // Deletion wins over a late revoke result: never re-enable undo/correct nor report REVOKED.
+                        if (manualCardStale(guard)) invalidateManualCard(guard) else {
+                            val outcome = result.getOrNull()
+                            when {
+                                result.isFailure -> {
+                                    status.text = "撤销失败：${result.exceptionOrNull()?.message}"
+                                    undo.isEnabled = true; correct.isEnabled = true
+                                }
+                                outcome == RevokeOutcome.REVOKED -> { status.text = "本次已撤销，历史查询保留"; undo.text = "已撤销" }
+                                else -> {
+                                    status.text = "撤销失败：该记录已不存在"; status.setTextColor(Paper.error)
+                                    undo.isEnabled = false; correct.isEnabled = false
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
         correct.setOnClickListener {
+            if (manualCardStale(guard)) { invalidateManualCard(guard); return@setOnClickListener }
             dialog.dismiss()
             val input = EditText(this).apply { setText(form); setSingleLine(true) }
             AlertDialog.Builder(this).setTitle("纠正词形").setView(input).setMessage("确认成功后撤销原事件，不重复累计。")
                 .setPositiveButton("确认查询") { _, _ -> manualLookup(input.text.toString(), event.id, raw) }.setNegativeButton("取消", null).show()
         }
         save()
+    }
+    // A manual card is out of date once it is invalidated or its word was deleted after the query
+    // credential was captured; both must win over any late success/failure result.
+    private fun manualCardStale(guard: ManualGuard): Boolean =
+        guard.invalid || app.repository.deletions.isStale(guard.key, guard.credential)
+    private fun invalidateManualCard(guard: ManualGuard) {
+        guard.invalid = true
+        guard.status.text = "未收录：该词已删除或查询已失效"; guard.status.setTextColor(Paper.error)
+        guard.undo.isEnabled = false; guard.correct.isEnabled = false; guard.retry.visibility = View.GONE
     }
     private fun export() {
         if (lostExportRequestCode >= 0 || cleaningLostExport) return

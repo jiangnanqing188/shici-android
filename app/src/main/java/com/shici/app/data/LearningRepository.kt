@@ -9,9 +9,14 @@ import com.shici.app.core.*
 import java.time.LocalDate
 import java.time.ZoneId
 
+/** Explicit three-state results so callers never report a stale/no-op revoke or delete as success. */
+enum class RevokeOutcome { REVOKED, NONE, STALE }
+enum class DeleteOutcome { DELETED, NOT_FOUND, STALE }
+
 /** Queries are serialized by ShiciApplication.worker; all mutations are transactional. */
 class LearningRepository(context: Context, name: String = "learning.db") : SQLiteOpenHelper(context, name, null, 1) {
     val changes = LearningChanges()
+    val deletions = DeletionGate()
 
     override fun onConfigure(db: SQLiteDatabase) { db.setForeignKeyConstraintsEnabled(true) }
 
@@ -32,9 +37,11 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
     }
 
     fun record(event: QueryEvent, entry: DictionaryEntry, replaces: String? = null,
+               deletionCredential: Long = deletions.capture(),
                canCommit: () -> Boolean = { true }): Boolean {
         require(event.entryKey == entry.key && !event.revoked)
         if (!canCommit()) return false
+        if (deletions.isStale(entry.key, deletionCredential)) return false
         val db = writableDatabase
         check(!db.inTransaction()) { "学习变更不能嵌套在未提交事务中" }
         db.beginTransaction()
@@ -45,7 +52,8 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
             if (changed) {
                 if (replaces != null) {
                     require(replaces != event.id)
-                    require(eventById(db, replaces) != null) { "原查询已不存在" }
+                    // If the original event was already deleted, never insert a replacement event.
+                    if (eventById(db, replaces) == null) return false
                     db.update("events", ContentValues().apply { put("revoked", 1) }, "id=?", arrayOf(replaces))
                 }
                 val dictionaryFields = ContentValues().apply {
@@ -73,11 +81,82 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
         db.update("events", ContentValues().apply { put("revoked", 1) }, "id=? AND revoked=0", arrayOf(id))
     }
 
-    fun updateWord(key: String, mastered: Boolean, note: String) = change { db ->
+    /**
+     * Revokes the newest active event of [entryKey] only if this word was not deleted after
+     * [deletionCredential] was taken. Returns STALE before resolving the latest event, so an old
+     * confirm dialog can never revoke an event of a word that was deleted and re-collected.
+     */
+    fun revokeLatest(entryKey: String, deletionCredential: Long): RevokeOutcome {
+        if (deletions.isStale(entryKey, deletionCredential)) return RevokeOutcome.STALE
+        val db = writableDatabase
+        check(!db.inTransaction()) { "学习变更不能嵌套在未提交事务中" }
+        db.beginTransaction()
+        val revoked: Boolean
+        try {
+            val id = latestEventId(db, entryKey)
+            revoked = id != null && db.update("events", ContentValues().apply { put("revoked", 1) },
+                "id=? AND revoked=0", arrayOf(id)) > 0
+            db.setTransactionSuccessful()
+        } finally { db.endTransaction() }
+        if (revoked) changes.publishCommitted()
+        return if (revoked) RevokeOutcome.REVOKED else RevokeOutcome.NONE
+    }
+
+    /**
+     * Revokes one exact active event of [entryKey]. Unlike the raw [revoke], a deleted/replaced word
+     * or an already-gone event is reported explicitly instead of being shown as a successful undo.
+     */
+    fun revokeEvent(id: String, entryKey: String, deletionCredential: Long): RevokeOutcome {
+        if (deletions.isStale(entryKey, deletionCredential)) return RevokeOutcome.STALE
+        var revoked = false
+        change { db ->
+            val affected = db.update("events", ContentValues().apply { put("revoked", 1) },
+                "id=? AND entry_key=? AND revoked=0", arrayOf(id, entryKey))
+            revoked = affected > 0
+            affected
+        }
+        return if (revoked) RevokeOutcome.REVOKED else RevokeOutcome.NONE
+    }
+
+    fun updateWord(key: String, mastered: Boolean, note: String,
+                   deletionCredential: Long = deletions.capture()): Boolean {
+        // A late detail save must never edit a word that was deleted after this detail was opened.
+        if (deletions.isStale(key, deletionCredential)) return false
         val marked = if (mastered) 1 else 0
-        db.update("words", ContentValues().apply {
-            put("mastered", marked); put("note", note)
-        }, "entry_key=? AND (mastered<>? OR note<>?)", arrayOf(key, marked.toString(), note))
+        change { db ->
+            db.update("words", ContentValues().apply {
+                put("mastered", marked); put("note", note)
+            }, "entry_key=? AND (mastered<>? OR note<>?)", arrayOf(key, marked.toString(), note))
+        }
+        return true
+    }
+
+    /**
+     * Deletes one word's whole personal history: every event (revoked included) and the words row
+     * with its note/mastery, in a single transaction by exact key. [deletionCredential] must come
+     * from the snapshot the caller's dialog was bound to; a deletion request based on stale UI data
+     * (the word was deleted after that snapshot) is rejected with STALE and never touches a record
+     * that was re-collected since. NOT_FOUND means there was nothing to delete (safe no-op); DELETED
+     * means a word was actually removed. Any failure rolls back fully, does not publish and does not
+     * invalidate in-flight queries for this word.
+     */
+    fun deleteWord(entryKey: String, deletionCredential: Long): DeleteOutcome {
+        if (deletions.isStale(entryKey, deletionCredential)) return DeleteOutcome.STALE
+        val db = writableDatabase
+        check(!db.inTransaction()) { "学习变更不能嵌套在未提交事务中" }
+        db.beginTransaction()
+        val deleted: Boolean
+        try {
+            db.delete("events", "entry_key=?", arrayOf(entryKey))
+            deleted = db.delete("words", "entry_key=?", arrayOf(entryKey)) > 0
+            db.setTransactionSuccessful()
+        } finally { db.endTransaction() }
+        if (deleted) {
+            deletions.recordDeletion(entryKey)
+            changes.publishCommitted()
+            return DeleteOutcome.DELETED
+        }
+        return DeleteOutcome.NOT_FOUND
     }
 
     private fun change(write: (SQLiteDatabase) -> Int) {
@@ -95,12 +174,15 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
     fun snapshot(date: LocalDate = LocalDate.now(), zone: ZoneId = ZoneId.systemDefault()): LearningSnapshot {
         val db = readableDatabase
         check(!db.inTransaction()) { "只能读取已提交的学习快照" }
+        // Taken before the rows are read: if a word present here is deleted afterwards, the snapshot's
+        // credential for that word becomes stale, so UI bound to this data can never edit a re-collected row.
+        val credential = deletions.capture()
         db.beginTransactionNonExclusive()
         try {
             val words = words()
             val stats = LearningRules.summarize(words, events(), date, zone)
             db.setTransactionSuccessful()
-            return LearningSnapshot(words, stats, changes.version)
+            return LearningSnapshot(words, stats, changes.version, credential)
         } finally { db.endTransaction() }
     }
 
@@ -130,7 +212,9 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
         return words
     }
 
-    fun latestEventId(key: String): String? = readableDatabase.rawQuery(
+    fun latestEventId(key: String): String? = latestEventId(readableDatabase, key)
+
+    private fun latestEventId(db: SQLiteDatabase, key: String): String? = db.rawQuery(
         "SELECT id FROM events WHERE entry_key=? AND revoked=0 ORDER BY time DESC, id DESC LIMIT 1", arrayOf(key)
     ).use { c -> if (c.moveToFirst()) c.getString(0) else null }
 

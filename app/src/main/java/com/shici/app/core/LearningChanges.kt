@@ -19,7 +19,17 @@ class LearningChanges {
     }
 }
 
-data class LearningSnapshot(val words: List<LearnedWord>, val stats: LearningStats, val version: Long)
+/**
+ * [deletionCredential] is the deletion generation taken by the worker immediately before these rows
+ * were read, so a detail opened from this snapshot stays bound to the data it actually shows. Default
+ * is only for compatibility with synthetic snapshots; live UI must use the repository-provided value.
+ */
+data class LearningSnapshot(
+    val words: List<LearnedWord>,
+    val stats: LearningStats,
+    val version: Long,
+    val deletionCredential: Long = 0L
+)
 
 /** Main-thread gate: duplicate notifications and stopped/older reads never replace current data. */
 class LearningRefreshGate {
