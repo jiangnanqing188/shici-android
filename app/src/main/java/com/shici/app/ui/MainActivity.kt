@@ -19,12 +19,15 @@ import android.text.TextWatcher
 import android.view.*
 import android.widget.*
 import com.shici.app.ShiciApplication
+import com.shici.app.BuildConfig
 import com.shici.app.capture.*
 import com.shici.app.core.*
 import com.shici.app.data.DeleteOutcome
+import com.shici.app.data.RestoreOutcome
 import com.shici.app.data.RevokeOutcome
 import com.shici.app.export.PdfExporter
 import com.shici.app.export.LostPdfFileCleanup
+import java.io.ByteArrayOutputStream
 import java.time.*
 import java.time.format.DateTimeFormatter
 import java.util.UUID
@@ -55,6 +58,16 @@ class MainActivity : Activity() {
     private var consentGeneration = -1L
     private val refreshGate = LearningRefreshGate()
     private val exportSession = LearningExportSession()
+    private val backupExportSession = LearningBackupExportSession()
+    private val restoreSession = LearningRestoreSession()
+    // Document request codes whose picker was open when the activity was recreated. Frozen backup
+    // state is in memory only, so these results can no longer be applied: reserve the codes (never
+    // reuse) and just tell the user to restart, without touching any file.
+    private val interruptedDocumentRequests = mutableSetOf<Int>()
+    private var backupExportButton: Button? = null
+    private var restoreButton: Button? = null
+    private var backupStatusView: TextView? = null
+    private var restorePreviewDialog: AlertDialog? = null
     private var lostExportRequestCode = -1
     private var cleaningLostExport = false
     private var exportDialog: AlertDialog? = null
@@ -120,6 +133,9 @@ class MainActivity : Activity() {
         consentGeneration = savedInstanceState?.getLong("consent", -1L) ?: -1L
         lostExportRequestCode = savedInstanceState?.getInt("export_request", -1) ?: -1
         if (lostExportRequestCode >= 0) LearningExportSession.reserveRequestCode(lostExportRequestCode)
+        savedInstanceState?.getIntArray("backup_requests")?.forEach { code ->
+            if (code >= 0) { interruptedDocumentRequests += code; LearningExportSession.reserveRequestCode(code) }
+        }
         buildShell()
     }
     override fun onStart() {
@@ -135,11 +151,19 @@ class MainActivity : Activity() {
         app.repository.changes.remove(dataListener)
         refreshGate.stop()
         if (exportSession.cancelPreparation()) { exportDialog?.dismiss(); updateExportButton() }
+        // A backup/restore picker (AWAIT_IMPORT/AWAIT_SAFETY) stops this activity itself, so only the
+        // non-picker preparations are cancelled here; a live picker and an in-flight apply are kept.
+        if (backupExportSession.cancelPreparation()) updateBackupButtons()
+        if (restoreSession.cancelPreparation()) {
+            restorePreviewDialog?.dismiss(); restorePreviewDialog = null; updateBackupButtons()
+        }
         CaptureStatus.remove(statusListener)
         super.onStop()
     }
     override fun onDestroy() {
         refreshGate.stop(); exportSession.clear(); manualGate.next()
+        backupExportSession.clear(); restoreSession.clear()
+        restorePreviewDialog?.dismiss(); restorePreviewDialog = null
         activeDialog?.dismiss(); activeDialog = null
         super.onDestroy()
     }
@@ -147,6 +171,12 @@ class MainActivity : Activity() {
         outState.putInt("tab", currentTab); outState.putString("search", search)
         outState.putLong("consent", consentGeneration)
         outState.putInt("export_request", exportSession.fileRequestCode ?: lostExportRequestCode)
+        val pendingBackupRequests = ArrayList<Int>()
+        backupExportSession.fileRequestCode?.let { pendingBackupRequests += it }
+        restoreSession.importRequestCode?.let { pendingBackupRequests += it }
+        restoreSession.safetyRequestCode?.let { pendingBackupRequests += it }
+        pendingBackupRequests += interruptedDocumentRequests
+        outState.putIntArray("backup_requests", pendingBackupRequests.toIntArray())
         super.onSaveInstanceState(outState)
     }
 
@@ -227,6 +257,7 @@ class MainActivity : Activity() {
     private fun render() {
         floatingSwitch = null; floatingText = null; stopCaptureButton = null; searchList = null; detailPanel = null
         exportButton = null; inlineDetail = null; dictionaryStatusView = null
+        backupExportButton = null; restoreButton = null; backupStatusView = null
         body.removeAllViews()
         val navOffset = if (wide) 3 else 0
         repeat(4) { index ->
@@ -763,7 +794,19 @@ class MainActivity : Activity() {
             addView(pair(input, query, inlineAt(sectionWidth - 48))); space(12)
             addView(text("未知词或未收录词形不生成释义、不新增记录；旧演示记录仍按旧来源展示。", 16f, Paper.secondary))
         }
-        library.addView(demo)
+        library.addView(demo); library.space(16)
+        val backup = panel().apply {
+            addView(text("备份与恢复", 20f, bold = true)); space(8)
+            addView(text("把本机学习数据（全部词条与事件，含已撤销历史、笔记与掌握状态）导出为一个 .shicibackup 文件，或用备份完整覆盖当前数据。文件只通过系统文档选择器创建或读取，不联网、不上传。", 16f, Paper.secondary)); space(12)
+            backupExportButton = button("导出学习数据备份", true) { exportLearningBackup() }
+            addView(backupExportButton); space(8)
+            restoreButton = button("从备份完整恢复") { startRestore() }
+            addView(restoreButton); space(12)
+            addView(text("恢复是完整覆盖、不合并、不猜测冲突：备份里没有的词也会被移除。恢复前必须先把当前数据另存为一个安全备份文件，写回校验通过且数据未变化时才会覆盖。空备份可在确认后清空学习数据。备份是本地明文个人数据，未加密、不防恶意篡改，请妥善保存。", 16f, Paper.warning)); space(8)
+            backupStatusView = text("", 16f, Paper.secondary); addView(backupStatusView)
+            updateBackupButtons()
+        }
+        library.addView(backup)
         val boundaries = column()
         val privacy = panel().apply {
             addView(text("权限与隐私", 20f, bold = true)); space(8)
@@ -785,7 +828,7 @@ class MainActivity : Activity() {
         boundaries.addView(privacy); boundaries.space(16)
         val limits = panel().apply {
             addView(text("原型限制", 20f, bold = true)); space(8)
-            addView(text("当前 PDF 仅支持搜索结果的 A4 记忆版。正式词典、发音、例句、备份恢复、自测版与日期筛选尚未实现。", 16f, Paper.secondary))
+            addView(text("当前 PDF 仅支持搜索结果的 A4 记忆版。正式词典、发音、例句、自测版与日期筛选尚未实现；本地备份仅为完整覆盖恢复，不提供合并或云同步。", 16f, Paper.secondary))
             divider(); addView(text("尚未真机验证速度、断网初装 OCR、海文兼容性与长时间功耗。", 16f, Paper.warning))
         }
         boundaries.addView(limits)
@@ -845,7 +888,12 @@ class MainActivity : Activity() {
                     runCatching { startForegroundService(intent) }.onFailure { permissionError("无法启动捕获服务：${it.message}") }
                 } else permissionError("已取消屏幕捕获，查词未开启")
             }
-            else -> if (lostExportRequestCode >= 0 && requestCode == lostExportRequestCode) {
+            else -> if (interruptedDocumentRequests.remove(requestCode)) {
+                // Frozen backup/restore state does not survive recreation: never auto-apply from the
+                // URI or touch any file; the reserved request code is now consumed for good.
+                toast("上次的备份或恢复操作已中断，请重新开始；未改动任何文件")
+                updateBackupButtons()
+            } else if (lostExportRequestCode >= 0 && requestCode == lostExportRequestCode) {
                 // Consume before IO: another recreation must not wait for this result again.
                 lostExportRequestCode = -1
                 if (resultCode != RESULT_OK) { toast("已取消导出"); updateExportButton() }
@@ -857,6 +905,12 @@ class MainActivity : Activity() {
                 else {
                     exportSession.cancel(requestCode); toast("已取消导出"); updateExportButton()
                 }
+            } else if (requestCode == backupExportSession.fileRequestCode) {
+                handleBackupExportResult(requestCode, resultCode, data)
+            } else if (requestCode == restoreSession.importRequestCode) {
+                handleRestoreImportResult(requestCode, resultCode, data)
+            } else if (requestCode == restoreSession.safetyRequestCode) {
+                handleRestoreSafetyResult(requestCode, resultCode, data)
             }
         }
     }
@@ -1056,6 +1110,211 @@ class MainActivity : Activity() {
                 updateExportButton()
             } }
         }
+    }
+    private fun updateBackupButtons() {
+        val busy = backupExportSession.busy || restoreSession.busy
+        backupExportButton?.isEnabled = !busy
+        restoreButton?.isEnabled = !busy
+        backupStatusView?.text = when {
+            restoreSession.busy -> "正在处理恢复：读取并校验备份、准备安全备份和原子覆盖，请勿离开本页"
+            backupExportSession.busy -> "正在准备备份文件，请稍候"
+            else -> "仅本地备份，不联网、不上传。"
+        }
+    }
+    private fun exportLearningBackup() {
+        if (backupExportSession.busy || restoreSession.busy) return
+        if (lostExportRequestCode >= 0 || cleaningLostExport) { toast("请先完成或取消当前 PDF 导出"); return }
+        val id = backupExportSession.begin() ?: return
+        updateBackupButtons()
+        app.worker.execute {
+            val result = runCatching {
+                val snapshot = app.repository.backupSnapshot()
+                LearningBackupCodec.encode(snapshot.data, BuildConfig.VERSION_NAME, BuildConfig.VERSION_CODE, System.currentTimeMillis())
+            }
+            main.post {
+                if (isDestroyed) return@post
+                result.onSuccess { bytes ->
+                    if (!backupExportSession.freeze(id, bytes)) return@onSuccess
+                    updateBackupButtons()
+                    val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE)
+                        .setType(LearningBackupCodec.MIME_TYPE)
+                        .putExtra(Intent.EXTRA_TITLE, "拾词-学习数据备份-${LocalDate.now()}${LearningBackupCodec.FILE_SUFFIX}")
+                    runCatching { startActivityForResult(intent, id) }.onFailure {
+                        backupExportSession.cancel(id); updateBackupButtons()
+                        toast("无法打开文件保存：${it.message}")
+                    }
+                }.onFailure {
+                    backupExportSession.cancel(id); updateBackupButtons()
+                    toast("准备备份失败：${it.message}")
+                }
+            }
+        }
+    }
+    private fun handleBackupExportResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        if (backupExportSession.fileRequestCode != requestCode) return
+        if (resultCode != RESULT_OK || data?.data == null) {
+            backupExportSession.cancel(requestCode); updateBackupButtons(); toast("已取消备份"); return
+        }
+        val bytes = backupExportSession.takeResult(requestCode) ?: return
+        val uri = data.data!!
+        app.worker.execute {
+            val error = runCatching {
+                val output = contentResolver.openOutputStream(uri, "wt") ?: error("无法写入所选位置")
+                output.use { it.write(bytes); it.flush() }
+            }.exceptionOrNull()
+            main.post {
+                if (isDestroyed) return@post
+                backupExportSession.cancel(requestCode)
+                updateBackupButtons()
+                toast(if (error == null) "学习数据备份已写入所选位置" else "备份失败：${error.message}；目标文件可能不完整，请删除后重试")
+            }
+        }
+    }
+    private fun startRestore() {
+        if (backupExportSession.busy || restoreSession.busy) return
+        if (lostExportRequestCode >= 0 || cleaningLostExport) { toast("请先完成或取消当前 PDF 导出"); return }
+        val id = restoreSession.beginImport() ?: return
+        updateBackupButtons()
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*")
+        runCatching { startActivityForResult(intent, id) }.onFailure {
+            restoreSession.cancelImport(id); updateBackupButtons()
+            toast("无法打开文件选择：${it.message}")
+        }
+    }
+    private fun handleRestoreImportResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        if (restoreSession.importRequestCode != requestCode) return
+        if (resultCode != RESULT_OK || data?.data == null) {
+            restoreSession.cancelImport(requestCode); updateBackupButtons(); toast("已取消恢复"); return
+        }
+        val uri = data.data!!
+        if (!restoreSession.beginReading(requestCode, uri.toString())) return
+        updateBackupButtons()
+        app.worker.execute {
+            // Read and validate the whole file first; the frozen payload is never re-read at apply time.
+            val result = runCatching { LearningBackupCodec.decode(readBoundedBytes(uri)) }
+            main.post {
+                if (isDestroyed) return@post
+                result.onSuccess { backup ->
+                    if (!restoreSession.freezeImport(requestCode, backup)) return@onSuccess
+                    updateBackupButtons()
+                    showRestorePreview(backup)
+                }.onFailure {
+                    restoreSession.cancelImport(requestCode); updateBackupButtons()
+                    toast("无法读取备份：${it.message}")
+                }
+            }
+        }
+    }
+    private fun showRestorePreview(backup: LearningBackup) {
+        val content = panel()
+        val dialog = paperDialog(content)
+        content.addView(text("从备份完整恢复", 24f, bold = true)); content.space(12)
+        content.addView(text("备份创建时间：${date(backup.createdAt)}", 18f))
+        content.addView(text("词条 ${backup.wordCount} 个 · 事件 ${backup.eventCount} 条", 18f))
+        content.addView(text("备份应用版本：${backup.appVersionName}（${backup.appVersionCode}）", 16f, Paper.secondary)); content.space(12)
+        val warning = column().apply {
+            setPadding(dp(16), dp(12), dp(16), dp(12)); background = shape(Paper.background, 8)
+            addView(text(if (backup.wordCount == 0 && backup.eventCount == 0)
+                "这是一个空备份：确认恢复后会清空当前全部学习数据。" else
+                "恢复会用备份内容完整替换当前全部学习数据（不合并、不猜测冲突）；备份里没有的词也会被移除。",
+                16f, Paper.warning, true))
+            addView(text("恢复前必须先把当前数据另存为一个安全备份文件；只有写入关闭并读回校验一致、且数据未在此期间变化时才会覆盖。", 16f, Paper.secondary))
+            addView(text("备份是本地明文个人数据，未加密、不防恶意篡改。", 16f, Paper.secondary))
+        }
+        content.addView(warning); content.space(24)
+        val cancel = button("取消") { dialog.dismiss() }.apply { background = shape(Paper.background, 8); setTextColor(Paper.ink) }
+        val confirm = button("继续并选择安全备份位置", true) {
+            val safetyId = restoreSession.confirm() ?: return@button
+            dialog.dismiss()
+            updateBackupButtons()
+            val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE)
+                .setType(LearningBackupCodec.MIME_TYPE)
+                .putExtra(Intent.EXTRA_TITLE, "拾词-恢复前安全备份-${LocalDate.now()}${LearningBackupCodec.FILE_SUFFIX}")
+            runCatching { startActivityForResult(intent, safetyId) }.onFailure {
+                restoreSession.cancelSafety(safetyId); updateBackupButtons()
+                toast("无法打开安全备份保存位置：${it.message}")
+            }
+        }
+        content.addView(pair(cancel, confirm, inlineAt(minOf(resources.configuration.screenWidthDp - 32, 560) - 48), 12))
+        showPaperDialog(dialog, 560) {
+            if (restorePreviewDialog === dialog) restorePreviewDialog = null
+            if (restoreSession.cancelPreview()) updateBackupButtons()
+        }
+        restorePreviewDialog = dialog
+    }
+    private fun handleRestoreSafetyResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        if (restoreSession.safetyRequestCode != requestCode) return
+        if (resultCode != RESULT_OK || data?.data == null) {
+            restoreSession.cancelSafety(requestCode); updateBackupButtons(); toast("已取消恢复：未选择安全备份位置"); return
+        }
+        val safetyUri = data.data!!
+        val importUri = restoreSession.pendingImportUri
+        if (importUri != null && safetyUri.toString() == importUri) {
+            restoreSession.cancelSafety(requestCode); updateBackupButtons()
+            toast("安全备份位置不能与导入的备份文件相同，已取消恢复"); return
+        }
+        val backup = restoreSession.beginApply(requestCode) ?: return
+        // Cross-thread cancellation identity for exactly this apply. onDestroy (through restoreSession.clear),
+        // a replaced session or an invalidated apply must not let this queued worker overwrite the database.
+        val apply = restoreSession.applyHandle ?: return
+        updateBackupButtons()
+        app.worker.execute {
+            // Revalidate on the worker thread before any I/O: an apply invalidated while this task was
+            // queued (destroyed/replaced session) must not even write the safety backup.
+            if (!apply.isActive()) return@execute
+            val result = runCatching {
+                val pre = app.repository.backupSnapshot()
+                val encoded = LearningBackupCodec.encode(pre.data, BuildConfig.VERSION_NAME, BuildConfig.VERSION_CODE, System.currentTimeMillis())
+                if (!writeSafetyBackup(safetyUri, encoded)) error("恢复前安全备份未能读回校验一致")
+                // Same worker and pre-transaction check: a change since the snapshot must not be overwritten.
+                // This is also the last admission gate: admit() is linearized against session invalidation, so
+                // a destroy/clear before it must not write, while an already admitted transaction is allowed to
+                // commit atomically — no half-write, no false cancellation claim, no forced mid-commit rollback.
+                if (!apply.admit()) return@runCatching null
+                app.repository.restoreBackup(backup.data, pre.revision)
+            }
+            main.post {
+                if (isDestroyed) return@post
+                // Settle only this operation; finish() is request/phase guarded, so a replaced session
+                // keeps its own busy state and a late callback cannot end the new session.
+                restoreSession.finish(requestCode)
+                updateBackupButtons()
+                result.onSuccess { outcome ->
+                    when (outcome) {
+                        RestoreOutcome.RESTORED -> {
+                            restorePreviewDialog?.dismiss(); restorePreviewDialog = null
+                            toast("已完整恢复：替换为备份中的 ${backup.wordCount} 个词、${backup.eventCount} 条事件")
+                        }
+                        RestoreOutcome.REVISION_CHANGED ->
+                            toast("学习数据在准备期间有新变化，本次未覆盖；请重新开始恢复")
+                        else -> Unit
+                    }
+                }.onFailure { toast("恢复失败，学习数据未改变：${it.message}") }
+            }
+        }
+    }
+    /** Reads at most the backup size cap + 1 byte so a huge or endless stream cannot allocate freely. */
+    private fun readBoundedBytes(uri: Uri): ByteArray {
+        val input = contentResolver.openInputStream(uri) ?: throw BackupFormatException("无法读取所选文件")
+        return input.use { stream ->
+            val out = ByteArrayOutputStream()
+            val buffer = ByteArray(64 * 1024)
+            var total = 0L
+            while (true) {
+                val read = stream.read(buffer)
+                if (read < 0) break
+                total += read
+                if (total > LearningBackupCodec.MAX_FILE_BYTES) throw BackupFormatException("备份文件超过 ${LearningBackupCodec.MAX_BYTES_LABEL} 上限")
+                out.write(buffer, 0, read)
+            }
+            out.toByteArray()
+        }
+    }
+    /** Writes the pre-restore snapshot, then reads it back and requires byte-identical content. */
+    private fun writeSafetyBackup(uri: Uri, bytes: ByteArray): Boolean {
+        val output = contentResolver.openOutputStream(uri, "wt") ?: throw java.io.IOException("无法写入所选安全备份位置")
+        output.use { it.write(bytes); it.flush() }
+        return readBoundedBytes(uri).contentEquals(bytes)
     }
     private fun date(time: Long) = Instant.ofEpochMilli(time).atZone(ZoneId.systemDefault()).format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm"))
     private fun toast(message: String) { Toast.makeText(this, message, Toast.LENGTH_LONG).show() }

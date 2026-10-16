@@ -13,6 +13,12 @@ import java.time.ZoneId
 enum class RevokeOutcome { REVOKED, NONE, STALE }
 enum class DeleteOutcome { DELETED, NOT_FOUND, STALE }
 
+/** A full overwrite is refused when the database changed since the pre-restore snapshot was taken. */
+enum class RestoreOutcome { RESTORED, REVISION_CHANGED }
+
+/** Raw two-table snapshot plus the committed revision it was read at; no derived cache. */
+data class LearningBackupSnapshot(val data: LearningBackupData, val revision: Long)
+
 /** Queries are serialized by ShiciApplication.worker; all mutations are transactional. */
 class LearningRepository(context: Context, name: String = "learning.db") : SQLiteOpenHelper(context, name, null, 1) {
     val changes = LearningChanges()
@@ -157,6 +163,71 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
             return DeleteOutcome.DELETED
         }
         return DeleteOutcome.NOT_FOUND
+    }
+
+    /**
+     * Reads every raw `words` row (including words whose only events are revoked) and every `events`
+     * row (revoked included) plus the committed revision, all in one read transaction. Never uses the
+     * active-events aggregate, so personal notes/mastery, historical sources and revoked history are
+     * all preserved. Counts and dates are re-aggregated later from these rows, never cached here.
+     */
+    fun backupSnapshot(): LearningBackupSnapshot {
+        check(!readableDatabase.inTransaction()) { "只能读取已提交的学习备份快照" }
+        val db = readableDatabase
+        val revision = changes.version
+        db.beginTransactionNonExclusive()
+        try {
+            val words = ArrayList<BackupWord>()
+            db.rawQuery("SELECT entry_key, headword, pos, meaning, source, version, mastered, note FROM words ORDER BY entry_key", null).use { c ->
+                while (c.moveToNext()) words += BackupWord(c.text("entry_key"), c.text("headword"), c.text("pos"),
+                    c.text("meaning"), c.text("source"), c.text("version"), c.int("mastered") == 1, c.text("note"))
+            }
+            val events = ArrayList<BackupEvent>()
+            db.rawQuery("SELECT id, entry_key, raw_text, final_form, time, revoked FROM events ORDER BY time, id", null).use { c ->
+                while (c.moveToNext()) events += BackupEvent(c.text("id"), c.text("entry_key"), c.text("raw_text"),
+                    c.text("final_form"), c.long("time"), c.int("revoked") == 1)
+            }
+            db.setTransactionSuccessful()
+            return LearningBackupSnapshot(LearningBackupData(words, events), revision)
+        } finally { db.endTransaction() }
+    }
+
+    /**
+     * Replaces the whole learning database with [data] in one transaction, first deleting `events` then
+     * `words` and inserting `words` before `events`. Any failure rolls back completely: no partial
+     * import, no success signal and no invalidation. [expectedRevision] is checked before the
+     * transaction; if the database changed since the pre-restore snapshot was read the overwrite is
+     * refused (no data written) so newer queries are never silently lost. Only after
+     * `endTransaction` returns successfully does the global restore barrier advance and a single
+     * change notification publish, invalidating every credential captured before the restore.
+     */
+    fun restoreBackup(data: LearningBackupData, expectedRevision: Long): RestoreOutcome {
+        check(!writableDatabase.inTransaction()) { "学习变更不能嵌套在未提交事务中" }
+        if (changes.version != expectedRevision) return RestoreOutcome.REVISION_CHANGED
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            db.delete("events", null, null)
+            db.delete("words", null, null)
+            data.words.forEach { word ->
+                db.insertOrThrow("words", null, ContentValues().apply {
+                    put("entry_key", word.entryKey); put("headword", word.headword); put("pos", word.partOfSpeech)
+                    put("meaning", word.meaning); put("source", word.source); put("version", word.version)
+                    put("mastered", if (word.mastered) 1 else 0); put("note", word.note)
+                })
+            }
+            data.events.forEach { event ->
+                db.insertOrThrow("events", null, ContentValues().apply {
+                    put("id", event.id); put("entry_key", event.entryKey); put("raw_text", event.rawText)
+                    put("final_form", event.finalForm); put("time", event.time)
+                    put("revoked", if (event.revoked) 1 else 0)
+                })
+            }
+            db.setTransactionSuccessful()
+        } finally { db.endTransaction() }
+        deletions.recordRestore()
+        changes.publishCommitted()
+        return RestoreOutcome.RESTORED
     }
 
     private fun change(write: (SQLiteDatabase) -> Int) {

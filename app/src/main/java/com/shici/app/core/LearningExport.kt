@@ -21,11 +21,17 @@ class LearningExportSession {
     companion object {
         private val nextRequestCode = AtomicInteger(1000)
         fun reserveRequestCode(code: Int) { nextRequestCode.updateAndGet { maxOf(it, code + 1) } }
+
+        /**
+         * Single source of document request codes. PDF export and learning backup/restore all draw
+         * from here so no two ACTION_CREATE_DOCUMENT / ACTION_OPEN_DOCUMENT requests can collide.
+         */
+        fun allocateRequestCode(): Int = nextRequestCode.getAndIncrement()
     }
 
     fun begin(search: String): Request? {
         if (busy) return null
-        return Request(nextRequestCode.getAndIncrement(), search).also { request = it; stage = Stage.LOADING }
+        return Request(allocateRequestCode(), search).also { request = it; stage = Stage.LOADING }
     }
     fun freeze(request: Request, snapshot: LearningExportSnapshot): Boolean {
         if (this.request != request || stage != Stage.LOADING || snapshot.search != request.search) return false
