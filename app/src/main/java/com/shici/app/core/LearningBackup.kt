@@ -6,6 +6,8 @@ import java.nio.CharBuffer
 import java.nio.charset.CharacterCodingException
 import java.nio.charset.CodingErrorAction
 import java.security.MessageDigest
+import java.time.LocalDate
+import java.time.ZoneId
 
 /** Raised for any malformed, truncated, oversized, future-version or inconsistent backup file. */
 class BackupFormatException(message: String) : Exception(message)
@@ -32,8 +34,76 @@ data class BackupEvent(
     val revoked: Boolean
 )
 
-/** Full raw two-table payload; counts/dates are re-aggregated from these rows, never cached here. */
-data class LearningBackupData(val words: List<BackupWord>, val events: List<BackupEvent>)
+/** Study settings; defaults reproduce a fresh v2 database and the v1 migration. */
+data class BackupStudySettings(
+    val selectedBook: String = StudyBook.default.id,
+    val dailyNewGoal: Int = StudyRules.DEFAULT_DAILY_NEW_GOAL
+)
+
+/**
+ * One `study_states` row (shared study progress for one entry key). [lastReviewSeq] is the commit
+ * sequence of the feedback that produced this exact stage/due/last-review, so the true final commit
+ * can be identified without assuming the wall clock is monotonic.
+ */
+data class BackupStudyState(
+    val entryKey: String,
+    val book: String,
+    val stage: Int,
+    val dueAt: Long,
+    val introducedAt: Long,
+    val lastReviewAt: Long,
+    val lastReviewSeq: Long = 0
+)
+
+/**
+ * One `study_reviews` row: a real feedback answer, never a QueryEvent. [seq] is a durable, strictly
+ * increasing commit sequence assigned by the repository when the feedback commits; it is the stable
+ * order of real commits for a word (never the wall clock, token text or list position).
+ */
+data class BackupStudyReview(
+    val token: String,
+    val entryKey: String,
+    val feedback: String,
+    val stageBefore: Int,
+    val stageAfter: Int,
+    val dueAfter: Long,
+    val reviewedAt: Long,
+    val dayKey: String,
+    val zoneId: String,
+    val newWord: Boolean,
+    val seq: Long = 0
+)
+
+/** The single persisted pending card, including its immutable word snapshot and reveal phase. */
+data class BackupStudySession(
+    val token: String,
+    val entryKey: String,
+    val book: String,
+    val stageBefore: Int,
+    val newWord: Boolean,
+    val answerRevealed: Boolean,
+    val headword: String,
+    val partOfSpeech: String,
+    val meaning: String,
+    val source: String,
+    val version: String,
+    val dayKey: String,
+    val createdAt: Long
+)
+
+/**
+ * Full raw payload across every persisted table; counts/dates are re-aggregated from these rows,
+ * never cached here. The study fields default to an empty v2 database so a v1 file (or a synthetic
+ * two-table payload) decodes to an empty review set with default settings.
+ */
+data class LearningBackupData(
+    val words: List<BackupWord>,
+    val events: List<BackupEvent>,
+    val settings: BackupStudySettings = BackupStudySettings(),
+    val states: List<BackupStudyState> = emptyList(),
+    val reviews: List<BackupStudyReview> = emptyList(),
+    val session: BackupStudySession? = null
+)
 
 /** A validated backup file: its identity metadata plus the frozen raw tables. */
 data class LearningBackup(
@@ -41,24 +111,34 @@ data class LearningBackup(
     val appVersionCode: Int,
     val schemaVersion: Int,
     val createdAt: Long,
-    val data: LearningBackupData
+    val data: LearningBackupData,
+    val formatVersion: Int = LearningBackupCodec.FORMAT_VERSION
 ) {
     val wordCount get() = data.words.size
     val eventCount get() = data.events.size
+    val stateCount get() = data.states.size
+    val reviewCount get() = data.reviews.size
+    /** A v1/schema1 file carries no review data; the preview must say so explicitly. */
+    val legacyNoStudyData: Boolean get() = formatVersion < LearningBackupCodec.FORMAT_VERSION
 }
 
 /**
  * Versioned, length-prefixed local binary backup (`.shicibackup`). Pure Kotlin/JDK so the codec can
  * be exercised without Android; see README "本地备份格式" for the byte layout. The file is an
  * unencrypted, tamper-evident (SHA-256 only) personal-data file, not a secure vault.
+ *
+ * Format v2 adds study settings/states/reviews and the pending card after the v1 two tables. v1
+ * files remain readable and decode to default settings plus an empty review set.
  */
 object LearningBackupCodec {
     const val MAGIC = "SHICIBKP"
-    const val FORMAT_VERSION = 1
+    const val FORMAT_VERSION = 2
+    const val LEGACY_FORMAT_VERSION = 1
     const val FILE_SUFFIX = ".shicibackup"
     const val MIME_TYPE = "application/octet-stream"
     const val APP_IDENTITY = "com.shici.app"
-    const val DB_SCHEMA_VERSION = 1
+    const val DB_SCHEMA_VERSION = 2
+    const val LEGACY_DB_SCHEMA_VERSION = 1
     const val MAX_FILE_BYTES = 64L * 1024 * 1024
     const val MAX_BYTES_LABEL = "64MiB"
 
@@ -85,6 +165,30 @@ object LearningBackupCodec {
             writer.writeString(event.id); writer.writeString(event.entryKey); writer.writeString(event.rawText)
             writer.writeString(event.finalForm); writer.writeLong(event.time); writer.writeBoolean(event.revoked)
         }
+        writer.writeString(data.settings.selectedBook)
+        writer.writeInt(data.settings.dailyNewGoal)
+        writer.writeInt(data.states.size)
+        data.states.forEach { state ->
+            writer.writeString(state.entryKey); writer.writeString(state.book); writer.writeInt(state.stage)
+            writer.writeLong(state.dueAt); writer.writeLong(state.introducedAt); writer.writeLong(state.lastReviewAt)
+            writer.writeLong(state.lastReviewSeq)
+        }
+        writer.writeInt(data.reviews.size)
+        data.reviews.forEach { review ->
+            writer.writeString(review.token); writer.writeString(review.entryKey); writer.writeString(review.feedback)
+            writer.writeInt(review.stageBefore); writer.writeInt(review.stageAfter); writer.writeLong(review.dueAfter)
+            writer.writeLong(review.reviewedAt); writer.writeString(review.dayKey); writer.writeString(review.zoneId)
+            writer.writeBoolean(review.newWord); writer.writeLong(review.seq)
+        }
+        val session = data.session
+        writer.writeBoolean(session != null)
+        session?.let {
+            writer.writeString(it.token); writer.writeString(it.entryKey); writer.writeString(it.book)
+            writer.writeInt(it.stageBefore); writer.writeBoolean(it.newWord); writer.writeBoolean(it.answerRevealed)
+            writer.writeString(it.headword); writer.writeString(it.partOfSpeech); writer.writeString(it.meaning)
+            writer.writeString(it.source); writer.writeString(it.version); writer.writeString(it.dayKey)
+            writer.writeLong(it.createdAt)
+        }
         val body = writer.toByteArray()
         if (body.size.toLong() + DIGEST_BYTES > MAX_FILE_BYTES) throw BackupFormatException("备份文件超过 $MAX_BYTES_LABEL 上限，未写出或读取")
         return body + sha256(body)
@@ -93,7 +197,8 @@ object LearningBackupCodec {
     /**
      * Fully validates [source] (size, checksum, magic, versions, every length/UTF-8/boolean, duplicate
      * keys, orphan events and trailing bytes) and returns the frozen payload. A version newer than
-     * [FORMAT_VERSION] is rejected rather than guessed as the current format.
+     * [FORMAT_VERSION] is rejected rather than guessed as the current format; v1 files are read into
+     * default settings with an empty review set.
      */
     fun decode(source: ByteArray): LearningBackup {
         if (source.size.toLong() > MAX_FILE_BYTES) throw BackupFormatException("备份文件超过 $MAX_BYTES_LABEL 上限，未写出或读取")
@@ -104,8 +209,10 @@ object LearningBackupCodec {
 
         val reader = BackupReader(body)
         if (reader.readAscii(8) != MAGIC) throw BackupFormatException("不是拾词备份文件（magic 不匹配）")
-        when (val format = reader.readInt()) {
-            FORMAT_VERSION -> Unit
+        val format = reader.readInt()
+        val legacy = when (format) {
+            FORMAT_VERSION -> false
+            LEGACY_FORMAT_VERSION -> true
             in (FORMAT_VERSION + 1)..Int.MAX_VALUE ->
                 throw BackupFormatException("备份格式版本 $format 高于当前支持的 $FORMAT_VERSION，请先升级应用")
             else -> throw BackupFormatException("备份格式版本 $format 不受支持")
@@ -115,8 +222,9 @@ object LearningBackupCodec {
         val appVersionName = reader.readString("应用版本名")
         val appVersionCode = reader.readInt()
         val schema = reader.readInt()
-        if (schema != DB_SCHEMA_VERSION) {
-            throw BackupFormatException("备份数据库版本 $schema 与当前 $DB_SCHEMA_VERSION 不一致，已拒绝恢复")
+        val expectedSchema = if (legacy) LEGACY_DB_SCHEMA_VERSION else DB_SCHEMA_VERSION
+        if (schema != expectedSchema) {
+            throw BackupFormatException("备份数据库版本 $schema 与当前 $expectedSchema 不一致，已拒绝恢复")
         }
         val createdAt = reader.readLong()
         val wordCount = reader.readInt()
@@ -155,8 +263,195 @@ object LearningBackupCodec {
             events += BackupEvent(id, entryKey, rawText, finalForm, time, revoked)
         }
 
+        if (legacy) {
+            if (reader.remaining != 0) throw BackupFormatException("备份在声明内容之后存在多余字节")
+            return LearningBackup(appVersionName, appVersionCode, schema, createdAt,
+                LearningBackupData(words, events), format)
+        }
+
+        val settings = BackupStudySettings(
+            selectedBook = reader.readString("所选词书").also {
+                if (StudyBook.fromId(it) == null) throw BackupFormatException("备份所选词书无效：$it")
+            },
+            dailyNewGoal = reader.readInt()
+        )
+        if (settings.dailyNewGoal < StudyRules.MIN_DAILY_NEW_GOAL || settings.dailyNewGoal > StudyRules.MAX_DAILY_NEW_GOAL) {
+            throw BackupFormatException("备份每日目标超出 ${StudyRules.MIN_DAILY_NEW_GOAL}–${StudyRules.MAX_DAILY_NEW_GOAL}")
+        }
+
+        val states = ArrayList<BackupStudyState>()
+        val stateKeys = HashSet<String>()
+        repeat(reader.readInt().also { if (it < 0) throw BackupFormatException("学习状态数量无效") }) {
+            val entryKey = reader.readString("学习状态词条键")
+            val book = reader.readString("学习状态书种")
+            val stage = reader.readInt()
+            val dueAt = reader.readLong()
+            val introducedAt = reader.readLong()
+            val lastReviewAt = reader.readLong()
+            val lastReviewSeq = reader.readLong()
+            if (StudyBook.fromId(book) == null) throw BackupFormatException("学习状态书种无效：$book")
+            if (stage < StudyRules.NEW_STAGE_BEFORE || stage > StudyRules.MAX_STAGE) throw BackupFormatException("学习状态阶段越界：$stage")
+            if (entryKey !in keys) throw BackupFormatException("学习状态无对应词条：$entryKey")
+            if (!stateKeys.add(entryKey)) throw BackupFormatException("学习状态重复词条键：$entryKey")
+            states += BackupStudyState(entryKey, book, stage, dueAt, introducedAt, lastReviewAt, lastReviewSeq)
+        }
+
+        val reviews = ArrayList<BackupStudyReview>()
+        val tokens = HashSet<String>()
+        repeat(reader.readInt().also { if (it < 0) throw BackupFormatException("学习反馈数量无效") }) {
+            val token = reader.readString("反馈 token")
+            val entryKey = reader.readString("反馈词条键")
+            val feedback = reader.readString("反馈类型")
+            val stageBefore = reader.readInt()
+            val stageAfter = reader.readInt()
+            val dueAfter = reader.readLong()
+            val reviewedAt = reader.readLong()
+            val dayKey = reader.readString("反馈日键")
+            val zoneId = reader.readString("反馈时区")
+            val newWord = reader.readBoolean("反馈新词标记")
+            val seq = reader.readLong()
+            if (token.isEmpty()) throw BackupFormatException("备份存在空反馈 token")
+            if (!tokens.add(token)) throw BackupFormatException("备份存在重复反馈 token：$token")
+            if (entryKey !in keys) throw BackupFormatException("反馈无对应词条：$entryKey")
+            if (FeedbackKind.fromId(feedback) == null) throw BackupFormatException("反馈类型无效：$feedback")
+            if (stageBefore < StudyRules.NEW_STAGE_BEFORE || stageBefore > StudyRules.MAX_STAGE ||
+                stageAfter < StudyRules.NEW_STAGE_BEFORE || stageAfter > StudyRules.MAX_STAGE) throw BackupFormatException("反馈阶段越界")
+            // A first real feedback always starts before stage 0; a later review may also start at
+            // -1 when the word was reset to relearning by 忘记, so only the new-word flag is implied.
+            if (newWord && stageBefore != StudyRules.NEW_STAGE_BEFORE) throw BackupFormatException("反馈新词标记与阶段不一致：$token")
+            if (dayKey.isEmpty() || zoneId.isEmpty()) throw BackupFormatException("反馈日键或时区为空")
+            reviews += BackupStudyReview(token, entryKey, feedback, stageBefore, stageAfter, dueAfter, reviewedAt, dayKey, zoneId, newWord, seq)
+        }
+
+        val session = if (reader.readBoolean("待答卡存在标记")) {
+            BackupStudySession(
+                token = reader.readString("待答卡 token"),
+                entryKey = reader.readString("待答卡词条键"),
+                book = reader.readString("待答卡书种"),
+                stageBefore = reader.readInt(),
+                newWord = reader.readBoolean("待答卡新词标记"),
+                answerRevealed = reader.readBoolean("待答卡显答案标记"),
+                headword = reader.readString("待答卡词头"),
+                partOfSpeech = reader.readString("待答卡词性"),
+                meaning = reader.readString("待答卡释义"),
+                source = reader.readString("待答卡来源"),
+                version = reader.readString("待答卡来源版本"),
+                dayKey = reader.readString("待答卡日键"),
+                createdAt = reader.readLong()
+            ).also {
+                if (it.token.isEmpty() || it.entryKey.isEmpty() || it.headword.isEmpty()) throw BackupFormatException("待答卡缺少 token 或词头")
+                if (StudyBook.fromId(it.book) == null) throw BackupFormatException("待答卡书种无效：${it.book}")
+                if (it.stageBefore < StudyRules.NEW_STAGE_BEFORE || it.stageBefore > StudyRules.MAX_STAGE) throw BackupFormatException("待答卡阶段越界")
+                if (it.newWord && it.stageBefore != StudyRules.NEW_STAGE_BEFORE) throw BackupFormatException("待答卡新词标记与阶段不一致")
+                if (it.dayKey.isEmpty()) throw BackupFormatException("待答卡日键为空")
+                if (!tokens.add(it.token)) throw BackupFormatException("待答卡 token 与反馈 token 冲突：${it.token}")
+            }
+        } else null
+
+        validateStudyCrossRecords(states, reviews, session)
+
         if (reader.remaining != 0) throw BackupFormatException("备份在声明内容之后存在多余字节")
-        return LearningBackup(appVersionName, appVersionCode, schema, createdAt, LearningBackupData(words, events))
+        return LearningBackup(appVersionName, appVersionCode, schema, createdAt,
+            LearningBackupData(words, events, settings, states, reviews, session), format)
+    }
+
+    /**
+     * Re-derives every recorded study row with [StudyRules] instead of trusting the file: each feedback
+     * must be the exact transition and due time the rules compute for its own (stageBefore, feedback),
+     * its day bucket must be the bucket that reviewedAt really falls in for its own zone, and each word
+     * must have exactly one introduction (so a duplicate cannot inflate the daily new-word quota).
+     *
+     * The real order of commits is the durable [BackupStudyReview.seq] — never the wall clock (a legal
+     * clock rollback makes a later commit's reviewedAt smaller), never the token text and never the
+     * list position. In that seq order every word's feedback must form one continuous stage chain that
+     * starts at the single introduction, and the persisted state must name that word's greatest seq and
+     * match exactly that last feedback's stage/due/reviewed time. [BackupStudyState.lastReviewSeq] must
+     * equal the greatest seq and introducedAt must equal the unique introduction's time, so an older but
+     * internally consistent state can no longer masquerade as the final one. Order between different
+     * words is never asserted by wall clock; only each row's own consistency and its state's own commit
+     * chain are checked, so an honest backup with an unusual (rolled-back) history is still accepted.
+     */
+    private fun validateStudyCrossRecords(
+        states: List<BackupStudyState>,
+        reviews: List<BackupStudyReview>,
+        session: BackupStudySession?
+    ) {
+        val stateByKey = states.associateBy { it.entryKey }
+        val reviewsByKey = reviews.groupBy { it.entryKey }
+
+        val seqs = HashSet<Long>()
+        for (review in reviews) {
+            val feedback = FeedbackKind.fromId(review.feedback) ?: throw BackupFormatException("反馈类型无效：${review.feedback}")
+            if (StudyRules.nextStage(review.stageBefore, feedback) != review.stageAfter) {
+                throw BackupFormatException("反馈阶段推进与规则不符：${review.token}")
+            }
+            if (StudyRules.dueAt(review.reviewedAt, review.stageBefore, feedback) != review.dueAfter) {
+                throw BackupFormatException("反馈到期时间与规则不符：${review.token}")
+            }
+            val zone = parseZone(review.zoneId) ?: throw BackupFormatException("反馈时区无效：${review.zoneId}")
+            val day = parseDayKey(review.dayKey) ?: throw BackupFormatException("反馈日键不是合法日期：${review.dayKey}")
+            if (StudyRules.dayKey(review.reviewedAt, zone) != day.toString()) {
+                throw BackupFormatException("反馈日键与反馈时间或时区不一致：${review.token}")
+            }
+            if (!seqs.add(review.seq)) throw BackupFormatException("备份存在重复提交序号：${review.seq}")
+        }
+
+        // Exactly one introduction per word: a second new-word flag would consume a second daily slot,
+        // and the seq-ordered chain must be continuous from that single introduction.
+        reviewsByKey.forEach { (key, list) ->
+            if (list.count { it.newWord } != 1) throw BackupFormatException("同一词条的首次反馈必须唯一：$key")
+            val ordered = list.sortedBy { it.seq }
+            val intro = ordered.first()
+            if (!intro.newWord || intro.stageBefore != StudyRules.NEW_STAGE_BEFORE) {
+                throw BackupFormatException("同一词条最早的反馈必须是从未引入档引入：$key")
+            }
+            for (index in 1 until ordered.size) {
+                if (ordered[index].stageBefore != ordered[index - 1].stageAfter) {
+                    throw BackupFormatException("真实反馈阶段转移链不连续：$key")
+                }
+            }
+        }
+
+        stateByKey.forEach { (key, state) ->
+            val list = reviewsByKey[key] ?: throw BackupFormatException("学习状态缺少对应的真实反馈：$key")
+            val intro = list.single { it.newWord }
+            if (state.introducedAt != intro.reviewedAt) {
+                throw BackupFormatException("学习状态引入时间与首次反馈不一致：$key")
+            }
+            // The final state must be the word's greatest commit sequence, matching exactly that feedback.
+            val last = list.maxByOrNull { it.seq } ?: throw BackupFormatException("学习状态缺少对应的真实反馈：$key")
+            if (state.lastReviewSeq != last.seq) throw BackupFormatException("学习状态末尾提交序号与最后反馈不一致：$key")
+            if (last.stageAfter != state.stage || last.dueAfter != state.dueAt || last.reviewedAt != state.lastReviewAt) {
+                throw BackupFormatException("学习状态与最后真实反馈不一致：$key")
+            }
+        }
+        reviewsByKey.keys.forEach { key ->
+            if (key !in stateByKey) throw BackupFormatException("真实反馈缺少对应的学习状态：$key")
+        }
+
+        if (session != null) {
+            if (session.headword != session.entryKey) throw BackupFormatException("待答卡词头与词条键不一致")
+            if (parseDayKey(session.dayKey) == null) throw BackupFormatException("待答卡日键不是合法日期：${session.dayKey}")
+            val state = stateByKey[session.entryKey]
+            if (session.newWord) {
+                if (state != null) throw BackupFormatException("待答卡标记为新词但该词已有学习状态：${session.entryKey}")
+            } else {
+                if (state == null) throw BackupFormatException("待答卡缺少对应的学习状态：${session.entryKey}")
+                if (state.stage != session.stageBefore) throw BackupFormatException("待答卡阶段与学习状态不一致：${session.entryKey}")
+            }
+        }
+    }
+
+    private fun parseDayKey(value: String): LocalDate? = try {
+        LocalDate.parse(value)
+    } catch (_: Exception) {
+        null
+    }
+
+    private fun parseZone(value: String): ZoneId? = try {
+        ZoneId.of(value)
+    } catch (_: Exception) {
+        null
     }
 
     private fun sha256(bytes: ByteArray): ByteArray = MessageDigest.getInstance("SHA-256").digest(bytes)

@@ -1,0 +1,284 @@
+package com.shici.app.ui
+
+import android.app.Activity
+import android.graphics.Color
+import android.os.Handler
+import android.os.Looper
+import android.view.Gravity
+import android.widget.Button
+import android.widget.LinearLayout
+import com.shici.app.ShiciApplication
+import com.shici.app.core.FeedbackKind
+import com.shici.app.core.StudyBook
+import com.shici.app.core.StudyCard
+import com.shici.app.core.StudyProgress
+import com.shici.app.core.StudyAdmission
+import com.shici.app.core.StudyRules
+import com.shici.app.core.StudyView
+import com.shici.app.data.StudyCommitOutcome
+import com.shici.app.data.StudyMembership
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+
+/**
+ * The real 背词 review surface. It draws from the repository's persisted study round and never keeps a
+ * parallel in-memory ledger: a committed feedback is re-read, not patched. Membership comes from the
+ * validated ky/cet6 index or, for 个人生词, from the live active vocabulary. All database work runs on
+ * the application's single worker; the view is rebuilt on the main thread after each commit.
+ *
+ * [context] is the owning Activity: once it is destroyed, every queued worker and every posted
+ * continuation checks [Activity.isDestroyed] and does nothing, so an old screen can never touch a
+ * detached view. Database writes are not protected by those fast checks alone: [admission] is the
+ * cross-thread linearization point, invalidated from [onDestroy] and admitted by the repository
+ * immediately before each write transaction. A destroy that happens during a long read therefore
+ * makes the later transaction refuse to start, while a transaction admitted first may finish
+ * atomically (it is never interrupted halfway).
+ */
+class StudyScreen(
+    private val app: ShiciApplication,
+    private val context: Activity,
+    private val onRerender: () -> Unit,
+    private val onToast: (String) -> Unit
+) {
+    private val main = Handler(Looper.getMainLooper())
+    private val zone = ZoneId.systemDefault()
+    private var generation = 0
+    // One in-flight commit/settings write at a time so a double tap cannot submit two feedbacks.
+    private var busy = false
+    // Shared by every write this surface starts. onDestroy invalidates it once; the repository checks
+    // it right before BEGIN, never while holding a lock across a read or a transaction. The owner
+    // liveness read is supplementary to the explicit cross-thread invalidation.
+    private val admission = StudyAdmission { !context.isDestroyed }
+
+    /** Invalidates every not-yet-admitted write of this surface. Called from Activity.onDestroy. */
+    fun onDestroy() { admission.invalidate() }
+
+    fun render(content: LinearLayout) {
+        content.removeAllViews()
+        content.addView(context.text("背词复习", 26f, Paper.ink, true))
+        content.addView(context.text("固定间隔复习，非经过验证的记忆算法；只按你的真实反馈推进。", 16f, Paper.secondary))
+        content.space(16)
+        content.addView(context.text("正在读取学习进度…", 16f, Paper.secondary))
+        load(content)
+    }
+
+    private fun load(content: LinearLayout) {
+        val token = ++generation
+        app.worker.execute {
+            // A queued load of a screen whose activity is already gone must not even deal a card.
+            if (context.isDestroyed) return@execute
+            val result = runCatching {
+                val settings = app.repository.studySettings()
+                // planFor may load personal members (a long read); studyView admits the pending-card
+                // write only after that, so a destroy during the load still persists nothing.
+                app.repository.studyView(planFor(settings.selectedBook), System.currentTimeMillis(), zone, admission)
+            }
+            main.post {
+                if (context.isDestroyed) return@post
+                if (token != generation) return@post
+                result.onSuccess { bind(content, it) }
+                    .onFailure {
+                        content.removeAllViews()
+                        content.addView(context.text("背词暂时不可用：${it.message}", 18f, Paper.error))
+                    }
+            }
+        }
+    }
+
+    private fun planFor(book: StudyBook): StudyMembership = when (book) {
+        // 个人生词 is a runtime set: every member already has a words row, so no snapshot lookup is needed.
+        StudyBook.PERSONAL -> StudyMembership(book, app.repository.personalMembers()) { null }
+        else -> {
+            val books = app.studyBooks.getOrThrow()
+            val dictionary = app.dictionary.getOrThrow()
+            val keys = books.orderedMembers(book) ?: error("学习词书缺少${book.label}归属")
+            StudyMembership(book, keys) { dictionary.entry(it) }
+        }
+    }
+
+    private fun bind(content: LinearLayout, view: StudyView) {
+        content.removeAllViews()
+        content.addView(context.text("背词复习", 26f, Paper.ink, true))
+        content.addView(context.text("固定间隔复习，非经过验证的记忆算法；只按你的真实反馈推进。", 16f, Paper.secondary))
+        content.space(16)
+        content.addView(bookSelector(view.settings.selectedBook))
+        content.space(8)
+        content.addView(goalRow(view.settings.dailyNewGoal))
+        content.addView(context.text("范围 ${StudyRules.MIN_DAILY_NEW_GOAL}–${StudyRules.MAX_DAILY_NEW_GOAL}，默认 ${StudyRules.DEFAULT_DAILY_NEW_GOAL}。", 16f, Paper.secondary))
+        content.divider()
+        content.addView(progressBlock(view.progress))
+        content.space(16)
+        val card = view.card
+        if (card == null) {
+            content.addView(context.text(emptyMessage(view.progress), 18f, Paper.ink))
+            return
+        }
+        content.addView(cardBlock(card, view.credential))
+    }
+
+    private fun bookSelector(selected: StudyBook): LinearLayout = context.row().apply {
+        listOf(StudyBook.KAOYAN, StudyBook.CET6, StudyBook.PERSONAL).forEach { book ->
+            val button = context.button(book.label, primary = false) { selectBook(book) }
+            if (book == selected) {
+                button.background = context.shape(Paper.green, 8)
+                button.setTextColor(Color.WHITE)
+            }
+            addView(button, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = context.dp(8) })
+        }
+    }
+
+    private fun goalRow(goal: Int): LinearLayout = context.row().apply {
+        gravity = Gravity.CENTER_VERTICAL
+        addView(context.text("每日新词目标", 18f), LinearLayout.LayoutParams(0, -2, 1f))
+        addView(context.button("−5", primary = false) { setGoal(goal - 5) })
+        addView(context.text("$goal", 22f, Paper.ink, true).apply {
+            gravity = Gravity.CENTER; setPadding(context.dp(16), 0, context.dp(16), 0)
+        })
+        addView(context.button("+5", primary = false) { setGoal(goal + 5) })
+    }
+
+    private fun progressBlock(progress: StudyProgress): LinearLayout = context.column().apply {
+        addView(context.text("今日新词 ${progress.introducedToday} 个 · 今日剩余新词额度 ${progress.newRemaining} 个", 18f))
+        addView(context.text("到期待复习 ${progress.dueNow} 词 · 今日已反馈 ${progress.todayAnswers} 次（${progress.todayReviewed} 词）· 累计已学 ${progress.totalIntroduced} 词",
+            16f, Paper.secondary))
+        progress.nextDueAt?.let { addView(context.text("下一张到期：${time(it)}", 16f, Paper.secondary)) }
+    }
+
+    private fun cardBlock(card: StudyCard, credential: Long): LinearLayout = context.column().apply {
+        setPadding(context.dp(20), context.dp(20), context.dp(20), context.dp(20))
+        background = context.shape(Paper.surface, 12, true)
+        addView(context.text(if (card.newWord) "新词 · 首次学习" else "复习 · 阶段 ${stageLabel(card.stageBefore)}", 16f, Paper.green))
+        addView(context.text(card.entry.headword, 32f, Paper.ink, true))
+        addView(context.text(card.entry.partOfSpeech.ifBlank { "—" }, 16f, Paper.secondary))
+        if (!card.answerRevealed) {
+            space(8)
+            addView(context.button("显示答案", primary = true) { reveal(card.token, credential) })
+            addView(context.text("先自己回忆词义，再看答案，然后选择真实反馈。", 16f, Paper.secondary))
+        } else {
+            divider()
+            addView(context.text(card.entry.meaning, 20f, Paper.ink))
+            // The snapshot's own provenance is shown with the answer so a historical source/version is
+            // never implied to be the current one.
+            val provenance = listOf(card.entry.source, card.entry.version).filter { it.isNotBlank() }
+            if (provenance.isNotEmpty()) {
+                addView(context.text("来源 ${provenance.joinToString(" · ")}", 16f, Paper.secondary))
+            }
+            if (card.note.isNotBlank()) {
+                space(8)
+                addView(context.text("我的笔记", 16f, Paper.secondary))
+                addView(context.text(card.note, 18f, Paper.ink))
+            }
+            space(8)
+            addView(context.text("这次记得怎么样？", 18f, bold = true))
+            val row = context.row()
+            FeedbackKind.entries.forEach { kind ->
+                val button = context.button(kind.label(), primary = kind == FeedbackKind.KNOW) {
+                    submit(card.token, kind, credential)
+                }
+                row.addView(button, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = context.dp(8) })
+            }
+            addView(row)
+            addView(context.text("${FeedbackKind.KNOW.label()}：进入下一阶段；${FeedbackKind.FUZZY.label()}：阶段不变、明天再来；${FeedbackKind.FORGET.label()}：回到第一阶段、约 10 分钟后再出现。", 16f, Paper.secondary))
+        }
+    }
+
+    private fun emptyMessage(progress: StudyProgress): String = when {
+        progress.dueNow > 0 -> "有 ${progress.dueNow} 个到期词，但暂时没有可显示的卡片。"
+        progress.newRemaining > 0 -> "可以开始学习新词。"
+        progress.nextDueAt != null -> "今日目标已完成，也没有到期复习；下一张 ${time(progress.nextDueAt!!)} 到期。"
+        else -> "这本词书已全部学过，且暂无到期复习。"
+    }
+
+    private fun selectBook(book: StudyBook) {
+        if (busy) return
+        busy = true
+        app.worker.execute {
+            if (context.isDestroyed) return@execute
+            val result = runCatching {
+                app.repository.updateStudySettings(book, app.repository.studySettings().dailyNewGoal, admission)
+            }
+            main.post {
+                if (context.isDestroyed) return@post
+                busy = false
+                result.onFailure { onToast("切换词书失败：${it.message}") }
+                onRerender()
+            }
+        }
+    }
+
+    private fun setGoal(goal: Int) {
+        if (busy) return
+        busy = true
+        app.worker.execute {
+            if (context.isDestroyed) return@execute
+            val result = runCatching {
+                app.repository.updateStudySettings(app.repository.studySettings().selectedBook, goal, admission)
+            }
+            main.post {
+                if (context.isDestroyed) return@post
+                busy = false
+                result.onFailure { onToast("目标设置失败：${it.message}") }
+                onRerender()
+            }
+        }
+    }
+
+    private fun reveal(token: String, credential: Long) {
+        if (busy) return
+        busy = true
+        app.worker.execute {
+            if (context.isDestroyed) return@execute
+            val result = runCatching { app.repository.revealStudyCard(token, credential, admission) }
+            main.post {
+                if (context.isDestroyed) return@post
+                busy = false
+                if (result.getOrNull() != true) onToast("这张卡已失效，正在刷新")
+                onRerender()
+            }
+        }
+    }
+
+    private fun submit(token: String, kind: FeedbackKind, credential: Long) {
+        if (busy) return
+        busy = true
+        app.worker.execute {
+            if (context.isDestroyed) return@execute
+            val result = runCatching {
+                // Re-check the activity on the worker right before the write too. The repository then
+                // performs its own admission check immediately before BEGIN, after every long read
+                // (including the settings/personal-member reads), so a destroy that lands between
+                // canCommit and BEGIN still writes nothing.
+                app.repository.commitStudyFeedback(token, kind, System.currentTimeMillis(), zone,
+                    credential, admission) {
+                    !context.isDestroyed
+                }
+            }
+            main.post {
+                if (context.isDestroyed) return@post
+                busy = false
+                result.onSuccess { outcome ->
+                    when (outcome) {
+                        StudyCommitOutcome.COMMITTED, StudyCommitOutcome.IDEMPOTENT -> Unit
+                        StudyCommitOutcome.CONFLICT -> onToast("这张卡已用其它反馈提交过，未重复记录")
+                        StudyCommitOutcome.STALE -> onToast("学习数据已变化，这张卡失效，未记录")
+                        StudyCommitOutcome.REJECTED -> onToast("这张卡已不是当前待答卡，未记录")
+                    }
+                }.onFailure { onToast("提交失败，未记录：${it.message}") }
+                onRerender()
+            }
+        }
+    }
+
+    private fun stageLabel(stageBefore: Int): String =
+        if (stageBefore < 0) "新词" else "第 ${stageBefore + 1} 阶段"
+
+    private fun FeedbackKind.label(): String = when (this) {
+        FeedbackKind.KNOW -> "认识"
+        FeedbackKind.FUZZY -> "模糊"
+        FeedbackKind.FORGET -> "忘记"
+    }
+
+    private fun time(at: Long): String =
+        Instant.ofEpochMilli(at).atZone(zone).format(DateTimeFormatter.ofPattern("MM-dd HH:mm"))
+}

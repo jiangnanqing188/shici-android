@@ -11,3 +11,4 @@ artifacts/
 docs/design/*.png
 docs/design/*.webp
 /app/src/main/assets/dictionary/kajweb.tsv.bin
+/app/src/main/assets/dictionary/study-books.tsv.bin

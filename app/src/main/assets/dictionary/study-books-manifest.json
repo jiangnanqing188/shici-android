@@ -1,0 +1,40 @@
+{
+  "asset": "dictionary/study-books.tsv.bin",
+  "asset_bytes": 43187,
+  "asset_sha256": "69f645e2d0c933765aed1cfdd6c8e6781875eaed8244080d7e22e71745207494",
+  "book_counts": {
+    "cet6": 2078,
+    "ky": 4533
+  },
+  "books": [
+    {
+      "count": 4533,
+      "exam": "ky",
+      "file": "KaoYan_2.zip",
+      "id": "ky",
+      "label": "考研",
+      "member": "KaoYan_2.json",
+      "sha256": "8f0670da980d55aee3e63a140633d33f78df04738ad18dbc6cfd552b63da0a5d"
+    },
+    {
+      "count": 2078,
+      "exam": "cet6",
+      "file": "CET6_2.zip",
+      "id": "cet6",
+      "label": "六级",
+      "member": "CET6_2.json",
+      "sha256": "fe12c5a331510e86da4a187a829d9d72e2785588e60ce45d830f349c30fc3866"
+    }
+  ],
+  "content_review_status": "unreviewed",
+  "format": "SHICI_STUDY_BOOKS",
+  "format_version": 1,
+  "local_candidate_only": true,
+  "normalization": "NFC+lowercase+curly-apostrophe+whitespace; no lemmatization",
+  "note": "仅考研/六级归属；个人生词为运行时动态集合。",
+  "redistribution_status": "unresolved",
+  "source": "kajweb/dict · 有道来源备考词书",
+  "syllabus_verified": false,
+  "uncompressed_bytes": 116239,
+  "version": "3992bcb94c800a2fd38a9fd6ff95b2353e755363"
+}

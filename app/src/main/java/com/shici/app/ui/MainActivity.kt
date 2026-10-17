@@ -60,6 +60,9 @@ class MainActivity : Activity() {
     private val exportSession = LearningExportSession()
     private val backupExportSession = LearningBackupExportSession()
     private val restoreSession = LearningRestoreSession()
+    // One persistent study surface so an in-flight feedback commit is not orphaned by a tab switch.
+    private val studyScreenDelegate = lazy { StudyScreen(app, this, { render() }, { toast(it) }) }
+    private val studyScreen by studyScreenDelegate
     // Document request codes whose picker was open when the activity was recreated. Frozen backup
     // state is in memory only, so these results can no longer be applied: reserve the codes (never
     // reuse) and just tell the user to restart, without touching any file.
@@ -163,6 +166,9 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         refreshGate.stop(); exportSession.clear(); manualGate.next()
         backupExportSession.clear(); restoreSession.clear()
+        // Invalidate the study surface's cross-thread admission before the Activity is gone. Workers
+        // that already reached their transaction may finish atomically; ones still reading refuse it.
+        if (studyScreenDelegate.isInitialized()) studyScreen.onDestroy()
         restorePreviewDialog?.dismiss(); restorePreviewDialog = null
         activeDialog?.dismiss(); activeDialog = null
         super.onDestroy()
@@ -205,7 +211,7 @@ class MainActivity : Activity() {
             root.addView(body, LinearLayout.LayoutParams(-1, 0, 1f))
             root.addView(nav, LinearLayout.LayoutParams(-1, -2))
         }
-        listOf("首页", "生词本", "统计", "设置").forEachIndexed { index, label ->
+        listOf("首页", "生词本", "统计", "设置", "背词").forEachIndexed { index, label ->
             nav.addView(button(label) { currentTab = index; render() },
                 if (wide) LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) }
                 else LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(4) })
@@ -260,13 +266,13 @@ class MainActivity : Activity() {
         backupExportButton = null; restoreButton = null; backupStatusView = null
         body.removeAllViews()
         val navOffset = if (wide) 3 else 0
-        repeat(4) { index ->
+        repeat(5) { index ->
             val button = nav.getChildAt(index + navOffset) as Button
             button.background = shape(if (index == currentTab) Paper.lightGreen else Paper.background, 8)
             button.setTypeface(button.typeface, if (index == currentTab) Typeface.BOLD else Typeface.NORMAL)
             button.isSelected = index == currentTab
         }
-        when (currentTab) { 0 -> home(); 1 -> vocabulary(); 2 -> statistics(); 3 -> settings() }
+        when (currentTab) { 0 -> home(); 1 -> vocabulary(); 2 -> statistics(); 3 -> settings(); 4 -> study() }
     }
     private fun scrolled(): LinearLayout {
         val content = column()
@@ -731,6 +737,9 @@ class MainActivity : Activity() {
             } else LinearLayout.LayoutParams(-1, -2))
         }
         return metrics
+    }
+    private fun study() {
+        studyScreen.render(scrolled())
     }
     private fun statistics() {
         val content = scrolled()
@@ -1211,6 +1220,12 @@ class MainActivity : Activity() {
         content.addView(text("从备份完整恢复", 24f, bold = true)); content.space(12)
         content.addView(text("备份创建时间：${date(backup.createdAt)}", 18f))
         content.addView(text("词条 ${backup.wordCount} 个 · 事件 ${backup.eventCount} 条", 18f))
+        if (backup.legacyNoStudyData) {
+            content.addView(text("这是旧版格式（v1）备份：只含生词与查询记录，不含背词进度。", 16f, Paper.warning, true))
+            content.addView(text("恢复后背词进度为空，所选词书与每日目标恢复为默认值。", 16f, Paper.warning))
+        } else {
+            content.addView(text("背词进度：已学 ${backup.stateCount} 词 · 反馈 ${backup.reviewCount} 条${if (backup.data.session != null) " · 含 1 张未答卡" else ""}", 18f))
+        }
         content.addView(text("备份应用版本：${backup.appVersionName}（${backup.appVersionCode}）", 16f, Paper.secondary)); content.space(12)
         val warning = column().apply {
             setPadding(dp(16), dp(12), dp(16), dp(12)); background = shape(Paper.background, 8)

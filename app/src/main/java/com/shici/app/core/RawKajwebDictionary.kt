@@ -27,6 +27,12 @@ class RawKajwebDictionary private constructor(private val entries: Map<String, D
         return LookupResult.Missing(form)
     }
 
+    /**
+     * Keyed lookup used by the study index: [normalizedKey] already matches the entry-key form; this
+     * never invents a form or falls back. Returns null when the key is not in the pinned dictionary.
+     */
+    fun entry(normalizedKey: String): DictionaryEntry? = normalize(normalizedKey)?.let { entries[it] }
+
     companion object {
         const val FORMAT = "SHICI_KAJWEB"
         const val FORMAT_VERSION = 1
