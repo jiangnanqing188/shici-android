@@ -17,7 +17,7 @@ class DebugPerformance {
     fun selectionReady() {
         operation?.let { emit("selection_ready", "ok", "click_to_selection_ms=${it.clickToSelection()}") }
     }
-    // OperationTiming's internal release marker is reused; the public metric now starts at Finish.
+    // The submit point is the real ACTION_UP of the single valid stroke; there is no Finish button.
     fun selectionSubmit() { operation?.release(); emit("selection_submit", "pending") }
     fun definitionVisible() {
         operation?.releaseToDefinition()?.let { emit("definition_visible", "ok", "submit_to_definition_ms=$it") }

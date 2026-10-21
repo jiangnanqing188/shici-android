@@ -28,7 +28,7 @@ class BubbleView(context: Context) : View(context) {
     private var dragged = false
     init {
         background = context.shape(Paper.green, 28)
-        contentDescription = "拾词：点击框选查词，拖动改变位置"
+        contentDescription = "拾词：点击后在原页面划词，拖动改变位置"
         isClickable = true; isFocusable = true
     }
     override fun onDraw(canvas: Canvas) {

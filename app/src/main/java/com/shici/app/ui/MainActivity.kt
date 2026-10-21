@@ -301,7 +301,7 @@ class MainActivity : Activity() {
         session.addView(heading)
         floatingText = text(CaptureStatus.state.message, 16f, Paper.secondary)
         session.addView(floatingText)
-        session.addView(text("开启后，可在题目页面用荧光笔划选查词", 16f, Paper.secondary))
+        session.addView(text("开启后，点悬浮「词」，直接在题目页面上划一笔查词", 16f, Paper.secondary))
         session.divider()
         val numbers = row()
         addMetric(numbers, "今日查询", stats.todayQueries); addMetric(numbers, "今日新增", stats.todayNew)
@@ -322,7 +322,7 @@ class MainActivity : Activity() {
             addView(text(RawKajwebDictionary.provenance(RawKajwebDictionary.SOURCE, RawKajwebDictionary.VERSION), 16f, Paper.secondary))
         }
         content.addView(demo); content.space()
-        content.addView(text("打开悬浮查词 → 划过文字 → 完成", 16f, Paper.secondary))
+        content.addView(text("打开悬浮查词 → 点「词」→ 划过文字 → 抬笔即查", 16f, Paper.secondary))
         statusListener(CaptureStatus.state)
     }
     private fun addMetric(row: LinearLayout, label: String, value: Int) {
@@ -827,12 +827,12 @@ class MainActivity : Activity() {
             addView(text("仅用于在其他应用上显示查词浮层。这是权限状态展示，不是授权开关。", 16f, Paper.secondary)); divider()
             addView(text("查词会话", 18f, bold = true))
             floatingText = text(CaptureStatus.state.message, 16f, Paper.secondary); addView(floatingText)
-            addView(text("只在首页主动开启时申请悬浮窗、屏幕捕获及通知权限。全屏捕获可看到整个屏幕；荧光笔划选时的静态画面不会暂停题目计时。", 16f, Paper.secondary)); space(12)
+            addView(text("只在首页主动开启时申请悬浮窗、屏幕捕获及通知权限。全屏捕获可看到整个屏幕；划词时原页面始终显示，仅由透明笔迹层在这一次取词期间接收手势。", 16f, Paper.secondary)); space(12)
             stopCaptureButton = button("关闭悬浮查词") { stopCapture(); toast("已请求停止查词") }
             addView(stopCaptureButton); space(8)
             addView(text("关闭会释放捕获和浮层，不会撤销系统悬浮窗权限。若需撤销，请在系统设置中操作。", 16f, Paper.secondary)); divider()
             addView(text("数据保存在本机", 18f, bold = true))
-            addView(text("截图仅临时保存在内存；荧光笔划选可累积多笔，点“完成”后在本机识别；多个词可选一个查词，尚无翻译。不写截图文件、不上传。查询记录、释义快照、个人笔记与掌握状态保存在本机数据库。PDF 写入你选择的位置。", 16f, Paper.secondary))
+            addView(text("屏幕画面仅在内存中短暂读取并本机识别，不写截图文件、不上传；一笔抬起自动查询，轻点/多指/取消不查询，多个词时选择其中一个词查询（译句未接入）。查询记录、释义快照、个人笔记与掌握状态保存在本机数据库。PDF 写入你选择的位置。", 16f, Paper.secondary))
         }
         boundaries.addView(privacy); boundaries.space(16)
         val limits = panel().apply {
@@ -850,7 +850,7 @@ class MainActivity : Activity() {
             CaptureStatus.state.phase == CapturePhase.STOPPING) { statusListener(CaptureStatus.state); return }
         consentGeneration = CaptureStatus.prepare()
         AlertDialog.Builder(this).setTitle("开启全屏悬浮查词")
-            .setMessage("系统会授予本工具整个屏幕的捕获权限。截图仅临时保存在内存，在本机识别，不上传；荧光笔划选时显示的静态画面不会暂停题目或视频。关闭开关或通知中的停止会释放捕获和浮层。")
+            .setMessage("系统会授予本工具整个屏幕的捕获权限。屏幕画面仅在内存中短暂读取并本机识别，不上传；划词时原页面保持显示并继续运行，不跳转截图页。一笔抬起自动查询。关闭开关或通知中的停止会释放捕获和浮层。")
             .setPositiveButton("继续") { _, _ ->
                 if (consentIsCurrent()) {
                     if (!Settings.canDrawOverlays(this)) {
