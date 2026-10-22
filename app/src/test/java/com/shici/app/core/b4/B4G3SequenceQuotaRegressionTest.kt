@@ -7,7 +7,7 @@ import java.time.*
 /** Real production Repository/codec, independent in-memory SQLite engine. No user database. */
 class B4G3SequenceQuotaRegressionTest {
  private val now=Instant.parse("2026-10-16T12:00:00Z").toEpochMilli();private val zone=ZoneOffset.UTC
- private fun plan(vararg keys:String,book:StudyBook=StudyBook.KAOYAN)=StudyMembership(book,keys.toList()){DictionaryEntry(it,"n","meaning","synthetic","v0")}
+ private fun plan(vararg keys:String,book:StudyBook=StudyBook.ALL)=StudyMembership(book,keys.toList()){DictionaryEntry(it,"n","meaning","synthetic","v0")}
  private fun <T> repo(f:(LearningRepository)->T):T=LearningRepository(Context(),"g3-sequence-quota").use(f)
  private fun view(r:LearningRepository,vararg keys:String,at:Long=now)=r.studyView(plan(*keys),at,zone)
  private fun answer(r:LearningRepository,v:StudyView,kind:FeedbackKind=FeedbackKind.KNOW,at:Long=now){assertTrue(r.revealStudyCard(v.card!!.token,v.credential));assertEquals(StudyCommitOutcome.COMMITTED,r.commitStudyFeedback(v.card!!.token,kind,at,zone,v.credential))}
@@ -42,7 +42,7 @@ class B4G3SequenceQuotaRegressionTest {
    assertEquals(setOf(1L,2L,3L),after.reviews.map{it.seq}.toSet());assertEquals(3L,after.states.single{it.entryKey=="a"}.lastReviewSeq);assertEquals(after,round(after))}
  }
  @Test fun deleteAndRestoreDoNotRenumberSurvivingHistoryOrReviveOldCard()=repo{r->
-  answer(r,view(r,"a"));answer(r,view(r,"b"));val stale=view(r,"b",at=now+StudyRules.DAY_MILLIS);r.revealStudyCard(stale.card!!.token,stale.credential)
+  answer(r,view(r,"a",at=now+1),at=now+1);answer(r,view(r,"b"));val stale=view(r,"b",at=now+StudyRules.DAY_MILLIS);r.revealStudyCard(stale.card!!.token,stale.credential)
   assertEquals(DeleteOutcome.DELETED,r.deleteWord("a",stale.credential));val d=round(r.backupSnapshot().data);assertEquals(stale.card!!.token,d.session!!.token)
   assertEquals(listOf(2L),d.reviews.map{it.seq});assertEquals(listOf("b"),d.states.map{it.entryKey});assertEquals(RestoreOutcome.RESTORED,r.restoreBackup(d,r.changes.version))
   assertEquals(StudyCommitOutcome.STALE,r.commitStudyFeedback(stale.card!!.token,FeedbackKind.KNOW,now+StudyRules.DAY_MILLIS,zone,stale.credential))
@@ -62,13 +62,13 @@ class B4G3SequenceQuotaRegressionTest {
   assertEquals(before,r.backupSnapshot())
  }
  @Test fun loweredGoalClearsPersistedNewCardAndRemainsSharedAfterSnapshotReload()=repo{r->
-  r.updateStudySettings(StudyBook.KAOYAN,2);answer(r,view(r,"a"));val old=view(r,"b");assertNotNull(old.card);r.updateStudySettings(StudyBook.KAOYAN,1)
+  r.updateStudySettings(StudyBook.ALL,2);answer(r,view(r,"a"));val old=view(r,"b");assertNotNull(old.card);r.updateStudySettings(StudyBook.ALL,1)
   assertNull(view(r,"a","b").card);val d=round(r.backupSnapshot().data);assertNull(d.session)
   repo{fresh->fresh.restoreBackup(d,fresh.changes.version);assertNull(view(fresh,"a","b").card);fresh.updateStudySettings(StudyBook.CET6,1)
    val other=fresh.studyView(plan("c",book=StudyBook.CET6),now,zone);assertNull(other.card);assertEquals(1,other.progress.introducedToday);assertEquals(0,other.progress.newRemaining)}
  }
  @Test fun dueReviewNotBlockedByLoweredGoalAndDiscardedNewCard()=repo{r->
-  r.updateStudySettings(StudyBook.KAOYAN,2);answer(r,view(r,"a"),FeedbackKind.FORGET);assertEquals("b",view(r,"a","b").card!!.entryKey);r.updateStudySettings(StudyBook.KAOYAN,1)
+  r.updateStudySettings(StudyBook.ALL,2);answer(r,view(r,"a"),FeedbackKind.FORGET);assertEquals("b",view(r,"a","b").card!!.entryKey);r.updateStudySettings(StudyBook.ALL,1)
   val due=view(r,"a","b",at=now+600000);assertEquals("a",due.card!!.entryKey);assertFalse(due.card!!.newWord);assertEquals(0,due.progress.newRemaining)
   answer(r,due,at=now+600000);assertEquals(1,r.backupSnapshot().data.reviews.count{it.newWord});assertEquals(2,r.backupSnapshot().data.reviews.size)
  }

@@ -2,6 +2,9 @@ package com.shici.app
 
 import android.app.Application
 import com.shici.app.data.LearningRepository
+import com.shici.app.core.DictionaryEntry
+import com.shici.app.core.DictionaryResolver
+import com.shici.app.core.LookupResult
 import com.shici.app.core.RawKajwebDictionary
 import com.shici.app.core.StudyBook
 import com.shici.app.core.StudyBooks
@@ -49,4 +52,21 @@ class ShiciApplication : Application() {
             StudyBooks.load(assets.open(StudyBooks.ASSET), manifest)
         }
     }
+
+    /**
+     * Unified manual/floating lookup. Worker-only: it reads the local supplement dictionary from the
+     * same repository worker and must not be called from the UI thread.
+     */
+    fun lookupWord(raw: String): LookupResult =
+        DictionaryResolver.lookup(dictionary.getOrThrow(), raw) { repository.userEntry(it) }
+
+    /**
+     * Unified entry resolution used by study membership/display. The saved original snapshot keeps
+     * historical source labels working for old records; the current user supplement is merged on top
+     * so an older word snapshot never swallows a newer supplement. Worker-only.
+     */
+    fun resolveEntry(key: String): DictionaryEntry? =
+        DictionaryResolver.resolve(dictionary.getOrNull(), repository.storedEntry(key), key) {
+            repository.userEntry(it)
+        }
 }

@@ -92,9 +92,21 @@ data class BackupStudySession(
 )
 
 /**
+ * One `user_entries` row: a locally saved supplement, independent from `words`, query events and the
+ * study ledger. A new headword may have this row and no other record at all.
+ */
+data class BackupUserEntry(
+    val entryKey: String,
+    val partOfSpeech: String,
+    val meaning: String,
+    val updatedAt: Long
+)
+
+/**
  * Full raw payload across every persisted table; counts/dates are re-aggregated from these rows,
  * never cached here. The study fields default to an empty v2 database so a v1 file (or a synthetic
- * two-table payload) decodes to an empty review set with default settings.
+ * two-table payload) decodes to an empty review set with default settings. [userEntries] defaults to
+ * empty so v1/v2 files remain readable; only a v3 file carries the personal supplement dictionary.
  */
 data class LearningBackupData(
     val words: List<BackupWord>,
@@ -102,7 +114,8 @@ data class LearningBackupData(
     val settings: BackupStudySettings = BackupStudySettings(),
     val states: List<BackupStudyState> = emptyList(),
     val reviews: List<BackupStudyReview> = emptyList(),
-    val session: BackupStudySession? = null
+    val session: BackupStudySession? = null,
+    val userEntries: List<BackupUserEntry> = emptyList()
 )
 
 /** A validated backup file: its identity metadata plus the frozen raw tables. */
@@ -118,8 +131,11 @@ data class LearningBackup(
     val eventCount get() = data.events.size
     val stateCount get() = data.states.size
     val reviewCount get() = data.reviews.size
-    /** A v1/schema1 file carries no review data; the preview must say so explicitly. */
-    val legacyNoStudyData: Boolean get() = formatVersion < LearningBackupCodec.FORMAT_VERSION
+    val userEntryCount get() = data.userEntries.size
+    /** A v1/schema1 file carries no study data; the preview must say so explicitly. */
+    val legacyNoStudyData: Boolean get() = formatVersion < LearningBackupCodec.STUDY_FORMAT_VERSION
+    /** A v1/v2 file carries no personal supplement dictionary; restoring it clears local supplements. */
+    val noPersonalDictionary: Boolean get() = formatVersion < LearningBackupCodec.FORMAT_VERSION
 }
 
 /**
@@ -127,17 +143,20 @@ data class LearningBackup(
  * be exercised without Android; see README "本地备份格式" for the byte layout. The file is an
  * unencrypted, tamper-evident (SHA-256 only) personal-data file, not a secure vault.
  *
- * Format v2 adds study settings/states/reviews and the pending card after the v1 two tables. v1
- * files remain readable and decode to default settings plus an empty review set.
+ * Format v2 adds study settings/states/reviews and the pending card after the v1 two tables. Format
+ * v3 appends the independent user supplement dictionary. v1/v2 files remain readable; v1 decodes to
+ * default settings plus an empty review set, and v1/v2 decode with an empty personal dictionary.
  */
 object LearningBackupCodec {
     const val MAGIC = "SHICIBKP"
-    const val FORMAT_VERSION = 2
+    const val FORMAT_VERSION = 3
+    const val STUDY_FORMAT_VERSION = 2
     const val LEGACY_FORMAT_VERSION = 1
     const val FILE_SUFFIX = ".shicibackup"
     const val MIME_TYPE = "application/octet-stream"
     const val APP_IDENTITY = "com.shici.app"
-    const val DB_SCHEMA_VERSION = 2
+    const val DB_SCHEMA_VERSION = 3
+    const val STUDY_DB_SCHEMA_VERSION = 2
     const val LEGACY_DB_SCHEMA_VERSION = 1
     const val MAX_FILE_BYTES = 64L * 1024 * 1024
     const val MAX_BYTES_LABEL = "64MiB"
@@ -189,6 +208,11 @@ object LearningBackupCodec {
             writer.writeString(it.source); writer.writeString(it.version); writer.writeString(it.dayKey)
             writer.writeLong(it.createdAt)
         }
+        writer.writeInt(data.userEntries.size)
+        data.userEntries.forEach { user ->
+            writer.writeString(user.entryKey); writer.writeString(user.partOfSpeech)
+            writer.writeString(user.meaning); writer.writeLong(user.updatedAt)
+        }
         val body = writer.toByteArray()
         if (body.size.toLong() + DIGEST_BYTES > MAX_FILE_BYTES) throw BackupFormatException("备份文件超过 $MAX_BYTES_LABEL 上限，未写出或读取")
         return body + sha256(body)
@@ -210,19 +234,24 @@ object LearningBackupCodec {
         val reader = BackupReader(body)
         if (reader.readAscii(8) != MAGIC) throw BackupFormatException("不是拾词备份文件（magic 不匹配）")
         val format = reader.readInt()
-        val legacy = when (format) {
-            FORMAT_VERSION -> false
-            LEGACY_FORMAT_VERSION -> true
-            in (FORMAT_VERSION + 1)..Int.MAX_VALUE ->
-                throw BackupFormatException("备份格式版本 $format 高于当前支持的 $FORMAT_VERSION，请先升级应用")
-            else -> throw BackupFormatException("备份格式版本 $format 不受支持")
+        if (format > FORMAT_VERSION) {
+            throw BackupFormatException("备份格式版本 $format 高于当前支持的 $FORMAT_VERSION，请先升级应用")
         }
+        if (format < LEGACY_FORMAT_VERSION) throw BackupFormatException("备份格式版本 $format 不受支持")
+        // v1 has no study section; v1/v2 predate the independent personal supplement dictionary.
+        val hasStudy = format >= STUDY_FORMAT_VERSION
+        val hasUserDictionary = format >= FORMAT_VERSION
         val identity = reader.readString("应用标识")
         if (identity != APP_IDENTITY) throw BackupFormatException("备份来自其他应用（$identity），已拒绝恢复")
         val appVersionName = reader.readString("应用版本名")
         val appVersionCode = reader.readInt()
         val schema = reader.readInt()
-        val expectedSchema = if (legacy) LEGACY_DB_SCHEMA_VERSION else DB_SCHEMA_VERSION
+        val expectedSchema = when (format) {
+            LEGACY_FORMAT_VERSION -> LEGACY_DB_SCHEMA_VERSION
+            STUDY_FORMAT_VERSION -> STUDY_DB_SCHEMA_VERSION
+            FORMAT_VERSION -> DB_SCHEMA_VERSION
+            else -> throw BackupFormatException("备份格式版本 $format 不受支持")
+        }
         if (schema != expectedSchema) {
             throw BackupFormatException("备份数据库版本 $schema 与当前 $expectedSchema 不一致，已拒绝恢复")
         }
@@ -263,7 +292,7 @@ object LearningBackupCodec {
             events += BackupEvent(id, entryKey, rawText, finalForm, time, revoked)
         }
 
-        if (legacy) {
+        if (!hasStudy) {
             if (reader.remaining != 0) throw BackupFormatException("备份在声明内容之后存在多余字节")
             return LearningBackup(appVersionName, appVersionCode, schema, createdAt,
                 LearningBackupData(words, events), format)
@@ -350,9 +379,35 @@ object LearningBackupCodec {
 
         validateStudyCrossRecords(states, reviews, session)
 
+        val userEntries = ArrayList<BackupUserEntry>()
+        if (hasUserDictionary) {
+            val count = reader.readInt()
+            if (count < 0) throw BackupFormatException("用户词典数量无效")
+            val userKeys = HashSet<String>()
+            repeat(count) {
+                val entryKey = reader.readString("用户词条键")
+                val partOfSpeech = reader.readString("用户词性")
+                val meaning = reader.readString("用户释义")
+                val updatedAt = reader.readLong()
+                try {
+                    PersonalDictionary.requireStoredKey(entryKey)
+                    if (!PersonalDictionary.isValidStoredPos(partOfSpeech)) {
+                        throw BackupFormatException("用户词性未规范化：$entryKey")
+                    }
+                    if (!PersonalDictionary.isValidStoredMeaning(meaning)) {
+                        throw BackupFormatException("用户释义未规范化：$entryKey")
+                    }
+                } catch (e: IllegalArgumentException) {
+                    throw BackupFormatException("用户词条无效：${e.message ?: entryKey}")
+                }
+                if (!userKeys.add(entryKey)) throw BackupFormatException("用户词典存在重复词条键：$entryKey")
+                userEntries += BackupUserEntry(entryKey, partOfSpeech, meaning, updatedAt)
+            }
+        }
+
         if (reader.remaining != 0) throw BackupFormatException("备份在声明内容之后存在多余字节")
         return LearningBackup(appVersionName, appVersionCode, schema, createdAt,
-            LearningBackupData(words, events, settings, states, reviews, session), format)
+            LearningBackupData(words, events, settings, states, reviews, session, userEntries), format)
     }
 
     /**

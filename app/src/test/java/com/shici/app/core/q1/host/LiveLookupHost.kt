@@ -8,19 +8,23 @@ import kotlin.math.hypot
 annotation class SuppressLint(val value:String)
 class Metrics {var density=1f;var scaledDensity=1f}
 class Resources {val displayMetrics=Metrics()}
-open class Context {val resources=Resources();open fun onDestroy(){}}
+open class Context {val resources=Resources();open fun onDestroy(){};open fun onStop(){};var isDestroyed=false}
 fun Context.dp(n:Int)=(n*resources.displayMetrics.density).toInt()
 open class View(val context:Context){
  val resources get()=context.resources
  var width=480;var height=640;var measuredHeight=180;var originX=0;var originY=0
  var contentDescription="";var isClickable=false;var isFocusable=false;var isFocusableInTouchMode=false;var isEnabled=true
- var visibility=0;var background:Any?=null;var text="";var hint="";var action:(()->Unit)?=null
+ var visibility=0;var typeface:Any?=null;var gravity=0;var minLines=0;var background:Any?=null;var text="";var hint="";var action:(()->Unit)?=null
  var isAttachedToWindow=false;val isShown get()=visibility==VISIBLE
  open fun onAttachedToWindow(){};open fun onLayout(changed:Boolean,left:Int,top:Int,right:Int,bottom:Int){};open fun onWindowVisibilityChanged(v:Int){}
  val children=mutableListOf<View>();val viewTreeObserver=ViewTreeObserver()
  fun all():List<View> = listOf(this)+children.flatMap{it.all()}
  open fun onDraw(c:Canvas){};open fun onTouchEvent(e:MotionEvent)=true;open fun performClick():Boolean{action?.invoke();return true}
  fun invalidate(){};fun getLocationOnScreen(a:IntArray){a[0]=originX;a[1]=originY}
+ interface OnAttachStateChangeListener {fun onViewAttachedToWindow(v:View);fun onViewDetachedFromWindow(v:View)}
+ val attaches=mutableListOf<OnAttachStateChangeListener>();fun addOnAttachStateChangeListener(l:OnAttachStateChangeListener){attaches+=l}
+ fun detach(){isAttachedToWindow=false;attaches.forEach{it.onViewDetachedFromWindow(this)};children.toList().forEach{it.detach()}}
+ fun removeView(v:View){children.remove(v);v.detach()}
  fun setPadding(a:Int,b:Int,c:Int,d:Int){};fun addView(v:View){children+=v};fun measure(a:Int,b:Int){}
  fun setOnKeyListener(f:(View,Int,KeyEvent)->Boolean){};fun requestFocus()=true
  fun setTextColor(i:Int){};fun setOnClickListener(f:(View)->Unit){action={f(this)}};fun click(){if(isEnabled)action?.invoke()}
@@ -37,8 +41,8 @@ class ScrollView(c:Context):View(c){var isFillViewport=false}
 fun Context.column()=LinearLayout(this)
 fun Context.text(s:String,size:Float=16f,color:Int=0,bold:Boolean=false)=TextView(this).apply{text=s}
 fun Context.button(s:String,primary:Boolean=false,f:()->Unit)=Button(this).apply{text=s;action=f}
-fun Context.inputField(s:String)=EditText(this)
-fun View.space(n:Int=12){}
+fun Context.inputField(s:String,singleLine:Boolean=true)=EditText(this).apply{hint=s}
+fun View.space(n:Int=12){};fun View.divider(){}
 fun Context.shape(c:Int,r:Int=0,border:Boolean=false):Any=c
 object Paper {const val error=1;const val green=2;const val surface=3;const val secondary=4;const val warning=5}
 object Color {const val WHITE=-1;fun argb(a:Int,r:Int,g:Int,b:Int)=(a shl 24) or (r shl 16) or (g shl 8) or b}
@@ -63,7 +67,7 @@ class MotionEvent(val actionMasked:Int,val x:Float,val y:Float,val ids:List<Int>
 object WindowManager {class LayoutParams(val width:Int,val height:Int,val type:Int,val flags:Int,val format:Int){var gravity=0;var x=0;var y=0;var softInputMode=0;companion object{const val MATCH_PARENT=-1;const val TYPE_APPLICATION_OVERLAY=2038;const val FLAG_NOT_FOCUSABLE=8;const val FLAG_LAYOUT_IN_SCREEN=256;const val FLAG_LAYOUT_NO_LIMITS=512;const val FLAG_NOT_TOUCH_MODAL=32;const val SOFT_INPUT_ADJUST_RESIZE=16}}}
 class Windows {var beforeAdd:((View)->Unit)?=null;var readyCallbacks=0;fun dispatchReady(){readyCallbacks++;views.keys.toList().forEach{it.isAttachedToWindow=true;it.onAttachedToWindow();it.onLayout(true,0,0,it.width,it.height);it.viewTreeObserver.dispatchLayout()}};val views=mutableMapOf<View,WindowManager.LayoutParams>();var throwAdd=false
  fun addView(v:View,p:WindowManager.LayoutParams){beforeAdd?.invoke(v);if(throwAdd)throw IllegalStateException("add failed");views[v]=p}
- fun updateViewLayout(v:View,p:WindowManager.LayoutParams){views[v]=p};fun removeViewImmediate(v:View){views.remove(v);v.isAttachedToWindow=false}
+ fun updateViewLayout(v:View,p:WindowManager.LayoutParams){views[v]=p};fun removeViewImmediate(v:View){views.remove(v);v.detach()}
 }
 object PixelFormat{const val TRANSLUCENT=-3;const val RGBA_8888=1}
 object Gravity{const val TOP=1;const val START=2;const val CENTER=4}
@@ -74,7 +78,7 @@ class Queue {var rejectPost=false;val tasks=java.util.ArrayDeque<()->Unit>();val
 }
 object SystemClock{var now=1L;fun elapsedRealtime()=now}
 class Choreographer{fun postFrameCallback(f:(Long)->Unit){f(System.nanoTime())};companion object{fun getInstance()=Choreographer()}}
-object CaptureStatus{var generation=1L;var state=State();class State{var phase=CapturePhase.ACTIVE};fun update(p:CapturePhase,m:String){state.phase=p}}
+object CaptureStatus{fun remove(listener:Any){};var generation=1L;var state=State();class State{var phase=CapturePhase.ACTIVE};fun update(p:CapturePhase,m:String){state.phase=p}}
 enum class CapturePhase{ACTIVE,STOPPING,PREPARING,CLOSED,ERROR}
 class Performance{val stages=mutableListOf<String>();fun click(){stages+="click"};fun selectionReady(){stages+="ready"};fun selectionSubmit(){stages+="submit"};fun stage(a:String,b:String){stages+="$a:$b"};fun end(a:String,b:String){stages+="$a:$b"};fun definitionVisible(){stages+="visible"}}
 class Bitmap(val width:Int,val height:Int,val pixels:IntArray=IntArray(width*height){-1}){
@@ -96,12 +100,33 @@ class Task {var success:((OcrResult)->Unit)?=null;var failure:((Exception)->Unit
  fun succeed(r:OcrResult){success!!(r);complete!!()};fun fail(){failure!!(IllegalStateException("ocr failed"));complete!!()}
 }
 class Recognizer{val tasks=mutableListOf<Task>();val images=mutableListOf<Bitmap>();var closed=false;fun close(){closed=true};var throwing=false;fun process(i:InputImage):Task{if(throwing)throw IllegalStateException("process failed");images+=i.b;return Task().also{tasks+=it}}}
-class Repository {val changes=LearningChanges();val deletions=DeletionGate();val events=linkedMapOf<String,QueryEvent>();var throwRecord=false;var beforeAdmission:(()->Unit)?=null
- fun record(e:QueryEvent,d:DictionaryEntry,replaces:String?,c:Long,admission:()->Boolean):Boolean{beforeAdmission?.invoke();if(!admission()||deletions.isStale(d.key,c))return false;if(throwRecord)throw IllegalStateException("disk full");if(replaces!=null)events.remove(replaces);events[e.id]=e;return true}
- fun revokeEvent(id:String,k:String,c:Long):RevokeOutcome{if(deletions.isStale(k,c)||events.remove(id)==null)return RevokeOutcome.MISSING;return RevokeOutcome.REVOKED}
+class Repository {
+ // Host construction precedes fixture DB injection, unlike Android onCreate. Rebind the exact listener only.
+ var onRealBound:(()->Unit)?=null
+ var real:com.shici.app.core.b4.host.LearningRepository?=null
+  set(value){field=value;onRealBound?.invoke()}
+ fun userEntry(k:String)=real?.userEntry(k)
+ fun storedEntry(k:String)=real?.storedEntry(k)
+ fun saveUserEntry(entryKey:String,partOfSpeech:String,meaning:String,expectedUpdatedAt:Long?=null,newHeadword:Boolean=false,admission:StudyAdmission?=null)=checkNotNull(real){"U1 supplement tests require real SQLite adapter"}.saveUserEntry(entryKey,partOfSpeech,meaning,expectedUpdatedAt=expectedUpdatedAt,newHeadword=newHeadword,admission=admission)
+private val fakeChanges=LearningChanges();private val fakeDeletions=DeletionGate();val changes get()=real?.changes?:fakeChanges;val deletions get()=real?.deletions?:fakeDeletions;val events=linkedMapOf<String,QueryEvent>();var throwRecord=false;var beforeAdmission:(()->Unit)?=null
+ fun record(e:QueryEvent,d:DictionaryEntry,replaces:String?,c:Long,admission:()->Boolean):Boolean{beforeAdmission?.invoke();real?.let{return it.record(e,d,replaces,c,admission)};if(!admission()||deletions.isStale(d.key,c))return false;if(throwRecord)throw IllegalStateException("disk full");if(replaces!=null)events.remove(replaces);events[e.id]=e;return true}
+ fun revokeEvent(id:String,k:String,c:Long):RevokeOutcome{real?.let{return if(it.revokeEvent(id,k,c)==com.shici.app.core.b4.host.RevokeOutcome.REVOKED) RevokeOutcome.REVOKED else RevokeOutcome.MISSING};if(deletions.isStale(k,c)||events.remove(id)==null)return RevokeOutcome.MISSING;return RevokeOutcome.REVOKED}
 }
 enum class RevokeOutcome{REVOKED,MISSING}
-class App{val repository=Repository();val worker=Queue();var dictionary:Result<RawKajwebDictionary> = Result.failure(IllegalStateException("not loaded"))}
+class App{val repository=Repository();val worker=Queue();var dictionary:Result<RawKajwebDictionary> = Result.failure(IllegalStateException("not loaded"))
+    fun lookupWord(raw: String): LookupResult =
+        DictionaryResolver.lookup(dictionary.getOrThrow(), raw) { repository.userEntry(it) }
+
+    /**
+     * Unified entry resolution used by study membership/display. The saved original snapshot keeps
+     * historical source labels working for old records; the current user supplement is merged on top
+     * so an older word snapshot never swallows a newer supplement. Worker-only.
+     */
+    fun resolveEntry(key: String): DictionaryEntry? =
+        DictionaryResolver.resolve(dictionary.getOrNull(), repository.storedEntry(key), key) {
+            repository.userEntry(it)
+        }
+}
 
 class Image(val b:Bitmap,val timestamp:Long){var beforeWidthRead:(()->Unit)?=null;var beforePlaneRead:(()->Unit)?=null;val width get():Int{beforeWidthRead?.invoke();return b.width};val height get()=b.height;var planeMissing=false;var planeThrow=false;var bufferOverride:java.nio.ByteBuffer?=null;var rowStrideOverride:Int?=null;var pixelStrideOverride:Int?=null
  class Plane(val rowStride:Int,val pixelStride:Int,val buffer:java.nio.ByteBuffer)
@@ -424,7 +449,27 @@ class LiveSelectionView(
     override fun performClick(): Boolean { super.performClick(); return true }
 }
 
+private data class LookupRead(
+    val result: LookupResult,
+    val user: UserDictionaryEntry?,
+    val revision: Long,
+    val stable: Boolean
+) {
+    fun isCurrent(now: Long): Boolean = stable && revision == now
+}
+
 class CaptureHost : Context() {
+    private class SupplementEditorLease(val admission: StudyAdmission) {
+        @Volatile var closed = false
+    }
+    private val supplementEditorLeases = mutableSetOf<SupplementEditorLease>()
+    private fun closeSupplementEditors() {
+        supplementEditorLeases.toList().forEach { lease ->
+            lease.closed = true
+            lease.admission.invalidate()
+        }
+        supplementEditorLeases.clear()
+    }
     private enum class FramePurpose { ENTRY, VERIFY }
     companion object {const val ENTRY_FRAME_TIMEOUT_MS=2500L;const val VERIFY_FRAME_TIMEOUT_MS=1500L;const val LIVE_MODE_TIMEOUT_MS=30000L;const val PAGE_GUARD_TIMEOUT_MS=60000L}
     var display:ReleaseResource?=ReleaseResource();var projection:ReleaseResource?=ReleaseResource();val framesThread=ThreadResource();var pendingError:String?=null;var foregroundStopped=false
@@ -463,11 +508,20 @@ class CaptureHost : Context() {
         val status: TextView, val undo: Button, val correct: Button, val retry: Button
     ) { @Volatile var invalid = false; @Volatile var saved = false }
     @Volatile private var definitionGuard: DefinitionGuard? = null
+    // The visible floating "未收录" card. Like DefinitionGuard it carries the query-start credential
+    // so an already-displayed card cannot open a writable editor after a restore/delete.
+    private class MissingGuard(
+        val key: String, val credential: Long,
+        val add: Button?, val collect: Button, val status: TextView,
+        val closeEditors: () -> Unit
+    ) { @Volatile var invalid = false }
+    @Volatile private var missingGuard: MissingGuard? = null
     private val pageLock = Any()
     var messages=mutableListOf<String>()
     fun toast(s:String){messages+=s}
     fun fail(s:String){messages+=s;stopped=true}
     fun frameBody()=PixelBox(0,0,screenWidth,screenHeight)
+    fun queryForTest(raw:String){lookup(raw,raw,manual=true)}
     fun start(){beginLiveSelection()}
     fun cancel(){cancelLiveMode("cancel")}
     fun close(){dismissPanel()}
@@ -492,8 +546,12 @@ class CaptureHost : Context() {
         if (guard != null && !guard.invalid && app.repository.deletions.isStale(guard.key, guard.credential)) {
             main.post { if (definitionGuard === guard) { invalidateDefinition(guard); endPageGuard() } }
         }
+        val missing = missingGuard
+        if (missing != null && !missing.invalid && app.repository.deletions.isStale(missing.key, missing.credential)) {
+            main.post { if (missingGuard === missing) invalidateMissing(missing) }
+        }
     }
-    init {app.repository.changes.observe(deletionListener)}
+    init {app.repository.changes.observe(deletionListener);app.repository.onRealBound={app.repository.changes.observe(deletionListener)}}
     private fun observeAmbientPage(image: Image) {
         fun matchesImage(baseline: LiveFrameFingerprint, body: PixelBox): Boolean = try {
             val plane = image.planes.firstOrNull()
@@ -581,6 +639,8 @@ class CaptureHost : Context() {
         if (!matchesImage(guard.baseline, guard.body)) invalidateOnFrameThread(guard)
     }
 
+    /** Screen rectangles covered by this application's own card; page changes elsewhere still count. */
+
     private fun pageOverlayExclusions(): List<PixelBox> {
         val bubbleBox = bubble?.let {
             PixelBox(bubbleX, bubbleY, bubbleX + dp(56), bubbleY + dp(56))
@@ -618,6 +678,8 @@ class CaptureHost : Context() {
         }
     }
 
+    /** Ends observation for a finished/dismissed request without invalidating any newer guard. */
+
     private fun endPageGuard() {
         synchronized(pageLock) {
             val previous = pageGuard
@@ -633,6 +695,12 @@ class CaptureHost : Context() {
         pageGuardTimeout?.let { main.removeCallbacks(it) }
         pageGuardTimeout = null
     }
+
+    /**
+     * The observed page no longer matches the accepted lift page. All callbacks that still carry
+     * the old QueryGate token are rejected at their next admission; an already committed save is
+     * left in place and is not presented as rolled back.
+     */
 
     private fun invalidatePage(guard: LivePageGuard, message: String) {
         synchronized(pageLock) {
@@ -726,9 +794,17 @@ class CaptureHost : Context() {
 
     private fun removeBubble() { bubble?.let { runCatching { windows.removeViewImmediate(it) } }; bubble = null }
 
+    /**
+     * A compact, non-full-screen result/pending card. FLAG_NOT_TOUCH_MODAL keeps everything outside
+     * the card's own bounds going to the page below; there is no dim layer or full-screen backdrop.
+     */
+
     override fun onDestroy() {
         perf.end("stopped", "session_stop")
         stopped = true
+        // A stopped service rejects every queued supplement save that has not reached its
+        // transaction yet; an already-admitted save keeps its atomic commit.
+        closeSupplementEditors()
         app.repository.changes.remove(deletionListener)
         dismissPanel(); removeBubble()
         display?.release(); display = null
@@ -888,6 +964,18 @@ class CaptureHost : Context() {
     private fun frameIsCurrent(request: FreshFrameRequest): Boolean =
         sessionIsActive() && requestedFrame.get() === request && gate.accepts(request.token)
 
+    /**
+     * Ends [request]'s capture-thread ownership in the same short [pageLock] boundary in which a
+     * replacement request is published. Ownership check, removal, gate advance, timeout detach and
+     * pending-identity cleanup are one step: either this callback wins and any later publish takes a
+     * newer gate token, or a replacement/cancellation already won and this callback changes nothing.
+     * The old request's synchronous cancel and callback removal run only after the lock is released,
+     * so a blocked/frozen old request monitor can neither stall the main-thread publisher nor create
+     * a lock inversion, and cleanup touches only the timeout runnable captured for this request.
+     *
+     * Returns true only for the caller that actually removed [request].
+     */
+
     private fun closeFailedCaptureRequest(request: FreshFrameRequest): Boolean {
         var timeout: Runnable? = null
         val closed = synchronized(pageLock) {
@@ -965,6 +1053,12 @@ class CaptureHost : Context() {
         return request
     }
 
+    /**
+     * Entry of one live lookup. The bubble is removed and a clean entry frame is requested before
+     * the transparent gesture layer is mounted, so neither the entry chip nor ink can be captured;
+     * a lookup is never performed from a stale mode-entry picture.
+     */
+
     private fun beginLiveSelection() {
         if (stopped || !sessionIsActive() || requestedFrame.get() != null || live != null || liveView != null) return
         synchronized(pageLock) {
@@ -1030,6 +1124,12 @@ class CaptureHost : Context() {
         }
     }
 
+    /**
+     * One valid stroke was lifted. The full-screen layer is removed before the clean lift frame is
+     * requested; no card or ink exists while that frame is captured. The gesture itself is never
+     * forwarded or synthesised to the underlying app.
+     */
+
     private fun commitLiveStroke(session: LiveSelectionSession, stroke: HighlighterStroke) {
         if (live !== session || liveView == null || !sessionIsActive() ||
             session.generation != CaptureStatus.generation || !gate.accepts(session.entryToken)) {
@@ -1049,6 +1149,8 @@ class CaptureHost : Context() {
             SystemClock.elapsedRealtime() + VERIFY_FRAME_TIMEOUT_MS)
         session.verifyToken = request.token
     }
+
+    /** Rejects a stroke whose page changed, went black or could not be read while it was drawn. */
 
     private fun onVerifyFrame(request: FreshFrameRequest, bitmap: Bitmap) {
         val session = live
@@ -1092,6 +1194,16 @@ class CaptureHost : Context() {
         perf.stage("frame", "verified")
         recognize(bitmap, selection, session.deletionCredential)
     }
+
+    /**
+     * Delivers a capture-thread failure notification only while the attempt that detected it is the
+     * current one. The old request and gate token were already closed on the capture thread; if a
+     * replacement entry/lift was armed, or the attempt was cancelled/dismissed, or the service is no
+     * longer active, this callback must leave every current object untouched instead of calling
+     * [failLiveLookup]. In particular it must not advance the gate again (which would invalidate the
+     * replacement token), clear a live session/new stroke, end a new page guard, or rebuild UI after
+     * stop. No old token is ever re-opened by this check.
+     */
 
     private fun failLiveLookupIfCurrent(generation: Long, epoch: Long, message: String, stage: String) {
         if (stopped || generation != sessionGeneration || CaptureStatus.generation != generation) return
@@ -1145,6 +1257,8 @@ class CaptureHost : Context() {
         main.postDelayed(timeout, LIVE_MODE_TIMEOUT_MS)
     }
 
+    /** Leaves one-stroke mode without querying or writing anything. */
+
     private fun cancelLiveMode(reason: String?) {
         val hadLive = live != null || liveView != null
         removeLiveLayer()
@@ -1189,20 +1303,22 @@ class CaptureHost : Context() {
         catch (e: Exception) { fail("无法打开取词界面：${e.message}") }
     }
 
-    private fun removePanelView() { definitionGuard = null; panel?.let { runCatching { windows.removeViewImmediate(it) } }; panel = null }
+    private fun removePanelView() { definitionGuard = null; missingGuard = null; panel?.let { runCatching { windows.removeViewImmediate(it) } }; panel = null }
 
     private fun invalidateDefinition(guard: DefinitionGuard) {
         guard.invalid = true
         guard.status.text = "未收录：该词已删除或查询已失效"; guard.status.setTextColor(Paper.error)
         guard.undo.isEnabled = false; guard.correct.isEnabled = false; guard.retry.visibility = View.GONE
     }
-    // A floating card is out of date once it is invalidated or its word was deleted after the query
-    // credential was captured; both must win over any late success/failure result.
+    // Retires an open uncollected card after a restore/delete: no new-headword editor and no explicit
+    // collect can start from the old world.
 
     private fun definitionCardStale(guard: DefinitionGuard): Boolean =
         guard.invalid || app.repository.deletions.isStale(guard.key, guard.credential)
 
     private fun dismissPanel() {
+        // Closing the page card ends every editor it owned, even before its view detaches.
+        closeSupplementEditors()
         perf.end("closed", "dismiss")
         gate.next(); requestedFrame.getAndSet(null)?.cancel(); clearFrameTimeout()
         // The dismissed attempt is over; queued failure notifications for it must stay silent.
@@ -1338,18 +1454,49 @@ class CaptureHost : Context() {
         val credential = credentialOverride ?: deletionCredential
         app.worker.execute {
             if (!sessionIsActive() || !gate.accepts(token)) return@execute
-            val lookup = runCatching { app.dictionary.getOrThrow().lookup(form) }
+            // One unified resolution for the pinned asset plus the local supplement dictionary.
+            val lookup = runCatching {
+                // Capture the committed revision immediately before and after the actual read. A
+                // commit in between means the merged entry and the user row may be from different
+                // snapshots; such a read is rejected rather than mixed or relabelled later.
+                val before = app.repository.changes.version
+                val result = app.lookupWord(form)
+                val user = (result as? LookupResult.Match)?.let { app.repository.userEntry(it.form) }
+                val after = app.repository.changes.version
+                LookupRead(result, user, after, before == after)
+            }
             main.post {
                 if (!sessionIsActive() || !gate.accepts(token)) return@post
-                lookup.onSuccess { result ->
+                lookup.onSuccess { read ->
+                    val result = read.result
                     when (result) {
                         LookupResult.Invalid -> { perf.stage("dictionary", "invalid"); showMessage("请输入一个有效词头，不自动拼接多个词。", raw, replaces) }
-                        is LookupResult.Missing -> { perf.stage("dictionary", "missing"); showMessage("「${result.form}」未收录于原始词库。没有生成释义，也没有新增记录。", raw, replaces) }
-                        is LookupResult.Match -> showDefinition(result.form, raw, result.entries.single(), replaces, credential, manual)
+                        is LookupResult.Missing -> {
+                            perf.stage("dictionary", "missing")
+                            // The result is only valid in the world the query started in. A restore or
+                            // this key's deletion must reject it instead of showing a writable card.
+                            if (app.repository.deletions.isStale(result.form, credential))
+                                showMessage("查询已失效（词条已删除或数据已恢复），请重新查询。", raw, replaces)
+                            else if (!read.isCurrent(app.repository.changes.version)) {
+                                // A supplement (or any committed data) changed after this read: drawing
+                                // the old result would hide the current user meaning, so no card is made.
+                                perf.stage("dictionary", "stale")
+                                showMessage("查询已失效（词条或本机补充已更新），请重新查询。", raw, replaces)
+                            } else showMissing(result.form, raw, replaces, credential)
+                        }
+                        is LookupResult.Match -> {
+                            val entry = result.entries.single()
+                            if (app.repository.deletions.isStale(entry.key, credential))
+                                showMessage("查询已失效（词条已删除或数据已恢复），请重新查询。", raw, replaces)
+                            else if (!read.isCurrent(app.repository.changes.version)) {
+                                perf.stage("dictionary", "stale")
+                                showMessage("查询已失效（词条或本机补充已更新），请重新查询。", raw, replaces)
+                            } else showDefinition(result.form, raw, entry, read.user, replaces, credential, manual)
+                        }
                     }
                 }.onFailure {
                     perf.stage("dictionary", "failed")
-                    showMessage("原始词库不可用：${it.message}。没有生成释义，也没有新增记录。", raw, replaces)
+                    showMessage("词库不可用：${it.message}。没有生成释义，也没有新增记录。", raw, replaces)
                 }
             }
         }
@@ -1370,6 +1517,12 @@ class CaptureHost : Context() {
         addPanel(scroll(content))
     }
 
+    /**
+     * The floating uncollected state. Adding a new user headword here is local-only: it creates no
+     * QueryEvent, count, vocabulary row or study card, and ends this automatic page admission. Only
+     * the explicit "查询并收录" button starts a normal (manual) query that may enter personal words.
+     */
+
     private fun showCorrection(raw: String, replaces: String?, originalRaw: String = raw) {
         // A correction is an explicit user action, not a late automatic result from the old page.
         endPageGuard()
@@ -1384,16 +1537,21 @@ class CaptureHost : Context() {
         addPanel(scroll(content))
     }
 
-    private fun showDefinition(form: String, raw: String, entry: DictionaryEntry, replaces: String?,
+    private fun showDefinition(form: String, raw: String, entry: DictionaryEntry,
+                               initialUser: UserDictionaryEntry?, replaces: String?,
                                credential: Long, manual: Boolean = false) {
         val token = gate.next()
         val page = pageGuard
         val event = QueryEvent(UUID.randomUUID().toString(), entry.key, raw, form, System.currentTimeMillis())
         val content = card(entry.headword)
-        content.addView(text("原词形：$form · ${entry.partOfSpeech}"))
+        val meta = text("原词形：$form · ${entry.partOfSpeech}")
+        val meaningView = text(entry.meaning, 18f)
+        val provenanceView = text(PersonalDictionary.provenance(entry), 14f, Paper.warning)
+        content.addView(meta)
         content.addView(text("选中原文：\n$raw"))
-        content.addView(text(entry.meaning, 18f)); content.space()
-        content.addView(text(RawKajwebDictionary.provenance(entry.source, entry.version), 14f, Paper.warning))
+        content.addView(meaningView); content.space()
+        content.addView(text(PersonalDictionary.label(entry), 13f, Paper.secondary))
+        content.addView(provenanceView)
         val status = text("保存中…", 16f, Paper.secondary)
         content.addView(status)
         val undo = button("撤销本次收录") {}
@@ -1401,6 +1559,28 @@ class CaptureHost : Context() {
         val retry = button("重试保存") {}
         undo.isEnabled = false; correct.isEnabled = false; retry.visibility = View.GONE
         content.addView(undo); content.space(8); content.addView(correct); content.space(8); content.addView(retry); content.space(8)
+        var currentUser = initialUser
+        val supplementStatus = text("", 13f, Paper.secondary)
+        val editorHost = column()
+        var editorRoot: LinearLayout? = null
+        content.addView(button("补充/编辑词义") {
+            val active = definitionGuard
+            if (active != null && definitionCardStale(active)) { invalidateDefinition(active); return@button }
+            if (!sessionIsActive()) return@button
+            editorRoot?.let { editorHost.removeView(it) }
+            val original = if (entry.source == PersonalDictionary.SOURCE) null
+            else PersonalDictionary.storedEntry(entry)
+            editorRoot = addSupplementEditor(editorHost, entry.key, entry.headword, original, currentUser,
+                credential) { saved, merged ->
+                currentUser = saved
+                meta.text = "原词形：$form · ${merged.partOfSpeech}"
+                meaningView.text = merged.meaning
+                provenanceView.text = PersonalDictionary.provenance(merged)
+                supplementStatus.text = "用户补充已保存到本机；本次查询记录不受影响"
+                supplementStatus.setTextColor(Paper.green)
+            }
+        }); content.space(4)
+        content.addView(supplementStatus); content.addView(editorHost); content.space(4)
         content.addView(button("重新划选") { beginLiveSelection() }); content.space(8)
         content.addView(button("返回做题", true) { dismissPanel(); showBubble() })
         addPanel(scroll(content))
@@ -1505,4 +1685,179 @@ class CaptureHost : Context() {
 
     private fun sessionIsActive(): Boolean = !stopped && CaptureStatus.generation == sessionGeneration &&
         CaptureStatus.state.phase == CapturePhase.ACTIVE
+
+    private fun invalidateMissing(guard: MissingGuard) {
+        guard.invalid = true
+        guard.add?.apply { isEnabled = false; text = "查询已失效" }
+        guard.collect.isEnabled = false
+        guard.status.text = "该词条已删除或数据已恢复，请重新查询"
+        guard.status.setTextColor(Paper.error)
+        guard.closeEditors()
+    }
+    // A floating card is out of date once it is invalidated or its word was deleted after the query
+    // credential was captured; both must win over any late success/failure result.
+
+    private fun showMissing(form: String, raw: String, replaces: String?, credential: Long) {
+        // Display-entry check: a stale query never creates a writable floating card.
+        if (app.repository.deletions.isStale(form, credential)) {
+            showMessage("查询已失效（词条已删除或数据已恢复），请重新查询。", raw, replaces)
+            return
+        }
+        endPageGuard()
+        gate.next()
+        val content = card("未收录")
+        content.addView(text("「$form」未收录。可以只在本机新增用户词条；保存不会产生查询记录或生词。", 16f, Paper.warning))
+        if (raw.isNotBlank()) { content.addView(text("选中原文：\n$raw")); content.space() }
+        val meaningView = text("", 18f)
+        val supplementStatus = text("", 14f, Paper.secondary)
+        val editorHost = column()
+        lateinit var guard: MissingGuard
+        val collect = button("查询并收录", true) {
+            if (!sessionIsActive()) return@button
+            // A card whose world was replaced must not start a new explicit query that could be
+            // perceived as the old query's write path.
+            if (app.repository.deletions.isStale(form, credential)) { invalidateMissing(guard); return@button }
+            // Explicit user action in the card's still-current world: the only path that may create a
+            // real query and personal vocabulary. It keeps the original query credential instead of
+            // recapturing, so a later restore cannot be laundered into a fresh write identity.
+            lookup(form, raw, replaces, credentialOverride = credential, manual = true)
+        }.apply { visibility = View.GONE }
+        var currentUser: UserDictionaryEntry? = null
+        var editorRoot: LinearLayout? = null
+        val canAdd = PersonalDictionary.normalizeNewKey(form) == form
+        if (!canAdd) {
+            content.addView(text("该结果不是单个规范英文词头（可能是短语或多词），不能作为新词头；请修改为一个英文单词。", 15f, Paper.warning, true))
+        }
+        lateinit var edit: Button
+        if (canAdd) {
+            edit = button("新增这个词", true) {
+                if (!sessionIsActive()) return@button
+                // Bind the editor to the query-start credential; opening it after a restore must not
+                // capture the new world and write the old text there.
+                if (app.repository.deletions.isStale(form, credential)) { invalidateMissing(guard); return@button }
+                editorRoot?.let { editorHost.removeView(it) }
+                editorRoot = addSupplementEditor(editorHost, form, form, null, currentUser, credential,
+                    newHeadword = true) { saved, merged ->
+                    currentUser = saved
+                    meaningView.text = "${merged.partOfSpeech} ${merged.meaning}".trim()
+                    supplementStatus.text = "已保存到本机用户词库（仅本机；尚未收录为生词）"
+                    supplementStatus.setTextColor(Paper.green)
+                    collect.visibility = View.VISIBLE
+                    edit.text = "重新编辑词义"
+                }
+            }
+            content.addView(edit); content.space(4)
+        }
+        content.addView(collect); content.space(4)
+        content.addView(meaningView); content.addView(supplementStatus)
+        content.addView(editorHost)
+        content.addView(button("重新划选") { beginLiveSelection() }); content.space(8)
+        content.addView(button("返回做题") { dismissPanel(); showBubble() })
+        guard = MissingGuard(form, credential, if (canAdd) edit else null, collect, supplementStatus) {
+            closeSupplementEditors()
+        }
+        addPanel(scroll(content))
+        missingGuard = guard
+    }
+
+    /**
+     * Inline supplement editor. It edits only user-owned POS/meaning; the original asset is shown
+     * read-only and never rewritten. A stale handle (restore, deletion or a newer supplement) is
+     * rejected instead of overwriting newer data, and no query/study row is written by this save.
+     */
+
+    private fun addSupplementEditor(host: LinearLayout, entryKey: String, headword: String,
+                                    original: DictionaryEntry?, currentUser: UserDictionaryEntry?,
+                                    credential: Long,
+                                    newHeadword: Boolean = false,
+                                    onSaved: (UserDictionaryEntry, DictionaryEntry) -> Unit): LinearLayout {
+        // Never open a writable editor for a query world that has already been replaced.
+        if (app.repository.deletions.isStale(entryKey, credential)) {
+            val stale = column().apply {
+                space(8); divider()
+                addView(text("该词条已删除或数据已恢复，请重新查询后再编辑", 15f, Paper.warning, true))
+            }
+            host.addView(stale)
+            return stale
+        }
+        val root = column().apply {
+            space(8); divider()
+            addView(text("补充/编辑词义 · 仅本机", 18f, bold = true))
+            addView(text("不会覆盖原始词库，也不会计入查询次数或学习进度", 13f, Paper.secondary))
+        }
+        original?.let {
+            root.addView(text("原词库释义（只读）", 15f, bold = true))
+            root.addView(text("${it.partOfSpeech} ${it.meaning}".trim(), 15f))
+            root.addView(text(PersonalDictionary.provenance(it), 12f, Paper.warning))
+        }
+        val pos = inputField("词性（可留空），如 n. / v.", singleLine = true).apply {
+            setText(currentUser?.partOfSpeech ?: "")
+        }
+        val meaning = inputField("用户补充释义（必填）", singleLine = false).apply {
+            minLines = 3; gravity = Gravity.TOP
+            setText(currentUser?.meaning ?: "")
+        }
+        root.addView(pos); root.space(4); root.addView(meaning)
+        val status = text("", 14f, Paper.secondary); root.addView(status)
+        val save = button("保存到本机", true) {}
+        root.addView(save)
+        host.addView(root)
+        var alive = true
+        var saving = false
+        // Bound to the deletion/restore world of the originating query, passed in explicitly. Opening
+        // the editor never captures a fresh credential, so an old card cannot rebind after a restore.
+        val editorLease = SupplementEditorLease(StudyAdmission {
+            !app.repository.deletions.isStale(entryKey, credential)
+        })
+        supplementEditorLeases += editorLease
+        fun closeEditor() {
+            editorLease.closed = true
+            editorLease.admission.invalidate()
+            supplementEditorLeases -= editorLease
+        }
+        root.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
+            // Detach closes the lease permanently; a later reattach does not make it writable again.
+            override fun onViewAttachedToWindow(v: View) { alive = true }
+            override fun onViewDetachedFromWindow(v: View) { alive = false; closeEditor() }
+        })
+        val expectedUpdatedAt = currentUser?.updatedAt ?: 0L
+        save.setOnClickListener {
+            if (!alive || editorLease.closed || saving || !sessionIsActive()) return@setOnClickListener
+            if (meaning.text.toString().isBlank()) {
+                status.text = "释义不能为空，未保存"; status.setTextColor(Paper.error); return@setOnClickListener
+            }
+            if (app.repository.deletions.isStale(entryKey, credential)) {
+                status.text = "词条已删除或数据已恢复，请重新划选后再编辑"; status.setTextColor(Paper.error)
+                return@setOnClickListener
+            }
+            saving = true; save.isEnabled = false; status.text = "保存中…"; status.setTextColor(Paper.secondary)
+            app.worker.execute {
+                val result = app.repository.saveUserEntry(entryKey, pos.text.toString(), meaning.text.toString(),
+                    expectedUpdatedAt = expectedUpdatedAt, newHeadword = newHeadword,
+                    admission = editorLease.admission)
+                main.post {
+                    // A closed/stopped owner suppresses its old UI, but never reports an already
+                    // committed save as unwritten; result.saved is the actual admission outcome.
+                    if (!alive || editorLease.closed) return@post
+                    saving = false
+                    if (!result.saved) {
+                        save.isEnabled = true
+                        status.text = result.message; status.setTextColor(Paper.error); return@post
+                    }
+                    if (app.repository.deletions.isStale(entryKey, credential)) {
+                        // Committed before the deletion/restore; do not claim "未保存" or repaint.
+                        save.isEnabled = false
+                        status.text = "保存已提交，但该词随后被删除或数据已恢复"
+                        status.setTextColor(Paper.warning); return@post
+                    }
+                    val saved = result.entry ?: return@post
+                    val merged = PersonalDictionary.merge(original, saved) ?: PersonalDictionary.userOnly(saved)
+                    onSaved(saved, merged)
+                    status.text = if (result.changed) "已保存到本机用户词库" else "词义未变化，未重复保存"
+                    status.setTextColor(Paper.green)
+                }
+            }
+        }
+        return root
+    }
 }

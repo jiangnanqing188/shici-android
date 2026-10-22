@@ -18,7 +18,7 @@ class B4LegacyCodecRegressionTest {
     private fun rejected(b:ByteArray){try{LearningBackupCodec.decode(b);fail("malformed input accepted")}catch(e:BackupFormatException){assertTrue(e.message!!.isNotEmpty())}}
     private val header get()=8+4+4+"com.shici.app".toByteArray().size+4+5+4+4+8
     private val wordStart get()=header+8
-    @Test fun allRowsAllFieldsAndMetadataRoundTrip(){val d=data();val v=LearningBackupCodec.decode(enc(d));assertEquals(d,v.data);assertEquals("0.4.0",v.appVersionName);assertEquals(10,v.appVersionCode);assertEquals(2,v.schemaVersion);assertEquals(-123L,v.createdAt);assertEquals(3,v.wordCount);assertEquals(3,v.eventCount)}
+    @Test fun allRowsAllFieldsAndMetadataRoundTrip(){val d=data();val v=LearningBackupCodec.decode(enc(d));assertEquals(d,v.data);assertEquals("0.4.0",v.appVersionName);assertEquals(10,v.appVersionCode);assertEquals(3,v.schemaVersion);assertEquals(-123L,v.createdAt);assertEquals(3,v.wordCount);assertEquals(3,v.eventCount)}
     @Test fun emptyDatabaseLegal(){val d=LearningBackupData(emptyList(),emptyList());assertEquals(d,LearningBackupCodec.decode(enc(d)).data)}
     @Test fun legalEmptyFieldsPreserved(){val w=BackupWord("x","x","","","","",false,"");val d=LearningBackupData(listOf(w),listOf(BackupEvent("e","x","","",-1,false)));assertEquals(d,LearningBackupCodec.decode(enc(d)).data)}
     @Test fun unicodeLongNoteBeyondWriteUtfLimit(){val w=word().copy(note="😀漢\u0000e\u0301\n".repeat(18000));val d=LearningBackupData(listOf(w),emptyList());assertTrue(w.note.toByteArray().size>65536);assertEquals(d,LearningBackupCodec.decode(enc(d)).data)}
@@ -27,10 +27,10 @@ class B4LegacyCodecRegressionTest {
     @Test fun checksumCoversBody(){val b=enc();b[50]=(b[50].toInt() xor 1).toByte();rejected(b)}
     @Test fun checksumDamageRejected(){val b=enc();b[b.lastIndex]=(b.last().toInt() xor 1).toByte();rejected(b)}
     @Test fun badMagicWithValidDigestRejected(){rejected(edit{it[0]=0})}
-    @Test fun futureFormatRejected(){rejected(edit{put(it,8,3)})}
+    @Test fun futureFormatRejected(){rejected(edit{put(it,8,4)})}
     @Test fun oldAndNegativeFormatRejected(){for(v in listOf(0,-1,Int.MIN_VALUE))rejected(edit{put(it,8,v)})}
     @Test fun wrongAppIdentityRejected(){rejected(edit{it[16]='X'.code.toByte()})}
-    @Test fun futureSchemaRejected(){rejected(edit{put(it,header-12,3)})}
+    @Test fun futureSchemaRejected(){rejected(edit{put(it,header-12,4)})}
     @Test fun negativeSchemaRejected(){rejected(edit{put(it,header-12,-1)})}
     @Test fun negativeCountsRejected(){for(p in listOf(header,header+4))rejected(edit{put(it,p,-1)})}
     @Test(timeout=2000) fun hugeCountCannotPreallocateOrLoopUnbounded(){for(p in listOf(header,header+4))rejected(edit{put(it,p,Int.MAX_VALUE)})}

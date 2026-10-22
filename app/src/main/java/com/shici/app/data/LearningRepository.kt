@@ -27,6 +27,14 @@ enum class StudyCommitOutcome { COMMITTED, IDEMPOTENT, CONFLICT, STALE, REJECTED
 /** Raw two-table snapshot plus the committed revision it was read at; no derived cache. */
 data class LearningBackupSnapshot(val data: LearningBackupData, val revision: Long)
 
+/** Result of saving one user supplement; [changed] is false for an idempotent repeat save. */
+data class UserEntrySaveResult(
+    val saved: Boolean,
+    val changed: Boolean,
+    val entry: UserDictionaryEntry?,
+    val message: String
+)
+
 /** What one book's study round is allowed to draw from: ordered members and a snapshot resolver. */
 class StudyMembership(
     val book: StudyBook,
@@ -35,7 +43,7 @@ class StudyMembership(
 )
 
 /** Queries are serialized by ShiciApplication.worker; all mutations are transactional. */
-class LearningRepository(context: Context, name: String = "learning.db") : SQLiteOpenHelper(context, name, null, 2) {
+class LearningRepository(context: Context, name: String = "learning.db") : SQLiteOpenHelper(context, name, null, 3) {
     val changes = LearningChanges()
     val deletions = DeletionGate()
 
@@ -53,13 +61,28 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
         db.execSQL("CREATE INDEX events_word_time ON events(entry_key, time)")
         createStudyTables(db)
         insertDefaultSettings(db)
+        createUserDictionaryTable(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        // v1 -> v2 only adds the study tables and the default settings row; the original words/events
-        // rows, notes, mastery, sources and revoked history are left exactly as they are.
-        if (oldVersion == 1 && newVersion == 2) { createStudyTables(db); insertDefaultSettings(db); return }
-        error("尚未提供从 $oldVersion 到 $newVersion 的迁移，保留原库而不删除数据")
+        // Non-destructive v1/v2 -> v3. v1 gets the study tables/settings; both old versions then get
+        // the independent user dictionary and the unified study scope. Words, events, notes, mastery,
+        // study states/reviews, due dates, feedback seq and the pending card snapshot are untouched.
+        if (oldVersion !in 1..2 || newVersion != 3) {
+            error("尚未提供从 $oldVersion 到 $newVersion 的迁移，保留原库而不删除数据")
+        }
+        if (oldVersion < 2) {
+            createStudyTables(db)
+            insertDefaultSettings(db)
+        }
+        if (oldVersion < 3) {
+            createUserDictionaryTable(db)
+            // A single unified scope is the only current setting; old book ids remain valid source
+            // values on rows. The pending card keeps its token, reveal phase and snapshot, but joining
+            // the unified round is recorded explicitly instead of pretending the old book still applies.
+            db.execSQL("UPDATE study_settings SET selected_book=?", arrayOf(StudyBook.ALL.id))
+            db.execSQL("UPDATE study_session SET book=?", arrayOf(StudyBook.ALL.id))
+        }
     }
 
     override fun onDowngrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -97,10 +120,23 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
         }, SQLiteDatabase.CONFLICT_IGNORE)
     }
 
+    /**
+     * The user supplement dictionary is independent from `words`: a new headword may be saved with no
+     * QueryEvent, no personal vocabulary row and no study state. No foreign key is declared on purpose.
+     */
+    private fun createUserDictionaryTable(db: SQLiteDatabase) {
+        db.execSQL("""CREATE TABLE user_entries (
+            entry_key TEXT PRIMARY KEY, pos TEXT NOT NULL, meaning TEXT NOT NULL,
+            updated_at INTEGER NOT NULL)""")
+    }
+
     fun record(event: QueryEvent, entry: DictionaryEntry, replaces: String? = null,
                deletionCredential: Long = deletions.capture(),
                canCommit: () -> Boolean = { true }): Boolean {
         require(event.entryKey == entry.key && !event.revoked)
+        // The display entry may already carry the marked user section. Never bake that derived text
+        // into `words`: the independent user row remains the single source of user content.
+        val stored = PersonalDictionary.storedEntry(entry)
         if (!canCommit()) return false
         if (deletions.isStale(entry.key, deletionCredential)) return false
         val db = writableDatabase
@@ -118,8 +154,8 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
                     db.update("events", ContentValues().apply { put("revoked", 1) }, "id=?", arrayOf(replaces))
                 }
                 val dictionaryFields = ContentValues().apply {
-                    put("headword", entry.headword); put("pos", entry.partOfSpeech); put("meaning", entry.meaning)
-                    put("source", entry.source); put("version", entry.version)
+                    put("headword", stored.headword); put("pos", stored.partOfSpeech); put("meaning", stored.meaning)
+                    put("source", stored.source); put("version", stored.version)
                 }
                 db.insertWithOnConflict("words", null, ContentValues(dictionaryFields).apply {
                     put("entry_key", entry.key)
@@ -263,16 +299,21 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
                     c.long("reviewed_at"), c.text("day_key"), c.text("zone_id"), c.int("new_word") == 1,
                     c.long("seq"))
             }
-            val session = readPending(db)?.let {
+            val session = readPending(db, mergeUser = false)?.let {
                 BackupStudySession(it.token, it.entryKey, it.book.id, it.stageBefore, it.newWord, it.answerRevealed,
                     it.entry.headword, it.entry.partOfSpeech, it.entry.meaning, it.entry.source, it.entry.version,
                     it.dayKey, it.createdAt)
+            }
+            // Stored independently of `words`, so a new headword saved without any query event is still
+            // part of the full v3 backup.
+            val userEntries = readUserEntries(db).map {
+                BackupUserEntry(it.entryKey, it.partOfSpeech, it.meaning, it.updatedAt)
             }
             db.setTransactionSuccessful()
             return LearningBackupSnapshot(
                 LearningBackupData(words, events,
                     BackupStudySettings(settings.selectedBook.id, settings.dailyNewGoal),
-                    states, reviews, session), revision)
+                    states, reviews, session, userEntries), revision)
         } finally { db.endTransaction() }
     }
 
@@ -294,6 +335,7 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
             db.delete("study_reviews", null, null)
             db.delete("study_states", null, null)
             db.delete("study_session", null, null)
+            db.delete("user_entries", null, null)
             db.delete("events", null, null)
             db.delete("words", null, null)
             data.words.forEach { word ->
@@ -301,6 +343,15 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
                     put("entry_key", word.entryKey); put("headword", word.headword); put("pos", word.partOfSpeech)
                     put("meaning", word.meaning); put("source", word.source); put("version", word.version)
                     put("mastered", if (word.mastered) 1 else 0); put("note", word.note)
+                })
+            }
+            data.userEntries.forEach { user ->
+                PersonalDictionary.requireStoredKey(user.entryKey)
+                require(PersonalDictionary.isValidStoredPos(user.partOfSpeech)) { "用户词性未规范化" }
+                require(PersonalDictionary.isValidStoredMeaning(user.meaning)) { "用户释义未规范化" }
+                db.insertOrThrow("user_entries", null, ContentValues().apply {
+                    put("entry_key", user.entryKey); put("pos", user.partOfSpeech)
+                    put("meaning", user.meaning); put("updated_at", user.updatedAt)
                 })
             }
             data.events.forEach { event ->
@@ -311,7 +362,10 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
                 })
             }
             db.insertWithOnConflict("study_settings", null, ContentValues().apply {
-                put("id", 0); put("selected_book", data.settings.selectedBook)
+                put("id", 0)
+                // Old v1/v2 backups may name one legacy book. Restoring keeps all study rows and due
+                // dates but joins the current unified scope; no switch-book UI remains.
+                put("selected_book", StudyBook.ALL.id)
                 put("daily_new_goal", data.settings.dailyNewGoal)
             }, SQLiteDatabase.CONFLICT_REPLACE)
             data.states.forEach { state ->
@@ -333,7 +387,9 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
             data.session?.let { session ->
                 db.insertOrThrow("study_session", null, ContentValues().apply {
                     put("id", 0); put("token", session.token); put("entry_key", session.entryKey)
-                    put("book", session.book); put("stage_before", session.stageBefore)
+                    // Token, reveal phase and the real snapshot are preserved; only the scope label
+                    // joins the unified round, exactly like the v2->v3 migration.
+                    put("book", StudyBook.ALL.id); put("stage_before", session.stageBefore)
                     put("new_word", if (session.newWord) 1 else 0)
                     put("answer_revealed", if (session.answerRevealed) 1 else 0)
                     put("headword", session.headword); put("pos", session.partOfSpeech)
@@ -346,6 +402,122 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
         deletions.recordRestore()
         changes.publishCommitted()
         return RestoreOutcome.RESTORED
+    }
+
+    // ---- User supplement dictionary ---------------------------------------------------------------
+
+    /** The current supplement for one normalized key, without merging it onto the original entry. */
+    fun userEntry(entryKey: String): UserDictionaryEntry? =
+        readUserEntry(readableDatabase, entryKey)
+
+    /** All saved supplements, stable by key, including new headwords with no query/study record. */
+    fun userEntries(): List<UserDictionaryEntry> = readUserEntries(readableDatabase)
+
+    fun userEntryCount(): Int =
+        readableDatabase.rawQuery("SELECT COUNT(*) FROM user_entries", null).use { c ->
+            if (c.moveToFirst()) c.getInt(0) else 0
+        }
+
+    /**
+     * Creates or replaces exactly one user row. Saving is not a query and not a study event: no
+     * event, query count, personal vocabulary row, state, feedback, note, mastery or due date is
+     * written. An empty/invalid meaning creates nothing; an identical repeat save is an explicit
+     * no-op. A real change clears only the pending card for this word so an older card cannot keep
+     * showing/reveal-commit a stale meaning; committed progress and review history are untouched.
+     */
+    fun saveUserEntry(entryKey: String, partOfSpeech: String, meaning: String,
+                      now: Long = System.currentTimeMillis(),
+                      expectedUpdatedAt: Long? = null,
+                      newHeadword: Boolean = false,
+                      admission: StudyAdmission? = null): UserEntrySaveResult {
+        val key = try { PersonalDictionary.requireStoredKey(entryKey) } catch (e: IllegalArgumentException) {
+            return UserEntrySaveResult(false, false, null, "保存失败：${e.message ?: "词头无效"}")
+        }
+        if (newHeadword && PersonalDictionary.normalizeNewKey(key) != key) {
+            return UserEntrySaveResult(false, false, null, "保存失败：新词头只支持单个英文单词，不能是短语或多词")
+        }
+        val pos = try { PersonalDictionary.sanitizePos(partOfSpeech) } catch (e: IllegalArgumentException) {
+            return UserEntrySaveResult(false, false, null, "保存失败：${e.message ?: "词性无效"}")
+        }
+        val text = try { PersonalDictionary.sanitizeMeaning(meaning) } catch (e: IllegalArgumentException) {
+            return UserEntrySaveResult(false, false, null, "保存失败：${e.message ?: "释义无效"}")
+        }
+        val db = writableDatabase
+        check(!db.inTransaction()) { "学习变更不能嵌套在未提交事务中" }
+        if (!admit(admission)) return UserEntrySaveResult(false, false, null, "操作已失效，未保存")
+
+        var changed = false
+        var conflict = false
+        var exhausted = false
+        var saved: UserDictionaryEntry? = null
+        var existingEntry: UserDictionaryEntry? = null
+        try {
+            db.beginTransaction()
+            try {
+                val existing = readUserEntry(db, key)
+                existingEntry = existing
+                // Two supplement editors for the same word: the older one must not overwrite the
+                // newer saved meaning. 0 means "opened with no user row"; null means no expectation.
+                if (expectedUpdatedAt != null &&
+                    (existing?.updatedAt ?: 0L) != expectedUpdatedAt) {
+                    conflict = true
+                } else if (existing != null && existing.partOfSpeech == pos && existing.meaning == text) {
+                    // A repeat of the current content keeps the row's existing conflict identity.
+                    saved = existing
+                } else {
+                    val nextUpdatedAt = nextUserEntryConflictIdentity(existing?.updatedAt, now)
+                    if (nextUpdatedAt == null) {
+                        // The row identity is already Long.MAX_VALUE: a real change cannot move
+                        // strictly forward without wrapping/reusing the old identity, so reject it
+                        // before writing anything. The stored row, revision and notifications stay.
+                        exhausted = true
+                    } else {
+                        val next = UserDictionaryEntry(key, pos, text, nextUpdatedAt)
+                        db.insertWithOnConflict("user_entries", null, ContentValues().apply {
+                            put("entry_key", next.entryKey); put("pos", next.partOfSpeech)
+                            put("meaning", next.meaning); put("updated_at", next.updatedAt)
+                        }, SQLiteDatabase.CONFLICT_REPLACE)
+                        // A card dealt before this supplement change must not be revealed/committed
+                        // with the old snapshot. Removing just this key's pending card makes its
+                        // token stale; the next view deals a fresh token while all real
+                        // state/review rows stay intact.
+                        db.delete("study_session", "id=0 AND entry_key=?", arrayOf(key))
+                        saved = next
+                        changed = true
+                    }
+                }
+                db.setTransactionSuccessful()
+            } finally { db.endTransaction() }
+        } catch (e: Exception) {
+            return UserEntrySaveResult(false, false, null, "保存失败：${e.message ?: "本地数据库错误"}")
+        }
+        if (conflict) {
+            return UserEntrySaveResult(false, false, existingEntry, "词义已被更新，请重新打开后再保存")
+        }
+        if (exhausted) {
+            return UserEntrySaveResult(false, false, existingEntry,
+                "词义版本已无法推进，请重新打开后再保存")
+        }
+        if (changed) changes.publishCommitted()
+        return UserEntrySaveResult(true, changed, saved,
+            if (changed) "已保存到本机用户词库" else "词义未变化，未重复保存")
+    }
+
+    /**
+     * Conflict identity stored in `user_entries.updated_at`. 0 is reserved for "the editor opened
+     * with no user row", so a real row must always carry a non-zero identity. Every real content
+     * change must move strictly past that row's previous identity: the wall clock alone is not
+     * enough, because two saves can land in the same millisecond (or the clock can move backwards)
+     * and then a stale editor's expectation would still match the newer row. A legitimate future
+     * [now] wins; otherwise advance by one. Returns null only when the previous identity is already
+     * [Long.MAX_VALUE] and cannot advance, in which case the caller must reject without writing.
+     */
+    private fun nextUserEntryConflictIdentity(previous: Long?, now: Long): Long? {
+        if (previous == null) return if (now > 0L) now else 1L
+        if (now > previous && now != 0L) return now
+        if (previous == Long.MAX_VALUE) return null
+        val next = previous + 1L
+        return if (next != 0L) next else 1L
     }
 
     // ---- Study ------------------------------------------------------------------------------------
@@ -382,6 +554,9 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
         val db = writableDatabase
         val today = StudyRules.dayKey(now, zone)
         val memberSet = plan.orderedKeys.toHashSet()
+        // The unified scope keeps every real existing state in its due pool, even a word that no
+        // longer appears in the new-candidate order. Only new candidates come from plan.orderedKeys.
+        val allScope = plan.book == StudyBook.ALL
 
         val reads = db.beginTransactionNonExclusive().let {
             try {
@@ -396,16 +571,20 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
             } finally { db.endTransaction() }
         }
 
-        val due = reads.states.values.filter { it.entryKey in memberSet && it.dueAt <= now }
+        val due = reads.states.values.filter {
+            (allScope || it.entryKey in memberSet) && it.dueAt <= now
+        }
         var card = reads.existing
-        // A pending card is only valid for today, for the selected book, and while its word is still a
-        // member of this book: a personal word removed from the live vocabulary set must not stay pending.
-        // A pending *new* word is also over quota once today's introductions have reached (or passed) a
-        // since-lowered goal: the commit path already refuses it, so the round is replanned away instead
-        // of staying stuck on a card that can never be answered. That replan only clears the pending card
-        // (and then re-deals the true due review, if any) — it never touches committed states or reviews.
+        // A pending card is only valid for today, for the selected scope, and while its word is still
+        // a member (or, in the unified scope, already has a real state that is due/reviewable): a
+        // personal word removed from the live vocabulary set must not stay pending. A pending *new*
+        // word is also over quota once today's introductions have reached (or passed) a since-lowered
+        // goal: the commit path already refuses it, so the round is replanned away instead of staying
+        // stuck on a card that can never be answered. That replan only clears the pending card (and
+        // then re-deals the true due review, if any) — it never touches committed states or reviews.
         val replan = card != null &&
-            (card.dayKey != today || card.book != plan.book || card.entryKey !in memberSet ||
+            (card.dayKey != today || card.book != plan.book ||
+                !(card.entryKey in memberSet || (allScope && card.entryKey in reads.states)) ||
                 (card.newWord && reads.introducedToday >= reads.settings.dailyNewGoal))
         if (replan) {
             clearPending(db, admission)
@@ -420,7 +599,7 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
                 ?: if (quota > 0) newCandidates.firstOrNull() else null
             if (candidate != null) {
                 val state = reads.states[candidate]
-                val entry = wordEntry(db, candidate) ?: plan.snapshot(candidate)
+                val entry = displayEntry(db, candidate, plan)
                 if (entry != null) {
                     val newWord = state == null
                     val dealt = StudyCard(UUID.randomUUID().toString(), candidate, plan.book,
@@ -433,7 +612,9 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
                 }
             }
             val dueNow = due.size
-            val nextDueAt = reads.states.values.filter { it.entryKey in memberSet && it.dueAt > now }.minOfOrNull { it.dueAt }
+            val nextDueAt = reads.states.values.filter {
+                (allScope || it.entryKey in memberSet) && it.dueAt > now
+            }.minOfOrNull { it.dueAt }
             return StudyView(reads.settings, card, StudyProgress(
                 dueNow = dueNow,
                 newRemaining = minOf(quota, newCandidates.size),
@@ -445,7 +626,9 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
         }
 
         val dueNow = due.size
-        val nextDueAt = reads.states.values.filter { it.entryKey in memberSet && it.dueAt > now }.minOfOrNull { it.dueAt }
+        val nextDueAt = reads.states.values.filter {
+            (allScope || it.entryKey in memberSet) && it.dueAt > now
+        }.minOfOrNull { it.dueAt }
         return StudyView(reads.settings, card, StudyProgress(
             dueNow = dueNow,
             newRemaining = minOf(quota, newCandidates.size),
@@ -525,10 +708,13 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
                 // real commits even when two feedbacks share the same wall-clock millisecond.
                 val seq = nextReviewSeq(db)
                 if (newWord) {
+                    // The pending card may display a merged supplement; persist only the original or
+                    // user-only snapshot. The user row stays the single source and is merged on read.
+                    val stored = PersonalDictionary.storedEntry(current.entry)
                     db.insertWithOnConflict("words", null, ContentValues().apply {
-                        put("entry_key", current.entryKey); put("headword", current.entry.headword)
-                        put("pos", current.entry.partOfSpeech); put("meaning", current.entry.meaning)
-                        put("source", current.entry.source); put("version", current.entry.version)
+                        put("entry_key", current.entryKey); put("headword", stored.headword)
+                        put("pos", stored.partOfSpeech); put("meaning", stored.meaning)
+                        put("source", stored.source); put("version", stored.version)
                     }, SQLiteDatabase.CONFLICT_IGNORE)
                 }
                 db.insertWithOnConflict("study_states", null, ContentValues().apply {
@@ -605,10 +791,10 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
                 c.long("last_review_seq")) else null
         }
 
-    private fun readPending(db: SQLiteDatabase): StudyCard? =
+    private fun readPending(db: SQLiteDatabase, mergeUser: Boolean = true): StudyCard? {
         // The personal note is not part of the immutable card snapshot: it is read live from `words`
         // (empty for a brand-new card that has no words row yet) so a note saved after dealing is shown.
-        db.rawQuery("""SELECT s.token, s.entry_key, s.book, s.stage_before, s.new_word, s.answer_revealed,
+        val base = db.rawQuery("""SELECT s.token, s.entry_key, s.book, s.stage_before, s.new_word, s.answer_revealed,
             s.headword, s.pos, s.meaning, s.source, s.version, s.day_key, s.created_at, w.note AS note
             FROM study_session s LEFT JOIN words w ON w.entry_key = s.entry_key WHERE s.id=0""", null).use { c ->
             if (c.moveToFirst()) StudyCard(c.text("token"), c.text("entry_key"),
@@ -617,6 +803,12 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
                 DictionaryEntry(c.text("headword"), c.text("pos"), c.text("meaning"), c.text("source"), c.text("version")),
                 c.text("day_key"), c.long("created_at"), c.textOrEmpty("note")) else null
         }
+        if (base == null || !mergeUser) return base
+        // Display-only refresh: the token, stage, day, reveal phase, note and every committed row are
+        // unchanged. Backup export reads mergeUser=false and therefore keeps the original snapshot.
+        val user = readUserEntry(db, base.entryKey) ?: return base
+        return base.copy(entry = PersonalDictionary.merge(base.entry, user) ?: base.entry)
+    }
 
     /** The word's current personal note, or empty when there is no words row (a brand-new card). */
     private fun noteOf(db: SQLiteDatabase, key: String): String =
@@ -628,6 +820,10 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
                               admission: StudyAdmission? = null): Boolean {
         // Admission is linearized here, immediately before BEGIN: an invalidated surface writes nothing.
         if (!admit(admission)) return false
+        // The card shown by studyView may be a merged display (original + current user section). Store
+        // only the untouched original/user-only snapshot, exactly like record(); re-reading, backup and
+        // first feedback then merge the separate user row once instead of treating derived text as raw.
+        val stored = PersonalDictionary.storedEntry(card.entry)
         db.beginTransaction()
         try {
             db.delete("study_session", "id=0", null)
@@ -636,9 +832,9 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
                 put("book", card.book.id); put("stage_before", card.stageBefore)
                 put("new_word", if (card.newWord) 1 else 0)
                 put("answer_revealed", if (card.answerRevealed) 1 else 0)
-                put("headword", card.entry.headword); put("pos", card.entry.partOfSpeech)
-                put("meaning", card.entry.meaning); put("source", card.entry.source)
-                put("version", card.entry.version); put("day_key", card.dayKey)
+                put("headword", stored.headword); put("pos", stored.partOfSpeech)
+                put("meaning", stored.meaning); put("source", stored.source)
+                put("version", stored.version); put("day_key", card.dayKey)
                 put("created_at", card.createdAt)
             })
             db.setTransactionSuccessful()
@@ -667,6 +863,32 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
             if (c.moveToFirst()) DictionaryEntry(c.text("headword"), c.text("pos"), c.text("meaning"),
                 c.text("source"), c.text("version")) else null
         }
+
+    /** Raw saved original snapshot for [key], without the user section; unified resolution merges it. */
+    fun storedEntry(key: String): DictionaryEntry? =
+        wordEntry(readableDatabase, key)?.let { PersonalDictionary.storedEntry(it) }
+
+    /**
+     * The entry shown/dealt for study: the saved original snapshot (which preserves historical source
+     * labels) or the plan's resolver, followed by the *current* user supplement. This is why an older
+     * word snapshot can never swallow a newer supplement edit.
+     */
+    private fun displayEntry(db: SQLiteDatabase, key: String, plan: StudyMembership): DictionaryEntry? =
+        PersonalDictionary.merge(plan.snapshot(key) ?: wordEntry(db, key), readUserEntry(db, key))
+
+    private fun readUserEntry(db: SQLiteDatabase, key: String): UserDictionaryEntry? =
+        db.rawQuery("SELECT entry_key, pos, meaning, updated_at FROM user_entries WHERE entry_key=?",
+            arrayOf(key)).use { c ->
+            if (c.moveToFirst()) UserDictionaryEntry(c.text("entry_key"), c.text("pos"),
+                c.text("meaning"), c.long("updated_at")) else null
+        }
+
+    private fun readUserEntries(db: SQLiteDatabase): List<UserDictionaryEntry> = buildList {
+        db.rawQuery("SELECT entry_key, pos, meaning, updated_at FROM user_entries ORDER BY entry_key", null).use { c ->
+            while (c.moveToNext()) add(UserDictionaryEntry(c.text("entry_key"), c.text("pos"),
+                c.text("meaning"), c.long("updated_at")))
+        }
+    }
 
     private fun reviewByToken(db: SQLiteDatabase, token: String): StudyReview? =
         db.rawQuery("""SELECT token, entry_key, feedback, stage_before, stage_after, due_after, reviewed_at,
@@ -731,6 +953,9 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
 
     fun words(search: String = ""): List<LearnedWord> {
         val words = mutableListOf<LearnedWord>()
+        // Display-only merge: the `words` row keeps the original snapshot and the user row stays the
+        // single source of supplement content. Personal fields, counts and source labels are unchanged.
+        val users = readUserEntries(readableDatabase).associateBy { it.entryKey }
         readableDatabase.rawQuery("""SELECT w.*, COUNT(e.id) AS query_count,
             MIN(e.time) AS first_at, MAX(e.time) AS last_at,
             (SELECT e2.final_form FROM events e2 WHERE e2.entry_key=w.entry_key AND e2.revoked=0
@@ -738,8 +963,11 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
             FROM words w JOIN events e ON e.entry_key=w.entry_key AND e.revoked=0
             GROUP BY w.entry_key ORDER BY last_at DESC, w.headword""", null).use { c ->
             while (c.moveToNext()) {
+                val key = c.text("entry_key")
+                val original = DictionaryEntry(c.text("headword"), c.text("pos"), c.text("meaning"),
+                    c.text("source"), c.text("version"))
                 val word = LearnedWord(
-                    DictionaryEntry(c.text("headword"), c.text("pos"), c.text("meaning"), c.text("source"), c.text("version")),
+                    PersonalDictionary.merge(original, users[key]) ?: original,
                     c.text("source"), c.text("version"), c.text("last_form"), c.int("query_count"),
                     c.long("first_at"), c.long("last_at"), c.int("mastered") == 1, c.text("note")
                 )

@@ -27,6 +27,22 @@ import com.shici.app.ui.*
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicReference
 
+/**
+ * One dictionary read plus the committed revision observed on the worker immediately around it.
+ * [stable] is false when a commit landed between the before/after reads, so the resolved entry and
+ * the separately read user row may come from different snapshots. Delivery compares only the
+ * in-memory revision (never SQLite on the main thread) and rejects an old read instead of relabelling
+ * stale text with newer data.
+ */
+private data class LookupRead(
+    val result: LookupResult,
+    val user: UserDictionaryEntry?,
+    val revision: Long,
+    val stable: Boolean
+) {
+    fun isCurrent(now: Long): Boolean = stable && revision == now
+}
+
 class CaptureService : Service() {
     companion object {
         const val ACTION_START = "com.shici.app.START_CAPTURE"
@@ -60,6 +76,20 @@ class CaptureService : Service() {
     private var recognizer: TextRecognizer? = null
     private var bubble: View? = null
     private var panel: View? = null
+    // One admission lease per open supplement editor. Detach, panel close and service stop/destroy
+    // close it; a closed lease cannot be revived by reattaching the old view. The repository still
+    // owns the real pre-transaction admission, so a save admitted earlier commits atomically.
+    private class SupplementEditorLease(val admission: StudyAdmission) {
+        @Volatile var closed = false
+    }
+    private val supplementEditorLeases = mutableSetOf<SupplementEditorLease>()
+    private fun closeSupplementEditors() {
+        supplementEditorLeases.toList().forEach { lease ->
+            lease.closed = true
+            lease.admission.invalidate()
+        }
+        supplementEditorLeases.clear()
+    }
     private var sessionGeneration = -1L
     // Captured once per live lookup and carried through the entry frame, gesture, lift verification,
     // OCR, display, save and retry.
@@ -113,10 +143,22 @@ class CaptureService : Service() {
         val status: TextView, val undo: Button, val correct: Button, val retry: Button
     ) { @Volatile var invalid = false; @Volatile var saved = false }
     @Volatile private var definitionGuard: DefinitionGuard? = null
+    // The visible floating "未收录" card. Like DefinitionGuard it carries the query-start credential
+    // so an already-displayed card cannot open a writable editor after a restore/delete.
+    private class MissingGuard(
+        val key: String, val credential: Long,
+        val add: Button?, val collect: Button, val status: TextView,
+        val closeEditors: () -> Unit
+    ) { @Volatile var invalid = false }
+    @Volatile private var missingGuard: MissingGuard? = null
     private val deletionListener: (Long) -> Unit = {
         val guard = definitionGuard
         if (guard != null && !guard.invalid && app.repository.deletions.isStale(guard.key, guard.credential)) {
             main.post { if (definitionGuard === guard) { invalidateDefinition(guard); endPageGuard() } }
+        }
+        val missing = missingGuard
+        if (missing != null && !missing.invalid && app.repository.deletions.isStale(missing.key, missing.credential)) {
+            main.post { if (missingGuard === missing) invalidateMissing(missing) }
         }
     }
 
@@ -977,17 +1019,29 @@ class CaptureService : Service() {
         try { windows.addView(view, params); panel = view; view.requestFocus() }
         catch (e: Exception) { fail("无法打开取词界面：${e.message}") }
     }
-    private fun removePanelView() { definitionGuard = null; panel?.let { runCatching { windows.removeViewImmediate(it) } }; panel = null }
+    private fun removePanelView() { definitionGuard = null; missingGuard = null; panel?.let { runCatching { windows.removeViewImmediate(it) } }; panel = null }
     private fun invalidateDefinition(guard: DefinitionGuard) {
         guard.invalid = true
         guard.status.text = "未收录：该词已删除或查询已失效"; guard.status.setTextColor(Paper.error)
         guard.undo.isEnabled = false; guard.correct.isEnabled = false; guard.retry.visibility = View.GONE
+    }
+    // Retires an open uncollected card after a restore/delete: no new-headword editor and no explicit
+    // collect can start from the old world.
+    private fun invalidateMissing(guard: MissingGuard) {
+        guard.invalid = true
+        guard.add?.apply { isEnabled = false; text = "查询已失效" }
+        guard.collect.isEnabled = false
+        guard.status.text = "该词条已删除或数据已恢复，请重新查询"
+        guard.status.setTextColor(Paper.error)
+        guard.closeEditors()
     }
     // A floating card is out of date once it is invalidated or its word was deleted after the query
     // credential was captured; both must win over any late success/failure result.
     private fun definitionCardStale(guard: DefinitionGuard): Boolean =
         guard.invalid || app.repository.deletions.isStale(guard.key, guard.credential)
     private fun dismissPanel() {
+        // Closing the page card ends every editor it owned, even before its view detaches.
+        closeSupplementEditors()
         perf.end("closed", "dismiss")
         gate.next(); requestedFrame.getAndSet(null)?.cancel(); clearFrameTimeout()
         // The dismissed attempt is over; queued failure notifications for it must stay silent.
@@ -1122,18 +1176,49 @@ class CaptureService : Service() {
         val credential = credentialOverride ?: deletionCredential
         app.worker.execute {
             if (!sessionIsActive() || !gate.accepts(token)) return@execute
-            val lookup = runCatching { app.dictionary.getOrThrow().lookup(form) }
+            // One unified resolution for the pinned asset plus the local supplement dictionary.
+            val lookup = runCatching {
+                // Capture the committed revision immediately before and after the actual read. A
+                // commit in between means the merged entry and the user row may be from different
+                // snapshots; such a read is rejected rather than mixed or relabelled later.
+                val before = app.repository.changes.version
+                val result = app.lookupWord(form)
+                val user = (result as? LookupResult.Match)?.let { app.repository.userEntry(it.form) }
+                val after = app.repository.changes.version
+                LookupRead(result, user, after, before == after)
+            }
             main.post {
                 if (!sessionIsActive() || !gate.accepts(token)) return@post
-                lookup.onSuccess { result ->
+                lookup.onSuccess { read ->
+                    val result = read.result
                     when (result) {
                         LookupResult.Invalid -> { perf.stage("dictionary", "invalid"); showMessage("请输入一个有效词头，不自动拼接多个词。", raw, replaces) }
-                        is LookupResult.Missing -> { perf.stage("dictionary", "missing"); showMessage("「${result.form}」未收录于原始词库。没有生成释义，也没有新增记录。", raw, replaces) }
-                        is LookupResult.Match -> showDefinition(result.form, raw, result.entries.single(), replaces, credential, manual)
+                        is LookupResult.Missing -> {
+                            perf.stage("dictionary", "missing")
+                            // The result is only valid in the world the query started in. A restore or
+                            // this key's deletion must reject it instead of showing a writable card.
+                            if (app.repository.deletions.isStale(result.form, credential))
+                                showMessage("查询已失效（词条已删除或数据已恢复），请重新查询。", raw, replaces)
+                            else if (!read.isCurrent(app.repository.changes.version)) {
+                                // A supplement (or any committed data) changed after this read: drawing
+                                // the old result would hide the current user meaning, so no card is made.
+                                perf.stage("dictionary", "stale")
+                                showMessage("查询已失效（词条或本机补充已更新），请重新查询。", raw, replaces)
+                            } else showMissing(result.form, raw, replaces, credential)
+                        }
+                        is LookupResult.Match -> {
+                            val entry = result.entries.single()
+                            if (app.repository.deletions.isStale(entry.key, credential))
+                                showMessage("查询已失效（词条已删除或数据已恢复），请重新查询。", raw, replaces)
+                            else if (!read.isCurrent(app.repository.changes.version)) {
+                                perf.stage("dictionary", "stale")
+                                showMessage("查询已失效（词条或本机补充已更新），请重新查询。", raw, replaces)
+                            } else showDefinition(result.form, raw, entry, read.user, replaces, credential, manual)
+                        }
                     }
                 }.onFailure {
                     perf.stage("dictionary", "failed")
-                    showMessage("原始词库不可用：${it.message}。没有生成释义，也没有新增记录。", raw, replaces)
+                    showMessage("词库不可用：${it.message}。没有生成释义，也没有新增记录。", raw, replaces)
                 }
             }
         }
@@ -1152,6 +1237,175 @@ class CaptureService : Service() {
         content.addView(button("返回做题") { dismissPanel(); showBubble() })
         addPanel(scroll(content))
     }
+
+    /**
+     * The floating uncollected state. Adding a new user headword here is local-only: it creates no
+     * QueryEvent, count, vocabulary row or study card, and ends this automatic page admission. Only
+     * the explicit "查询并收录" button starts a normal (manual) query that may enter personal words.
+     */
+    private fun showMissing(form: String, raw: String, replaces: String?, credential: Long) {
+        // Display-entry check: a stale query never creates a writable floating card.
+        if (app.repository.deletions.isStale(form, credential)) {
+            showMessage("查询已失效（词条已删除或数据已恢复），请重新查询。", raw, replaces)
+            return
+        }
+        endPageGuard()
+        gate.next()
+        val content = card("未收录")
+        content.addView(text("「$form」未收录。可以只在本机新增用户词条；保存不会产生查询记录或生词。", 16f, Paper.warning))
+        if (raw.isNotBlank()) { content.addView(text("选中原文：\n$raw")); content.space() }
+        val meaningView = text("", 18f)
+        val supplementStatus = text("", 14f, Paper.secondary)
+        val editorHost = column()
+        lateinit var guard: MissingGuard
+        val collect = button("查询并收录", true) {
+            if (!sessionIsActive()) return@button
+            // A card whose world was replaced must not start a new explicit query that could be
+            // perceived as the old query's write path.
+            if (app.repository.deletions.isStale(form, credential)) { invalidateMissing(guard); return@button }
+            // Explicit user action in the card's still-current world: the only path that may create a
+            // real query and personal vocabulary. It keeps the original query credential instead of
+            // recapturing, so a later restore cannot be laundered into a fresh write identity.
+            lookup(form, raw, replaces, credentialOverride = credential, manual = true)
+        }.apply { visibility = View.GONE }
+        var currentUser: UserDictionaryEntry? = null
+        var editorRoot: LinearLayout? = null
+        val canAdd = PersonalDictionary.normalizeNewKey(form) == form
+        if (!canAdd) {
+            content.addView(text("该结果不是单个规范英文词头（可能是短语或多词），不能作为新词头；请修改为一个英文单词。", 15f, Paper.warning, true))
+        }
+        lateinit var edit: Button
+        if (canAdd) {
+            edit = button("新增这个词", true) {
+                if (!sessionIsActive()) return@button
+                // Bind the editor to the query-start credential; opening it after a restore must not
+                // capture the new world and write the old text there.
+                if (app.repository.deletions.isStale(form, credential)) { invalidateMissing(guard); return@button }
+                editorRoot?.let { editorHost.removeView(it) }
+                editorRoot = addSupplementEditor(editorHost, form, form, null, currentUser, credential,
+                    newHeadword = true) { saved, merged ->
+                    currentUser = saved
+                    meaningView.text = "${merged.partOfSpeech} ${merged.meaning}".trim()
+                    supplementStatus.text = "已保存到本机用户词库（仅本机；尚未收录为生词）"
+                    supplementStatus.setTextColor(Paper.green)
+                    collect.visibility = View.VISIBLE
+                    edit.text = "重新编辑词义"
+                }
+            }
+            content.addView(edit); content.space(4)
+        }
+        content.addView(collect); content.space(4)
+        content.addView(meaningView); content.addView(supplementStatus)
+        content.addView(editorHost)
+        content.addView(button("重新划选") { beginLiveSelection() }); content.space(8)
+        content.addView(button("返回做题") { dismissPanel(); showBubble() })
+        guard = MissingGuard(form, credential, if (canAdd) edit else null, collect, supplementStatus) {
+            closeSupplementEditors()
+        }
+        addPanel(scroll(content))
+        missingGuard = guard
+    }
+
+    /**
+     * Inline supplement editor. It edits only user-owned POS/meaning; the original asset is shown
+     * read-only and never rewritten. A stale handle (restore, deletion or a newer supplement) is
+     * rejected instead of overwriting newer data, and no query/study row is written by this save.
+     */
+    private fun addSupplementEditor(host: LinearLayout, entryKey: String, headword: String,
+                                    original: DictionaryEntry?, currentUser: UserDictionaryEntry?,
+                                    credential: Long,
+                                    newHeadword: Boolean = false,
+                                    onSaved: (UserDictionaryEntry, DictionaryEntry) -> Unit): LinearLayout {
+        // Never open a writable editor for a query world that has already been replaced.
+        if (app.repository.deletions.isStale(entryKey, credential)) {
+            val stale = column().apply {
+                space(8); divider()
+                addView(text("该词条已删除或数据已恢复，请重新查询后再编辑", 15f, Paper.warning, true))
+            }
+            host.addView(stale)
+            return stale
+        }
+        val root = column().apply {
+            space(8); divider()
+            addView(text("补充/编辑词义 · 仅本机", 18f, bold = true))
+            addView(text("不会覆盖原始词库，也不会计入查询次数或学习进度", 13f, Paper.secondary))
+        }
+        original?.let {
+            root.addView(text("原词库释义（只读）", 15f, bold = true))
+            root.addView(text("${it.partOfSpeech} ${it.meaning}".trim(), 15f))
+            root.addView(text(PersonalDictionary.provenance(it), 12f, Paper.warning))
+        }
+        val pos = inputField("词性（可留空），如 n. / v.", singleLine = true).apply {
+            setText(currentUser?.partOfSpeech ?: "")
+        }
+        val meaning = inputField("用户补充释义（必填）", singleLine = false).apply {
+            minLines = 3; gravity = Gravity.TOP
+            setText(currentUser?.meaning ?: "")
+        }
+        root.addView(pos); root.space(4); root.addView(meaning)
+        val status = text("", 14f, Paper.secondary); root.addView(status)
+        val save = button("保存到本机", true) {}
+        root.addView(save)
+        host.addView(root)
+        var alive = true
+        var saving = false
+        // Bound to the deletion/restore world of the originating query, passed in explicitly. Opening
+        // the editor never captures a fresh credential, so an old card cannot rebind after a restore.
+        val editorLease = SupplementEditorLease(StudyAdmission {
+            !app.repository.deletions.isStale(entryKey, credential)
+        })
+        supplementEditorLeases += editorLease
+        fun closeEditor() {
+            editorLease.closed = true
+            editorLease.admission.invalidate()
+            supplementEditorLeases -= editorLease
+        }
+        root.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
+            // Detach closes the lease permanently; a later reattach does not make it writable again.
+            override fun onViewAttachedToWindow(v: View) { alive = true }
+            override fun onViewDetachedFromWindow(v: View) { alive = false; closeEditor() }
+        })
+        val expectedUpdatedAt = currentUser?.updatedAt ?: 0L
+        save.setOnClickListener {
+            if (!alive || editorLease.closed || saving || !sessionIsActive()) return@setOnClickListener
+            if (meaning.text.toString().isBlank()) {
+                status.text = "释义不能为空，未保存"; status.setTextColor(Paper.error); return@setOnClickListener
+            }
+            if (app.repository.deletions.isStale(entryKey, credential)) {
+                status.text = "词条已删除或数据已恢复，请重新划选后再编辑"; status.setTextColor(Paper.error)
+                return@setOnClickListener
+            }
+            saving = true; save.isEnabled = false; status.text = "保存中…"; status.setTextColor(Paper.secondary)
+            app.worker.execute {
+                val result = app.repository.saveUserEntry(entryKey, pos.text.toString(), meaning.text.toString(),
+                    expectedUpdatedAt = expectedUpdatedAt, newHeadword = newHeadword,
+                    admission = editorLease.admission)
+                main.post {
+                    // A closed/stopped owner suppresses its old UI, but never reports an already
+                    // committed save as unwritten; result.saved is the actual admission outcome.
+                    if (!alive || editorLease.closed) return@post
+                    saving = false
+                    if (!result.saved) {
+                        save.isEnabled = true
+                        status.text = result.message; status.setTextColor(Paper.error); return@post
+                    }
+                    if (app.repository.deletions.isStale(entryKey, credential)) {
+                        // Committed before the deletion/restore; do not claim "未保存" or repaint.
+                        save.isEnabled = false
+                        status.text = "保存已提交，但该词随后被删除或数据已恢复"
+                        status.setTextColor(Paper.warning); return@post
+                    }
+                    val saved = result.entry ?: return@post
+                    val merged = PersonalDictionary.merge(original, saved) ?: PersonalDictionary.userOnly(saved)
+                    onSaved(saved, merged)
+                    status.text = if (result.changed) "已保存到本机用户词库" else "词义未变化，未重复保存"
+                    status.setTextColor(Paper.green)
+                }
+            }
+        }
+        return root
+    }
+
     private fun showCorrection(raw: String, replaces: String?, originalRaw: String = raw) {
         // A correction is an explicit user action, not a late automatic result from the old page.
         endPageGuard()
@@ -1166,16 +1420,21 @@ class CaptureService : Service() {
         addPanel(scroll(content))
     }
 
-    private fun showDefinition(form: String, raw: String, entry: DictionaryEntry, replaces: String?,
+    private fun showDefinition(form: String, raw: String, entry: DictionaryEntry,
+                               initialUser: UserDictionaryEntry?, replaces: String?,
                                credential: Long, manual: Boolean = false) {
         val token = gate.next()
         val page = pageGuard
         val event = QueryEvent(UUID.randomUUID().toString(), entry.key, raw, form, System.currentTimeMillis())
         val content = card(entry.headword)
-        content.addView(text("原词形：$form · ${entry.partOfSpeech}"))
+        val meta = text("原词形：$form · ${entry.partOfSpeech}")
+        val meaningView = text(entry.meaning, 18f)
+        val provenanceView = text(PersonalDictionary.provenance(entry), 14f, Paper.warning)
+        content.addView(meta)
         content.addView(text("选中原文：\n$raw"))
-        content.addView(text(entry.meaning, 18f)); content.space()
-        content.addView(text(RawKajwebDictionary.provenance(entry.source, entry.version), 14f, Paper.warning))
+        content.addView(meaningView); content.space()
+        content.addView(text(PersonalDictionary.label(entry), 13f, Paper.secondary))
+        content.addView(provenanceView)
         val status = text("保存中…", 16f, Paper.secondary)
         content.addView(status)
         val undo = button("撤销本次收录") {}
@@ -1183,6 +1442,28 @@ class CaptureService : Service() {
         val retry = button("重试保存") {}
         undo.isEnabled = false; correct.isEnabled = false; retry.visibility = View.GONE
         content.addView(undo); content.space(8); content.addView(correct); content.space(8); content.addView(retry); content.space(8)
+        var currentUser = initialUser
+        val supplementStatus = text("", 13f, Paper.secondary)
+        val editorHost = column()
+        var editorRoot: LinearLayout? = null
+        content.addView(button("补充/编辑词义") {
+            val active = definitionGuard
+            if (active != null && definitionCardStale(active)) { invalidateDefinition(active); return@button }
+            if (!sessionIsActive()) return@button
+            editorRoot?.let { editorHost.removeView(it) }
+            val original = if (entry.source == PersonalDictionary.SOURCE) null
+            else PersonalDictionary.storedEntry(entry)
+            editorRoot = addSupplementEditor(editorHost, entry.key, entry.headword, original, currentUser,
+                credential) { saved, merged ->
+                currentUser = saved
+                meta.text = "原词形：$form · ${merged.partOfSpeech}"
+                meaningView.text = merged.meaning
+                provenanceView.text = PersonalDictionary.provenance(merged)
+                supplementStatus.text = "用户补充已保存到本机；本次查询记录不受影响"
+                supplementStatus.setTextColor(Paper.green)
+            }
+        }); content.space(4)
+        content.addView(supplementStatus); content.addView(editorHost); content.space(4)
         content.addView(button("重新划选") { beginLiveSelection() }); content.space(8)
         content.addView(button("返回做题", true) { dismissPanel(); showBubble() })
         addPanel(scroll(content))
@@ -1295,6 +1576,9 @@ class CaptureService : Service() {
     override fun onDestroy() {
         perf.end("stopped", "session_stop")
         stopped = true
+        // A stopped service rejects every queued supplement save that has not reached its
+        // transaction yet; an already-admitted save keeps its atomic commit.
+        closeSupplementEditors()
         app.repository.changes.remove(deletionListener)
         dismissPanel(); removeBubble()
         display?.release(); display = null

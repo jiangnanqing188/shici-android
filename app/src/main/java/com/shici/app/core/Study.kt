@@ -3,14 +3,21 @@ package com.shici.app.core
 import java.time.Instant
 import java.time.ZoneId
 
-/** Fixed first-version study books. Personal vocabulary is a runtime set, not a generated index. */
+/**
+ * The study scope. [ALL] is the single unified entrance (个人生词 + 考研 + 六级), not an asset book:
+ * the fixed books still come from the pinned ky/cet6 index and personal vocabulary is the live query
+ * set. [KAOYAN], [CET6] and [PERSONAL] are kept for old-source compatibility and existing persisted
+ * rows; they are no longer offered as separate study queues. A word has one state per entry key and
+ * therefore one progress no matter which source introduced it.
+ */
 enum class StudyBook(val id: String, val label: String) {
+    ALL("all", "统一背诵"),
     KAOYAN("ky", "考研"),
     CET6("cet6", "六级"),
     PERSONAL("personal", "个人生词");
 
     companion object {
-        val default: StudyBook = KAOYAN
+        val default: StudyBook = ALL
         fun fromId(id: String): StudyBook? = entries.firstOrNull { it.id == id }
     }
 }

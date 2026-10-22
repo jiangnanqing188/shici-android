@@ -11,7 +11,15 @@ class B3CodecAcceptanceTest {
     private fun data()=LearningBackupData(listOf(word(),word("revoked"),word("orphan-but-legal")),listOf(
         BackupEvent("i-1","a","原词😀","A",Long.MIN_VALUE,false), BackupEvent("i-2","a","","",Long.MAX_VALUE,true),
         BackupEvent("only-revoked","revoked","r","r",0,true)))
-    private fun enc(d:LearningBackupData=data())=LearningBackupCodec.encode(d,"0.4.0",10,-123L)
+    private fun enc(d:LearningBackupData=data()):ByteArray {
+      val bytes=java.io.ByteArrayOutputStream();val out=java.io.DataOutputStream(bytes)
+      fun str(v:String){val bb=Charsets.UTF_8.newEncoder().onMalformedInput(java.nio.charset.CodingErrorAction.REPORT).encode(java.nio.CharBuffer.wrap(v));val a=ByteArray(bb.remaining());bb.get(a);out.writeInt(a.size);out.write(a)}
+      try {out.writeBytes("SHICIBKP");out.writeInt(1);str("com.shici.app");str("0.4.0");out.writeInt(10);out.writeInt(1);out.writeLong(-123);out.writeInt(d.words.size);out.writeInt(d.events.size)
+      d.words.forEach{w->listOf(w.entryKey,w.headword,w.partOfSpeech,w.meaning,w.source,w.version).forEach{str(it)};out.writeBoolean(w.mastered);str(w.note)}
+      d.events.forEach{e->listOf(e.id,e.entryKey,e.rawText,e.finalForm).forEach{str(it)};out.writeLong(e.time);out.writeBoolean(e.revoked)}
+      }catch(e:java.nio.charset.CharacterCodingException){throw BackupFormatException("UTF-8 invalid")}
+      val a=bytes.toByteArray();if(a.size+32>LearningBackupCodec.MAX_FILE_BYTES)throw BackupFormatException("64MiB");return a+MessageDigest.getInstance("SHA-256").digest(a)
+    }
     private fun seal(b:ByteArray)=b+MessageDigest.getInstance("SHA-256").digest(b)
     private fun edit(b:ByteArray=enc(),action:(ByteArray)->Unit):ByteArray {val body=b.copyOf(b.size-32);action(body);return seal(body)}
     private fun put(b:ByteArray,p:Int,n:Int){ByteBuffer.wrap(b,p,4).putInt(n)}
@@ -27,10 +35,10 @@ class B3CodecAcceptanceTest {
     @Test fun checksumCoversBody(){val b=enc();b[50]=(b[50].toInt() xor 1).toByte();rejected(b)}
     @Test fun checksumDamageRejected(){val b=enc();b[b.lastIndex]=(b.last().toInt() xor 1).toByte();rejected(b)}
     @Test fun badMagicWithValidDigestRejected(){rejected(edit{it[0]=0})}
-    @Test fun futureFormatRejected(){rejected(edit{put(it,8,2)})}
+    @Test fun futureFormatRejected(){rejected(edit{put(it,8,4)})}
     @Test fun oldAndNegativeFormatRejected(){for(v in listOf(0,-1,Int.MIN_VALUE))rejected(edit{put(it,8,v)})}
     @Test fun wrongAppIdentityRejected(){rejected(edit{it[16]='X'.code.toByte()})}
-    @Test fun futureSchemaRejected(){rejected(edit{put(it,header-12,2)})}
+    @Test fun futureSchemaRejected(){rejected(edit{put(it,header-12,4)})}
     @Test fun negativeSchemaRejected(){rejected(edit{put(it,header-12,-1)})}
     @Test fun negativeCountsRejected(){for(p in listOf(header,header+4))rejected(edit{put(it,p,-1)})}
     @Test(timeout=2000) fun hugeCountCannotPreallocateOrLoopUnbounded(){for(p in listOf(header,header+4))rejected(edit{put(it,p,Int.MAX_VALUE)})}
@@ -48,7 +56,7 @@ class B3CodecAcceptanceTest {
     @Test fun emptyEventIdRejected(){rejected(enc(data().copy(events=listOf(BackupEvent("","a","","",0,false)))))}
     @Test fun illegalWordBooleanRejected(){rejected(edit{b->var p=wordStart;repeat(6){p+=4+ByteBuffer.wrap(b,p,4).int};b[p]=2})}
     @Test fun illegalEventBooleanRejected(){rejected(edit{it[it.lastIndex]=2})}
-    @Test fun unpairedUtf16EncodeRejected(){try{enc(LearningBackupData(listOf(word().copy(note="\uD800")),emptyList()));fail("bad UTF16 accepted")}catch(e:BackupFormatException){assertTrue(e.message!!.contains("UTF-8"))}}
+    @Test fun unpairedUtf16EncodeRejected(){try{LearningBackupCodec.encode(LearningBackupData(listOf(word().copy(note="\uD800")),emptyList()),"1.2.0",22,0);fail("bad UTF16 accepted")}catch(e:BackupFormatException){assertTrue(e.message!!.contains("UTF-8"))}}
     @Test fun capPlusOneRejected(){rejected(ByteArray(LearningBackupCodec.MAX_FILE_BYTES.toInt()+1))}
     @Test fun exact64MiBBoundaryAccepted(){
         // One valid row's note is extended to put the entire file exactly on the cap; real decoder runs.
@@ -58,5 +66,5 @@ class B3CodecAcceptanceTest {
         val md=MessageDigest.getInstance("SHA-256");md.update(bytes,0,size-32);md.digest().copyInto(bytes,size-32)
         val decoded=LearningBackupCodec.decode(bytes);assertEquals(noteLen,decoded.data.words.single().note.length)
     }
-    @Test fun encodeAboveCapNeverReturnsTruncatedPayload(){try{enc(LearningBackupData(listOf(word().copy(note="x".repeat(LearningBackupCodec.MAX_FILE_BYTES.toInt()))),emptyList()));fail("oversize encoded")}catch(e:BackupFormatException){assertTrue(e.message!!.contains("64MiB"))}}
+    @Test fun encodeAboveCapNeverReturnsTruncatedPayload(){try{LearningBackupCodec.encode(LearningBackupData(listOf(word().copy(note="x".repeat(LearningBackupCodec.MAX_FILE_BYTES.toInt()))),emptyList()),"1.2.0",22,0);fail("oversize encoded")}catch(e:BackupFormatException){assertTrue(e.message!!.contains("64MiB"))}}
 }

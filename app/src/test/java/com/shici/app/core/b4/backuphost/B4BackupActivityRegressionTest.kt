@@ -11,7 +11,7 @@ class Intent(val action:String="") {
  fun addCategory(s:String)=this;fun setType(s:String)=this;fun putExtra(k:String,v:String)=this
  companion object {const val ACTION_CREATE_DOCUMENT="create";const val ACTION_OPEN_DOCUMENT="open";const val CATEGORY_OPENABLE="openable";const val EXTRA_TITLE="title"}
 }
-object BuildConfig{const val VERSION_NAME="1.0.0";const val VERSION_CODE=12}
+object BuildConfig{const val VERSION_NAME="1.2.0";const val VERSION_CODE=22}
 object Paper{val secondary=0;val background=0;val warning=0;val ink=0}
 class Queue{val tasks=java.util.ArrayDeque<()->Unit>();fun execute(f:()->Unit){tasks.add(f)};fun post(f:()->Unit){tasks.add(f)};fun one(){tasks.removeFirst().invoke()};fun all(){while(tasks.isNotEmpty())one()}}
 open class Node {var isEnabled=true;var text="";var background:Any?=null;var action:(()->Unit)?=null;fun click(){action!!.invoke()};fun space(n:Int){};fun addView(n:Node){};fun setTextColor(n:Int){};fun setPadding(a:Int,b:Int,c:Int,d:Int){}}
@@ -158,17 +158,23 @@ class B4BackupActivityRegressionTest:Base(){
         content.addView(text("备份创建时间：${date(backup.createdAt)}", 18f))
         content.addView(text("词条 ${backup.wordCount} 个 · 事件 ${backup.eventCount} 条", 18f))
         if (backup.legacyNoStudyData) {
-            content.addView(text("这是旧版格式（v1）备份：只含生词与查询记录，不含背词进度。", 16f, Paper.warning, true))
-            content.addView(text("恢复后背词进度为空，所选词书与每日目标恢复为默认值。", 16f, Paper.warning))
+            content.addView(text("这是旧版格式（v1）备份：只含生词与查询记录，不含背词进度和个人补充词库。", 16f, Paper.warning, true))
+            content.addView(text("恢复后背词进度为空、个人补充词库为空，所选范围与每日目标恢复为默认值。", 16f, Paper.warning))
         } else {
             content.addView(text("背词进度：已学 ${backup.stateCount} 词 · 反馈 ${backup.reviewCount} 条${if (backup.data.session != null) " · 含 1 张未答卡" else ""}", 18f))
+            if (backup.noPersonalDictionary) {
+                content.addView(text("这是 v2 备份：不含个人补充词库。恢复会清空当前本机补充词条，不会与备份隐式合并。", 16f, Paper.warning, true))
+            } else {
+                content.addView(text("个人补充词库：${backup.userEntryCount} 个词条（含未产生查询记录的新词头）", 18f))
+            }
         }
         content.addView(text("备份应用版本：${backup.appVersionName}（${backup.appVersionCode}）", 16f, Paper.secondary)); content.space(12)
         val warning = column().apply {
             setPadding(dp(16), dp(12), dp(16), dp(12)); background = shape(Paper.background, 8)
-            addView(text(if (backup.wordCount == 0 && backup.eventCount == 0)
-                "这是一个空备份：确认恢复后会清空当前全部学习数据。" else
-                "恢复会用备份内容完整替换当前全部学习数据（不合并、不猜测冲突）；备份里没有的词也会被移除。",
+            addView(text(if (backup.wordCount == 0 && backup.eventCount == 0 &&
+                    backup.stateCount == 0 && backup.userEntryCount == 0 && backup.data.session == null)
+                "这是一个空备份：确认恢复后会清空当前全部学习数据和个人补充词库。" else
+                "恢复会用备份内容完整替换当前全部学习数据与个人补充词库（不合并、不猜测冲突）；备份里没有的词、查询记录和补充词条也会被移除。",
                 16f, Paper.warning, true))
             addView(text("恢复前必须先把当前数据另存为一个安全备份文件；只有写入关闭并读回校验一致、且数据未在此期间变化时才会覆盖。", 16f, Paper.secondary))
             addView(text("备份是本地明文个人数据，未加密、不防恶意篡改。", 16f, Paper.secondary))
@@ -235,7 +241,7 @@ class B4BackupActivityRegressionTest:Base(){
                     when (outcome) {
                         RestoreOutcome.RESTORED -> {
                             restorePreviewDialog?.dismiss(); restorePreviewDialog = null
-                            toast("已完整恢复：替换为备份中的 ${backup.wordCount} 个词、${backup.eventCount} 条事件")
+                            toast("已完整恢复：替换为备份中的 ${backup.wordCount} 个词、${backup.eventCount} 条事件、${backup.userEntryCount} 条用户补充")
                         }
                         RestoreOutcome.REVISION_CHANGED ->
                             toast("学习数据在准备期间有新变化，本次未覆盖；请重新开始恢复")
@@ -409,5 +415,24 @@ if (interruptedDocumentRequests.remove(requestCode)) {
   app.repository.rows=LearningBackupData(listOf(BackupWord("x","x","n","old","s","v",true,"note")),emptyList(),BackupStudySettings("cet6",41),listOf(BackupStudyState("x","ky",0,now+86400000,now,now,1)),listOf(BackupStudyReview("r","x","know",-1,0,now+86400000,now,"1970-01-01","UTC",true,1)))
   val before=app.repository.rows;val id=readySafety();handleRestoreSafetyResult(id,RESULT_OK,result("safe"));settle()
   assertEquals(before,LearningBackupCodec.decode(contentResolver.files.getValue("safe")).data);assertEquals(1,app.repository.restores)
+ }
+ @Test fun U1B01_v2PreviewWarnsSupplementsClearedNotStudyEmpty(){
+  val b=LearningBackup("1.0.3",15,2,0,payload().copy(settings=BackupStudySettings("ky",37)),2)
+  val id=restoreSession.beginImport()!!;restoreSession.beginReading(id,"input");restoreSession.freezeImport(id,b);showRestorePreview(b)
+  assertTrue(texts.any{it.contains("v2")&&it.contains("清空当前本机补充词条")});assertTrue(texts.any{it.contains("背词进度：")});assertFalse(texts.any{it.contains("背词进度为空")})
+ }
+ @Test fun U1B02_userOnlyV3NotMisreportedEmptyBackup(){
+  val d=LearningBackupData(emptyList(),emptyList(),userEntries=listOf(BackupUserEntry("novel","","用户词",1)))
+  val b=LearningBackupCodec.decode(LearningBackupCodec.encode(d,"1.2.0",22,1));val id=restoreSession.beginImport()!!;restoreSession.beginReading(id,"input");restoreSession.freezeImport(id,b);showRestorePreview(b)
+  assertTrue(texts.any{it.contains("个人补充词库：1")});assertFalse(texts.any{it.contains("这是一个空备份")});assertTrue(texts.any{it.contains("完整替换")&&it.contains("个人补充词库")})
+ }
+ @Test fun U1B03_safetyBackupIncludesUnqueriedUserRowsBeforeOverwrite(){
+  app.repository.rows=app.repository.rows.copy(userEntries=listOf(BackupUserEntry("novel","n.","current user meaning",9)))
+  val before=app.repository.rows;val id=readySafety();handleRestoreSafetyResult(id,RESULT_OK,result("safe-u1"));settle()
+  val safe=LearningBackupCodec.decode(contentResolver.files.getValue("safe-u1"));assertEquals(3,safe.formatVersion);assertEquals(before,safe.data);assertEquals(1,safe.userEntryCount);assertTrue(app.repository.rows.userEntries.isEmpty());assertEquals(1,app.repository.restores)
+ }
+ @Test fun U1B04_supplementRevisionDuringSafetyIoPreventsOverwrite(){
+  val id=readySafety();contentResolver.afterClose={app.repository.rows=app.repository.rows.copy(userEntries=listOf(BackupUserEntry("novel","","mine",1)));app.repository.changes.publishCommitted()};handleRestoreSafetyResult(id,RESULT_OK,result("safe-u1"));settle()
+  assertEquals(0,app.repository.restores);assertEquals("mine",app.repository.rows.userEntries.single().meaning)
  }
 }

@@ -5,7 +5,7 @@ import org.junit.Test
 import java.time.*
 class B4StudyRulesAcceptanceTest {
  private val now=1_800_000_000_000L
- @Test fun booksExactlyRequested(){assertEquals(listOf("ky","cet6","personal"),StudyBook.entries.map{it.id});assertEquals(StudyBook.KAOYAN,StudyBook.default);assertNull(StudyBook.fromId("cet4"))}
+ @Test fun booksExactlyRequested(){assertEquals(listOf("all","ky","cet6","personal"),StudyBook.entries.map{it.id});assertEquals(StudyBook.ALL,StudyBook.default);assertNull(StudyBook.fromId("cet4"))}
  @Test fun defaultsAndGoalBounds(){assertEquals(20,StudySettings().dailyNewGoal);assertEquals(1,StudyRules.clampGoal(Int.MIN_VALUE));assertEquals(200,StudyRules.clampGoal(Int.MAX_VALUE));assertEquals(80,StudyRules.clampGoal(80))}
  @Test fun knowSequenceAndCap(){var stage=-1;for(days in listOf(1,3,7,14,30,30)){assertEquals(now+days*StudyRules.DAY_MILLIS,StudyRules.dueAt(now,stage,FeedbackKind.KNOW));stage=StudyRules.nextStage(stage,FeedbackKind.KNOW)}}
  @Test fun fuzzyExistingDoesNotUpgrade(){for(stage in 0..4){assertEquals(stage,StudyRules.nextStage(stage,FeedbackKind.FUZZY));assertEquals(now+StudyRules.DAY_MILLIS,StudyRules.dueAt(now,stage,FeedbackKind.FUZZY))}}

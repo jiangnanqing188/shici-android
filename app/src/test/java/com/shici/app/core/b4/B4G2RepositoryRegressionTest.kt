@@ -8,7 +8,7 @@ import java.time.*
 class B4G2RepositoryRegressionTest {
  private val now=Instant.parse("2026-10-16T12:00:00Z").toEpochMilli();private val zone=ZoneOffset.UTC
  private fun entry(k:String)=DictionaryEntry(k,"n","old meaning","old source","old version")
- private fun plan(vararg keys:String)=StudyMembership(StudyBook.KAOYAN,keys.toList()){entry(it)}
+ private fun plan(vararg keys:String)=StudyMembership(StudyBook.ALL,keys.toList()){entry(it)}
  private fun <T> repo(f:(LearningRepository)->T):T=LearningRepository(Context(),"g2-synthetic").use(f)
  private fun view(r:LearningRepository,at:Long=now)=r.studyView(plan("a"),at,zone)
  private fun answer(r:LearningRepository,v:StudyView,kind:FeedbackKind,at:Long){r.revealStudyCard(v.card!!.token,v.credential);assertEquals(StudyCommitOutcome.COMMITTED,r.commitStudyFeedback(v.card!!.token,kind,at,zone,v.credential))}
@@ -54,9 +54,9 @@ class B4G2RepositoryRegressionTest {
   assertEquals(StudyCommitOutcome.REJECTED,r.commitStudyFeedback(v.card!!.token,FeedbackKind.KNOW,now,zone,v.credential));assertEquals(before,r.backupSnapshot())
  }
  @Test fun loweredGoalPlanningMustNotKeepOverQuotaNewCard()=repo{r->
-  r.updateStudySettings(StudyBook.KAOYAN,2);answer(r,view(r),FeedbackKind.KNOW,now)
+  r.updateStudySettings(StudyBook.ALL,2);answer(r,view(r),FeedbackKind.KNOW,now)
   val pending=r.studyView(plan("a","b"),now,zone);assertEquals("b",pending.card!!.entryKey)
-  r.updateStudySettings(StudyBook.KAOYAN,1);val refreshed=r.studyView(plan("a","b"),now,zone)
+  r.updateStudySettings(StudyBook.ALL,1);val refreshed=r.studyView(plan("a","b"),now,zone)
   assertEquals(0,refreshed.progress.newRemaining);assertNull("planning must not retain an over-quota new card",refreshed.card)
  }
  @Test fun pendingSnapshotStaysOldButPersonalNoteReadsLive()=repo{r->

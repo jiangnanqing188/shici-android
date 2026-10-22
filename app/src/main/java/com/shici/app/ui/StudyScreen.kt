@@ -1,7 +1,6 @@
 package com.shici.app.ui
 
 import android.app.Activity
-import android.graphics.Color
 import android.os.Handler
 import android.os.Looper
 import android.view.Gravity
@@ -15,6 +14,7 @@ import com.shici.app.core.StudyProgress
 import com.shici.app.core.StudyAdmission
 import com.shici.app.core.StudyRules
 import com.shici.app.core.StudyView
+import com.shici.app.core.UnifiedStudyPool
 import com.shici.app.data.StudyCommitOutcome
 import com.shici.app.data.StudyMembership
 import java.time.Instant
@@ -23,8 +23,11 @@ import java.time.format.DateTimeFormatter
 
 /**
  * The real 背词 review surface. It draws from the repository's persisted study round and never keeps a
- * parallel in-memory ledger: a committed feedback is re-read, not patched. Membership comes from the
- * validated ky/cet6 index or, for 个人生词, from the live active vocabulary. All database work runs on
+ * parallel in-memory ledger: a committed feedback is re-read, not patched. There is one unified
+ * entrance: due reviews first, then new words from the personal query set (recent first) followed by
+ * the fixed ky/cet6 books stably interleaved and deduplicated by entry key. Membership is built here
+ * from the validated index and the live personal set; entry snapshots go through the application's
+ * unified resolver so a user-supplied supplement is what the card shows. All database work runs on
  * the application's single worker; the view is rebuilt on the main thread after each commit.
  *
  * [context] is the owning Activity: once it is destroyed, every queued worker and every posted
@@ -56,8 +59,9 @@ class StudyScreen(
 
     fun render(content: LinearLayout) {
         content.removeAllViews()
-        content.addView(context.text("背词复习", 26f, Paper.ink, true))
+        content.addView(context.text("背词复习 · 统一背诵", 26f, Paper.ink, true))
         content.addView(context.text("固定间隔复习，非经过验证的记忆算法；只按你的真实反馈推进。", 16f, Paper.secondary))
+        content.addView(context.text("到期复习优先；之后先学个人生词（最近查询优先），再按考研/六级原书顺序稳定交错。", 16f, Paper.secondary))
         content.space(16)
         content.addView(context.text("正在读取学习进度…", 16f, Paper.secondary))
         load(content)
@@ -69,10 +73,10 @@ class StudyScreen(
             // A queued load of a screen whose activity is already gone must not even deal a card.
             if (context.isDestroyed) return@execute
             val result = runCatching {
-                val settings = app.repository.studySettings()
-                // planFor may load personal members (a long read); studyView admits the pending-card
-                // write only after that, so a destroy during the load still persists nothing.
-                app.repository.studyView(planFor(settings.selectedBook), System.currentTimeMillis(), zone, admission)
+                // planFor loads the personal set and the pinned book index (long reads); studyView
+                // admits the pending-card write only after that, so a destroy during the load still
+                // persists nothing.
+                app.repository.studyView(planFor(), System.currentTimeMillis(), zone, admission)
             }
             main.post {
                 if (context.isDestroyed) return@post
@@ -86,26 +90,31 @@ class StudyScreen(
         }
     }
 
-    private fun planFor(book: StudyBook): StudyMembership = when (book) {
-        // 个人生词 is a runtime set: every member already has a words row, so no snapshot lookup is needed.
-        StudyBook.PERSONAL -> StudyMembership(book, app.repository.personalMembers()) { null }
-        else -> {
-            val books = app.studyBooks.getOrThrow()
-            val dictionary = app.dictionary.getOrThrow()
-            val keys = books.orderedMembers(book) ?: error("学习词书缺少${book.label}归属")
-            StudyMembership(book, keys) { dictionary.entry(it) }
-        }
+    /**
+     * The one unified plan: personal vocabulary in recent-query order first, then the two fixed
+     * source books interleaved in their original order, deduplicated by entry key. 个人生词 is a
+     * runtime set, 考研/六级 are the pinned index; neither is turned into a separate queue here.
+     * Learned keys are filtered by the repository (due states keep priority), and personal priority
+     * never bypasses a due review. Snapshots resolve through the application's unified resolver so
+     * the card shows the latest original-or-user-supplement meaning instead of a stale word row.
+     */
+    private fun planFor(): StudyMembership {
+        val books = app.studyBooks.getOrThrow()
+        val kaoyan = books.orderedMembers(StudyBook.KAOYAN) ?: error("学习词书缺少${StudyBook.KAOYAN.label}归属")
+        val cet6 = books.orderedMembers(StudyBook.CET6) ?: error("学习词书缺少${StudyBook.CET6.label}归属")
+        val keys = UnifiedStudyPool.merged(app.repository.personalMembers(), kaoyan, cet6)
+        return StudyMembership(StudyBook.ALL, keys) { app.resolveEntry(it) }
     }
 
     private fun bind(content: LinearLayout, view: StudyView) {
         content.removeAllViews()
-        content.addView(context.text("背词复习", 26f, Paper.ink, true))
+        content.addView(context.text("背词复习 · 统一背诵", 26f, Paper.ink, true))
         content.addView(context.text("固定间隔复习，非经过验证的记忆算法；只按你的真实反馈推进。", 16f, Paper.secondary))
-        content.space(16)
-        content.addView(bookSelector(view.settings.selectedBook))
+        content.addView(context.text("统一范围：个人生词 + 考研 + 六级；同词只保留一份进度，不要求切换词书。", 16f, Paper.secondary))
         content.space(8)
         content.addView(goalRow(view.settings.dailyNewGoal))
         content.addView(context.text("范围 ${StudyRules.MIN_DAILY_NEW_GOAL}–${StudyRules.MAX_DAILY_NEW_GOAL}，默认 ${StudyRules.DEFAULT_DAILY_NEW_GOAL}。", 16f, Paper.secondary))
+        content.addView(context.text("释义来自原始词书（未逐条核对）或本机用户补充；不联网、不自动生成。", 16f, Paper.secondary))
         content.divider()
         content.addView(progressBlock(view.progress))
         content.space(16)
@@ -115,17 +124,6 @@ class StudyScreen(
             return
         }
         content.addView(cardBlock(card, view.credential))
-    }
-
-    private fun bookSelector(selected: StudyBook): LinearLayout = context.row().apply {
-        listOf(StudyBook.KAOYAN, StudyBook.CET6, StudyBook.PERSONAL).forEach { book ->
-            val button = context.button(book.label, primary = false) { selectBook(book) }
-            if (book == selected) {
-                button.background = context.shape(Paper.green, 8)
-                button.setTextColor(Color.WHITE)
-            }
-            addView(button, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = context.dp(8) })
-        }
     }
 
     private fun goalRow(goal: Int): LinearLayout = context.row().apply {
@@ -159,11 +157,11 @@ class StudyScreen(
             divider()
             addView(context.text(card.entry.meaning, 20f, Paper.ink))
             // The snapshot's own provenance is shown with the answer so a historical source/version is
-            // never implied to be the current one.
+            // never implied to be the current one. A user supplement is labelled by its source instead
+            // of being presented as original word-book content.
             val provenance = listOf(card.entry.source, card.entry.version).filter { it.isNotBlank() }
-            if (provenance.isNotEmpty()) {
-                addView(context.text("来源 ${provenance.joinToString(" · ")}", 16f, Paper.secondary))
-            }
+            addView(context.text(if (provenance.isEmpty()) "释义来源 未标注" else "释义来源 ${provenance.joinToString(" · ")}",
+                16f, Paper.secondary))
             if (card.note.isNotBlank()) {
                 space(8)
                 addView(context.text("我的笔记", 16f, Paper.secondary))
@@ -187,24 +185,7 @@ class StudyScreen(
         progress.dueNow > 0 -> "有 ${progress.dueNow} 个到期词，但暂时没有可显示的卡片。"
         progress.newRemaining > 0 -> "可以开始学习新词。"
         progress.nextDueAt != null -> "今日目标已完成，也没有到期复习；下一张 ${time(progress.nextDueAt!!)} 到期。"
-        else -> "这本词书已全部学过，且暂无到期复习。"
-    }
-
-    private fun selectBook(book: StudyBook) {
-        if (busy) return
-        busy = true
-        app.worker.execute {
-            if (context.isDestroyed) return@execute
-            val result = runCatching {
-                app.repository.updateStudySettings(book, app.repository.studySettings().dailyNewGoal, admission)
-            }
-            main.post {
-                if (context.isDestroyed) return@post
-                busy = false
-                result.onFailure { onToast("切换词书失败：${it.message}") }
-                onRerender()
-            }
-        }
+        else -> "统一范围内已全部学过，且暂无到期复习。"
     }
 
     private fun setGoal(goal: Int) {
@@ -213,7 +194,9 @@ class StudyScreen(
         app.worker.execute {
             if (context.isDestroyed) return@execute
             val result = runCatching {
-                app.repository.updateStudySettings(app.repository.studySettings().selectedBook, goal, admission)
+                // The unified scope is the only study setting the screen still exposes; the goal write
+                // keeps the current global goal semantics but always persists the unified scope.
+                app.repository.updateStudySettings(StudyBook.ALL, goal, admission)
             }
             main.post {
                 if (context.isDestroyed) return@post

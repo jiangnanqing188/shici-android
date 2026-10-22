@@ -4,7 +4,20 @@ import java.util.Locale
 
 data class DictionaryEntry(val headword: String, val partOfSpeech: String, val meaning: String,
                            val source: String = DemoDictionary.SOURCE,
-                           val version: String = DemoDictionary.VERSION) {
+                           val version: String = DemoDictionary.VERSION,
+                           /**
+                            * Display-only provenance for an entry that [PersonalDictionary.merge] built
+                            * from a real original snapshot plus the current user supplement. It points
+                            * at the untouched original entry, so the user section can be replaced or
+                            * removed without parsing marker-like text out of the original body.
+                            *
+                            * A default [null] means "this is a raw entry and every byte of its meaning
+                            * and part of speech is original data, even if it literally contains the
+                            * user-section marker". This value is never written to `words`, the study
+                            * session, the backup payload or any other persisted field; [PersonalDictionary.storedEntry]
+                            * strips it before persistence.
+                            */
+                           val originalSnapshot: DictionaryEntry? = null) {
     val key: String get() = headword
 }
 

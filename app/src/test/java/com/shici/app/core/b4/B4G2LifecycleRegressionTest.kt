@@ -11,7 +11,7 @@ class B4G2LifecycleRegressionTest {
  private class Fixture:AutoCloseable {
   val repo=LearningRepository(com.shici.app.core.b4.host.Context(),"g2-lifecycle");val ctx=Context();val app=ShiciApplication(repo);val owner=ActivityOwner(ctx,app)
   val screen=owner.screenForTest();val root=LinearLayout(ctx)
-  init {com.shici.app.core.b4.uihost.System.now=java.time.Instant.parse("2026-10-16T12:00:00Z").toEpochMilli();Handler.queue=Queue();repo.record(QueryEvent("q","alpha","alpha","alpha",1),DictionaryEntry("alpha","n","meaning","source","version"));repo.updateStudySettings(StudyBook.PERSONAL,20)}
+  init {com.shici.app.core.b4.uihost.System.now=java.time.Instant.parse("2026-10-16T12:00:00Z").toEpochMilli();Handler.queue=Queue();repo.record(QueryEvent("q","alpha","alpha","alpha",1),DictionaryEntry("alpha","n","meaning","source","version"));app.studyBooks=Result.success(com.shici.app.core.u1.U1TestAssets.books());repo.updateStudySettings(StudyBook.ALL,20)}
   fun drain(){app.worker.all();Handler.queue.all()};fun render(){screen.render(root);drain()}
   fun click(s:String){root.all().first{it.textValue==s}.click()}
   fun reveal(){click("显示答案");drain();render()}
@@ -24,7 +24,7 @@ class B4G2LifecycleRegressionTest {
   assertNull("destroyed during planFor still persisted pending card",f.repo.backupSnapshot().data.session)
  }
  @Test fun destroyDuringSettingsReadMustNotPersistQueuedGoal()=Fixture().use{f->
-  f.render();f.click("+5");f.destroyWhen{it.startsWith("SELECT selected_book")};f.drain()
+  f.render();f.click("+5");f.repo.beforeWritable={f.repo.beforeWritable=null;f.owner.onDestroy()};f.drain()
   assertTrue(f.ctx.isDestroyed);assertEquals("worker started but not admitted settings write",20,f.repo.studySettings().dailyNewGoal)
  }
  @Test fun destroyAfterCanCommitWhileAdmissionReadMustNotCommitFeedback()=Fixture().use{f->
