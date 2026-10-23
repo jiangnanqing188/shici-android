@@ -76,6 +76,10 @@ class CaptureService : Service() {
     private var recognizer: TextRecognizer? = null
     private var bubble: View? = null
     private var panel: View? = null
+    // Identity of the card that currently owns the floating panel. Every panel removal advances it,
+    // so a click queued by an already-replaced failure card can neither close a newer card nor
+    // publish a new capture request in that newer card's world.
+    private var panelOwner = 0L
     // One admission lease per open supplement editor. Detach, panel close and service stop/destroy
     // close it; a closed lease cannot be revived by reattaching the old view. The repository still
     // owns the real pre-transaction admission, so a save admitted earlier commits atomically.
@@ -277,7 +281,7 @@ class CaptureService : Service() {
             }
             // A plain null return means the source simply has no newer image and stays neutral.
             val image = try { source.acquireLatestImage() } catch (_: IllegalStateException) {
-                unusableSource("frame_acquire", "无法读取当前页面画面；本次查询已取消。")
+                unusableSource("frame_acquire", "未拿到可读取的画面：屏幕采集异常（不是 OCR 或词库问题）。本次未查询、未收录。请点「重试取词」。")
                 null
             }
             if (image != null) {
@@ -288,7 +292,7 @@ class CaptureService : Service() {
                         image.width == source.width && image.height == source.height
                     if (source === reader && !current) {
                         // Wrong geometry from the current reader cannot prove the accepted page.
-                        unusableSource("frame_geometry", "画面尺寸异常；本次查询已取消。")
+                        unusableSource("frame_geometry", "未拿到可读取的画面：画面尺寸异常（屏幕采集异常，不是 OCR 或词库问题）。本次未查询、未收录。请点「重试取词」。")
                     } else if (current && request != null && frameIsCurrent(request) &&
                         request.canInspect(image.timestamp, SystemClock.elapsedRealtime())) {
                         val purpose = framePurpose
@@ -315,8 +319,8 @@ class CaptureService : Service() {
                                 main.post {
                                     failLiveLookupIfCurrent(failedGeneration, failedEpoch,
                                         if (purpose == FramePurpose.VERIFY)
-                                            "无法读取抬笔后的页面画面；本次未查询。请返回做题后重试。"
-                                        else "无法读取当前页面画面；本次未查询。请返回做题后重试。",
+                                            "已拿到抬笔画面但无法读取页面特征（采集异常，不是 OCR 或词库问题）。本次未查询、未收录。请点「重试取词」。"
+                                        else "已拿到画面但无法读取页面特征（采集异常，不是 OCR 或词库问题）。本次未查询、未收录。请点「重试取词」。",
                                         if (purpose == FramePurpose.VERIFY) "verify_frame" else "entry_frame")
                                 }
                             }
@@ -333,6 +337,7 @@ class CaptureService : Service() {
                                 if (source === reader && frameIsCurrent(request) &&
                                     request.complete(SystemClock.elapsedRealtime()) && requestedFrame.compareAndSet(request, null)) {
                                     clearFrameTimeout()
+                                    perf.frame(if (purpose == FramePurpose.ENTRY) "entry" else "verify", black = false)
                                     when (purpose) {
                                         FramePurpose.ENTRY -> onEntryFrame(request, captured)
                                         FramePurpose.VERIFY -> onVerifyFrame(request, captured)
@@ -343,7 +348,12 @@ class CaptureService : Service() {
                                 }
                             }) bitmap = null // The main-thread callback now owns this bitmap.
                         } else if (firstBlack && request.rejectedBlack) {
-                            main.post { if (frameIsCurrent(request)) perf.stage("frame_rejected", "black") }
+                            main.post {
+                                if (frameIsCurrent(request)) {
+                                    perf.frame(if (purpose == FramePurpose.ENTRY) "entry" else "verify", black = true)
+                                    perf.stage("frame_rejected", "black")
+                                }
+                            }
                         }
                     } else if (current) {
                         // This image was not taken as the one-shot entry/lift frame. It is still
@@ -356,7 +366,7 @@ class CaptureService : Service() {
                         if (request != null && frameIsCurrent(request)) {
                             perf.end("failed", "frame_conversion")
                             dismissPanel()
-                            showMessage("取词失败：${e.message}")
+                            showMessage("取词失败：屏幕画面转换异常（采集阶段，不是 OCR 识别或词库未命中）。本次未查询、未收录。请点「重试取词」。")
                         }
                     }
                 } finally { bitmap?.recycle(); image.close() }
@@ -444,7 +454,7 @@ class CaptureService : Service() {
                 val failedEpoch = lookupEpoch
                 if (closeFailedCaptureRequest(awaiting)) {
                     main.post { failLiveLookupIfCurrent(failedGeneration, failedEpoch,
-                        "页面已变化，本次查询已取消。", "page_changed_gap") }
+                        "抬笔后页面已改变。本次未查询、未收录。请在页面稳定后点「重试取词」。", "page_changed_gap") }
                     return
                 }
                 // Main delivery won the race; record the change for the pending guard below.
@@ -693,14 +703,14 @@ class CaptureService : Service() {
             FramePurpose.ENTRY -> {
                 perf.end("failed", if (request.rejectedBlack) "frame_black_timeout" else "frame_timeout")
                 showMessage(if (request.rejectedBlack)
-                    "已丢弃主体黑帧，等待有效新画面超时。页面可能尚未就绪或禁止截图；不会复用旧截图或绕过保护。请返回做题后重试。"
-                    else "未收到新的有效屏幕画面。安全页面可能禁止截图；不会复用旧截图。请返回做题后重试。")
+                    "未拿到新画面：只收到黑帧（页面可能尚未就绪、锁屏或禁止截图）。本次未识别文字、未查询、未收录；不会复用旧截图或绕过保护。请点「重试取词」重新划词。"
+                    else "未拿到新画面：没有收到新的有效屏幕画面（安全页面可能禁止截图）。本次未识别文字、未查询、未收录；不会复用旧截图。请点「重试取词」重新划词。")
             }
             FramePurpose.VERIFY -> {
                 perf.end("failed", if (request.rejectedBlack) "verify_black_timeout" else "verify_timeout")
                 showMessage(if (request.rejectedBlack)
-                    "抬笔后只收到主体黑帧，本次未查询，也没有写入生词本。请返回做题后重试。"
-                    else "抬笔后未收到新的有效画面，本次未查询，也没有写入生词本。请返回做题后重试。")
+                    "抬笔后没有拿到新画面：只收到黑帧。本次未查询、未收录，也没有写入生词本。请点「重试取词」重新划词。"
+                    else "抬笔后没有拿到新画面：未收到新的有效画面。本次未查询、未收录，也没有写入生词本。请点「重试取词」重新划词。")
             }
         }
     }
@@ -757,12 +767,44 @@ class CaptureService : Service() {
         synchronized(pageLock) {
             dismissPanel()
             if (!sessionIsActive()) return
-            perf.click()
+            perf.click(screenWidth, screenHeight)
             deletionCredential = app.repository.deletions.capture()
             val body = frameBody()
             removeBubble()
             armFrame(FramePurpose.ENTRY, body, SystemClock.elapsedRealtime() + ENTRY_FRAME_TIMEOUT_MS)
         }
+    }
+
+    /**
+     * Explicit user request to retry from a non-committed capture/OCR failure card.
+     *
+     * [owner] is the panel identity captured when that card was mounted. A click delivered after the
+     * card was replaced, dismissed, or torn down by stop/destroy sees a newer [panelOwner] and does
+     * nothing, so it can never close or replace a later success card. The retry releases only this
+     * card's old world (live layer, pending frame, page guard, editors, panel) and then goes through
+     * the original [beginLiveSelection] path, which captures a fresh deletion credential and arms a
+     * brand-new gate token, entry frame and lookup epoch. No old bitmap, OCR result or callback is
+     * reused, no record is written here, and a stopped service or dead projection/projection source
+     * refuses instead of pretending the retry was admitted.
+     */
+    private fun retryLiveSelection(owner: Long) {
+        if (owner != panelOwner || panel == null) return
+        if (stopped || !sessionIsActive()) {
+            toast("查词服务已停止或会话已失效，无法重试取词；请重新开启全屏查词后再划词")
+            return
+        }
+        if (projection == null || reader == null) {
+            toast("屏幕捕获已失效（投影已停止或画面源不可用），无法重试取词；请重新开启全屏查词")
+            return
+        }
+        // Release the failure card's old live/frame/pageGuard/overlay and its editors before a new
+        // request is published. This advances gate/epoch and retires the old panel owner.
+        dismissPanel()
+        if (stopped || !sessionIsActive() || projection == null || reader == null) {
+            toast("屏幕捕获已失效，本次未重试取词；请重新开启全屏查词")
+            return
+        }
+        beginLiveSelection()
     }
 
     private fun onEntryFrame(request: FreshFrameRequest, bitmap: Bitmap) {
@@ -784,10 +826,11 @@ class CaptureService : Service() {
         }.getOrNull()
         if (fingerprint == null) {
             bitmap.recycle()
-            failLiveLookup("无法读取当前页面画面；本次未查询。请返回做题后重试。", "entry_frame")
+            failLiveLookup("已拿到画面但无法读取页面特征（采集异常，不是 OCR 或词库问题）。本次未查询、未收录。请点「重试取词」。", "entry_frame")
             return
         }
         bitmap.recycle() // Only the compact fingerprint survives; the clean entry bitmap is released.
+        perf.stage("frame_entry", "ok")
         val session = LiveSelectionSession(
             generation = CaptureStatus.generation,
             entryToken = request.token,
@@ -831,6 +874,7 @@ class CaptureService : Service() {
         val selection = HighlighterGeometry.selection(listOf(stroke), session.screenWidth, session.screenHeight,
             session.screenWidth, session.screenHeight, resources.displayMetrics.density)
         if (selection == null) {
+            perf.stage("selection", "empty")
             toast("未形成有效划线；没有查询，也没有新增记录")
             return
         }
@@ -860,12 +904,12 @@ class CaptureService : Service() {
         }.getOrNull()
         if (fingerprint == null) {
             bitmap.recycle()
-            failLiveLookup("无法读取抬笔后的页面画面；本次未查询。请返回做题后重试。", "verify_frame")
+            failLiveLookup("已拿到抬笔画面但无法读取页面特征（采集异常，不是 OCR 或词库问题）。本次未查询、未收录。请点「重试取词」。", "verify_frame")
             return
         }
         if (!session.entryFingerprint.matches(fingerprint)) {
             bitmap.recycle()
-            failLiveLookup("划选期间页面已变化，本次未查询。请在页面稳定后重新划选。", "page_changed")
+            failLiveLookup("抬笔后的画面与起点页面不一致（划选期间页面已改变）。本次未查询、未收录。请在页面稳定后点「重试取词」。", "page_changed")
             return
         }
         // Fresh lift frame, clean of bubble/ink/card, and materially the same page as the entry
@@ -924,7 +968,7 @@ class CaptureService : Service() {
         windows.addView(view, params)
         true
     } catch (e: Exception) {
-        failLiveLookup("无法打开透明划词层：${e.message}；本次未查询。", "live_layer")
+        failLiveLookup("无法打开透明划词层：${e.message}；本次未查询、未收录。请点「重试取词」。", "live_layer")
         false
     }
 
@@ -1019,7 +1063,15 @@ class CaptureService : Service() {
         try { windows.addView(view, params); panel = view; view.requestFocus() }
         catch (e: Exception) { fail("无法打开取词界面：${e.message}") }
     }
-    private fun removePanelView() { definitionGuard = null; missingGuard = null; panel?.let { runCatching { windows.removeViewImmediate(it) } }; panel = null }
+    private fun removePanelView() {
+        // Every removal retires the old card owner, including replacement by a newer success card,
+        // dismissal and service stop. A late retry click from the removed card is then a no-op.
+        panelOwner++
+        definitionGuard = null
+        missingGuard = null
+        panel?.let { runCatching { windows.removeViewImmediate(it) } }
+        panel = null
+    }
     private fun invalidateDefinition(guard: DefinitionGuard) {
         guard.invalid = true
         guard.status.text = "未收录：该词已删除或查询已失效"; guard.status.setTextColor(Paper.error)
@@ -1061,7 +1113,9 @@ class CaptureService : Service() {
             if (slice === bitmap) checkNotNull(bitmap.copy(Bitmap.Config.ARGB_8888, false)) else slice
         } catch (e: Exception) {
             bitmap.recycle()
-            perf.stage("ocr", "failed"); showMessage("无法准备识别画面：${e.message}"); return
+            perf.stage("ocr", "failed")
+            showMessage("无法准备识别画面（采集异常，不是 OCR 算法结果）。本次未查询、未收录。请点「重试取词」。")
+            return
         }
         bitmap.recycle() // The only retained pixels are the necessary stroke-area crop.
         val token = gate.next()
@@ -1095,7 +1149,8 @@ class CaptureService : Service() {
         } catch (e: Exception) {
             crop.recycle()
             if (sessionIsActive() && gate.accepts(token)) {
-                perf.stage("ocr", "failed"); showMessage("识别失败：${e.message}")
+                perf.stage("ocr", "failed")
+                showMessage("本地文字识别异常（OCR 未返回结果，不是词库未命中）。本次未查询、未收录。请点「重试取词」或手动纠错。")
             }
             return
         }
@@ -1123,7 +1178,7 @@ class CaptureService : Service() {
                 when {
                     selected.isEmpty() -> {
                         perf.stage("ocr_empty", "failed")
-                        showMessage("笔迹没有命中可识别文字。没有查询或新增记录；请沿字形重新划选，或手动纠错。")
+                        showMessage("没有识别到笔迹附近的文字（OCR 结果为空，不是词库未命中）。本次未查询、未收录；请沿完整单词点「重试取词」，或手动纠错。")
                     }
                     selected.size == 1 && RawKajwebDictionary.normalize(selected.first().text) != null ->
                         lookup(selected.first().text, raw, credentialOverride = credential)
@@ -1133,16 +1188,20 @@ class CaptureService : Service() {
                     }
                 }
             }
-        }.addOnFailureListener { e ->
-            if (sessionIsActive() && gate.accepts(token)) { perf.stage("ocr", "failed"); showMessage("识别失败：${e.message}") }
+        }.addOnFailureListener { _ ->
+            if (sessionIsActive() && gate.accepts(token)) {
+                perf.stage("ocr", "failed")
+                showMessage("本地文字识别异常（OCR 未返回结果，不是词库未命中）。本次未查询、未收录。请点「重试取词」或手动纠错。")
+            }
         }.addOnCompleteListener { crop.recycle() }
     }
 
     private fun showSelectedText(raw: String, words: List<String>, manual: Boolean = false) {
         gate.next()
+        perf.snapshot("multi_word")
         val content = card("选中原文")
         content.addView(text(raw, 18f)); content.space()
-        content.addView(text("译句未接入 · 请选择一个词查词；不会批量自动加入生词本。", 16f, Paper.warning)); content.space()
+        content.addView(text("识别到多个候选词，尚未查询或收录。译句未接入 · 请选择一个词查词；不会批量自动加入生词本。", 16f, Paper.warning)); content.space()
         words.filter { RawKajwebDictionary.normalize(it) != null }.distinct().forEach { word ->
             content.addView(button("查词：$word") { lookup(word, raw, manual = manual) }); content.space(8)
         }
@@ -1192,33 +1251,33 @@ class CaptureService : Service() {
                 lookup.onSuccess { read ->
                     val result = read.result
                     when (result) {
-                        LookupResult.Invalid -> { perf.stage("dictionary", "invalid"); showMessage("请输入一个有效词头，不自动拼接多个词。", raw, replaces) }
+                        LookupResult.Invalid -> { perf.stage("dictionary", "invalid"); showMessage("请输入一个有效词头，不自动拼接多个词。本次未查询、未收录。", raw, replaces) }
                         is LookupResult.Missing -> {
                             perf.stage("dictionary", "missing")
                             // The result is only valid in the world the query started in. A restore or
                             // this key's deletion must reject it instead of showing a writable card.
                             if (app.repository.deletions.isStale(result.form, credential))
-                                showMessage("查询已失效（词条已删除或数据已恢复），请重新查询。", raw, replaces)
+                                showMessage("查询已失效（词条已删除或数据已恢复），本次未查询、未收录，请重新查询。", raw, replaces)
                             else if (!read.isCurrent(app.repository.changes.version)) {
                                 // A supplement (or any committed data) changed after this read: drawing
                                 // the old result would hide the current user meaning, so no card is made.
                                 perf.stage("dictionary", "stale")
-                                showMessage("查询已失效（词条或本机补充已更新），请重新查询。", raw, replaces)
+                                showMessage("查询已失效（词条或本机补充已更新），本次未查询、未收录，请重新查询。", raw, replaces)
                             } else showMissing(result.form, raw, replaces, credential)
                         }
                         is LookupResult.Match -> {
                             val entry = result.entries.single()
                             if (app.repository.deletions.isStale(entry.key, credential))
-                                showMessage("查询已失效（词条已删除或数据已恢复），请重新查询。", raw, replaces)
+                                showMessage("查询已失效（词条已删除或数据已恢复），本次未查询、未收录，请重新查询。", raw, replaces)
                             else if (!read.isCurrent(app.repository.changes.version)) {
                                 perf.stage("dictionary", "stale")
-                                showMessage("查询已失效（词条或本机补充已更新），请重新查询。", raw, replaces)
+                                showMessage("查询已失效（词条或本机补充已更新），本次未查询、未收录，请重新查询。", raw, replaces)
                             } else showDefinition(result.form, raw, entry, read.user, replaces, credential, manual)
                         }
                     }
                 }.onFailure {
                     perf.stage("dictionary", "failed")
-                    showMessage("词库不可用：${it.message}。没有生成释义，也没有新增记录。", raw, replaces)
+                    showMessage("本地词库不可用：${it.message}。没有生成释义，本次未查询、未收录。请点「重试取词」。", raw, replaces)
                 }
             }
         }
@@ -1227,15 +1286,22 @@ class CaptureService : Service() {
         // A terminal message has no save/retry admission left; stop observing its page.
         endPageGuard()
         gate.next()
+        perf.snapshot("message")
         val content = card("取词提示")
         content.addView(text(message, 16f, Paper.warning)); content.space()
         if (raw.isNotBlank()) {
             content.addView(text("选中原文：\n$raw")); content.space()
             content.addView(button("手动纠错") { showCorrection(raw, replaces) }); content.space(8)
         }
-        content.addView(button("重新划选") { beginLiveSelection() }); content.space(8)
+        // Explicit restart entry. It is wired to the current card's owner after the panel is
+        // mounted, so a queued click from an already-replaced card cannot dismiss or replace a
+        // later card. "返回做题" remains available unchanged.
+        val retry = button("重试取词（重新划词）") {}
+        content.addView(retry); content.space(8)
         content.addView(button("返回做题") { dismissPanel(); showBubble() })
         addPanel(scroll(content))
+        val owner = panelOwner
+        retry.setOnClickListener { retryLiveSelection(owner) }
     }
 
     /**
@@ -1246,13 +1312,14 @@ class CaptureService : Service() {
     private fun showMissing(form: String, raw: String, replaces: String?, credential: Long) {
         // Display-entry check: a stale query never creates a writable floating card.
         if (app.repository.deletions.isStale(form, credential)) {
-            showMessage("查询已失效（词条已删除或数据已恢复），请重新查询。", raw, replaces)
+            showMessage("查询已失效（词条已删除或数据已恢复），本次未查询、未收录，请重新查询。", raw, replaces)
             return
         }
         endPageGuard()
         gate.next()
+        perf.snapshot("dictionary_missing")
         val content = card("未收录")
-        content.addView(text("「$form」未收录。可以只在本机新增用户词条；保存不会产生查询记录或生词。", 16f, Paper.warning))
+        content.addView(text("「$form」未命中本地词库（不是识别失败），尚未查询或收录。可以只在本机新增用户词条；保存不会产生查询记录或生词。", 16f, Paper.warning))
         if (raw.isNotBlank()) { content.addView(text("选中原文：\n$raw")); content.space() }
         val meaningView = text("", 18f)
         val supplementStatus = text("", 14f, Paper.secondary)

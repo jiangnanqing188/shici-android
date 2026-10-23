@@ -9,9 +9,15 @@ import java.util.UUID
 /** Debug-only logcat; no file, network, word, OCR text or image is emitted. */
 class DebugPerformance {
     private var operation: OperationTiming? = null
-    fun click() {
+    // Same-operation, content-free evidence. Every entry point below is a no-op in release.
+    private val diagnostics = CaptureDiagnostics()
+    fun click(width: Int = 0, height: Int = 0) {
         if (!BuildConfig.DEBUG) return
-        operation = OperationTiming(UUID.randomUUID().toString(), SystemClock::elapsedRealtime)
+        val timing = OperationTiming(UUID.randomUUID().toString(), SystemClock::elapsedRealtime)
+        operation = timing
+        // Reuse this click's non-content timing id as the diagnostics summary identity, so
+        // ShiciPerf and ShiciDiag lines for the same operation share one op id.
+        diagnostics.begin(width, height, timing.id)
         emit("click", "pending")
     }
     fun selectionReady() {
@@ -22,8 +28,32 @@ class DebugPerformance {
     fun definitionVisible() {
         operation?.releaseToDefinition()?.let { emit("definition_visible", "ok", "submit_to_definition_ms=$it") }
     }
-    fun stage(stage: String, status: String) { emit(stage, status) }
-    fun end(status: String, stage: String) { emit(stage, status); operation = null }
+    fun stage(stage: String, status: String) {
+        diagnostics.stage(stage, status)
+        emit(stage, status)
+    }
+    /** Aggregated frame counters for the current operation; no per-frame log line. */
+    fun frame(purpose: String, black: Boolean) {
+        if (!BuildConfig.DEBUG) return
+        diagnostics.frame(purpose, black)
+    }
+    /**
+     * Emits one content-free summary of the stages observed so far without ending the operation.
+     * Used when a terminal card (message / multi-word / dictionary miss) becomes visible, so the
+     * evidence is readable even if the user never dismisses that card.
+     */
+    fun snapshot(result: String) {
+        if (!BuildConfig.DEBUG) return
+        diagnostics.flush(result)
+    }
+    fun end(status: String, stage: String) {
+        if (BuildConfig.DEBUG) {
+            diagnostics.stage(stage, status)
+            diagnostics.end(status)
+        }
+        emit(stage, status)
+        operation = null
+    }
     private fun emit(stage: String, status: String, additional: String = "") {
         if (!BuildConfig.DEBUG) return
         operation?.let {

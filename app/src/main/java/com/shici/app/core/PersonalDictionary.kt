@@ -136,14 +136,19 @@ object PersonalDictionary {
         }
     }
 
-    fun label(entry: DictionaryEntry): String =
-        if (entry.source == SOURCE && entry.version == VERSION) "用户补充 · 仅本机"
-        else RawKajwebDictionary.label(entry.source, entry.version)
+    fun label(entry: DictionaryEntry): String = label(entry.source, entry.version)
 
-    fun provenance(entry: DictionaryEntry): String =
-        if (entry.source == SOURCE && entry.version == VERSION)
+    /** Explicit source/version pair, for callers that keep them separately from the merged entry. */
+    fun label(source: String, version: String): String =
+        if (source == SOURCE && version == VERSION) "用户补充 · 仅本机"
+        else RawKajwebDictionary.label(source, version)
+
+    fun provenance(entry: DictionaryEntry): String = provenance(entry.source, entry.version)
+
+    fun provenance(source: String, version: String): String =
+        if (source == SOURCE && version == VERSION)
             "来源：用户补充（仅保存在本机）\n未联网、未自动生成或核验；原始词库义项未被覆盖。"
-        else RawKajwebDictionary.provenance(entry.source, entry.version)
+        else RawKajwebDictionary.provenance(source, version)
 
     fun userOnly(entry: UserDictionaryEntry): DictionaryEntry = entry.toEntry()
 

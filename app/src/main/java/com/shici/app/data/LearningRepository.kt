@@ -10,9 +10,50 @@ import java.time.LocalDate
 import java.time.ZoneId
 import java.util.UUID
 
-/** Explicit three-state results so callers never report a stale/no-op revoke or delete as success. */
+/**
+ * Explicit three-state results so callers never report a stale/no-op revoke or delete as success.
+ * [DeleteOutcome.REJECTED] is only returned when the caller supplied an admission/`canCommit` that
+ * refused before any transaction: nothing was deleted and nothing changed.
+ */
 enum class RevokeOutcome { REVOKED, NONE, STALE }
-enum class DeleteOutcome { DELETED, NOT_FOUND, STALE }
+enum class DeleteOutcome { DELETED, NOT_FOUND, STALE, REJECTED }
+
+/** Result of preparing the exact event shown by the "仅撤销最近一次有效查询" flow. */
+enum class UndoPrepareOutcome {
+    /** A fixed event identity was read; pass [UndoPreparation.prepared] to `commitUndo`. */
+    PREPARED,
+    /** There is no active event for this word right now. */
+    NONE,
+    /** The word was deleted (or a full restore committed) after this detail's credential was taken. */
+    STALE,
+    /** The database changed while the candidate was being read; nothing may be shown, retry/reopen. */
+    CHANGED
+}
+
+/** Result of committing one exact prepared undo. [REJECTED] means an owner check refused before writing. */
+enum class ExactUndoOutcome { REVOKED, NONE, STALE, REJECTED }
+
+/**
+ * Immutable identity of the one event the confirmation dialog displayed. [revision] is the change
+ * revision observed for the stable prepare read; [deletionCredential] binds the commit to the same
+ * word generation as the detail that opened the flow.
+ */
+data class PreparedUndo(
+    val entryKey: String,
+    val eventId: String,
+    val eventTime: Long,
+    val revision: Long,
+    val deletionCredential: Long
+)
+
+/** Outcome plus the exact prepared identity (non-null if and only if the outcome is PREPARED). */
+data class UndoPreparation(val outcome: UndoPrepareOutcome, val prepared: PreparedUndo? = null) {
+    init {
+        require((outcome == UndoPrepareOutcome.PREPARED) == (prepared != null)) {
+            "PREPARED 必须携带 exact 事件，其余结果不得携带"
+        }
+    }
+}
 
 /** A full overwrite is refused when the database changed since the pre-restore snapshot was taken. */
 enum class RestoreOutcome { RESTORED, REVISION_CHANGED }
@@ -215,6 +256,70 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
         return if (revoked) RevokeOutcome.REVOKED else RevokeOutcome.NONE
     }
 
+    /**
+     * Prepares "撤销最近一次有效查询" as an exact, immutable target. The latest active event is read
+     * once under the caller's original [deletionCredential]; the deletion generation and the change
+     * revision are checked on both sides of that read, so the event the confirmation will display is
+     * known not to have moved while it was read.
+     *
+     * The result distinguishes a deleted/re-collected word ([UndoPrepareOutcome.STALE]), a word with no
+     * active event ([UndoPrepareOutcome.NONE]) and a database that changed during the read
+     * ([UndoPrepareOutcome.CHANGED]) instead of silently substituting a different latest event.
+     * This read never writes and never publishes.
+     */
+    fun prepareUndoLatest(entryKey: String, deletionCredential: Long): UndoPreparation {
+        if (deletions.isStale(entryKey, deletionCredential)) return UndoPreparation(UndoPrepareOutcome.STALE)
+        val db = readableDatabase
+        check(!db.inTransaction()) { "只能读取已提交的撤销候选" }
+        val revisionBefore = changes.version
+        val exact = db.beginTransactionNonExclusive().let {
+            try {
+                val event = latestActiveEvent(db, entryKey)
+                db.setTransactionSuccessful()
+                event
+            } finally { db.endTransaction() }
+        }
+        val revisionAfter = changes.version
+        // Checked again after the read: a deletion that committed while the rows were read must never
+        // present an event for a word that is already gone (or was re-collected under a new generation).
+        if (deletions.isStale(entryKey, deletionCredential)) return UndoPreparation(UndoPrepareOutcome.STALE)
+        if (revisionBefore != revisionAfter) return UndoPreparation(UndoPrepareOutcome.CHANGED)
+        if (exact == null) return UndoPreparation(UndoPrepareOutcome.NONE)
+        return UndoPreparation(UndoPrepareOutcome.PREPARED,
+            PreparedUndo(entryKey, exact.id, exact.time, revisionAfter, deletionCredential))
+    }
+
+    /**
+     * Commits exactly the event returned by [prepareUndoLatest]. The UPDATE is conditional on the shown
+     * id, key and time plus `revoked=0`: "latest" is never resolved again, so an event collected while
+     * the confirmation was open can never be the one this confirmation removes. An event that was
+     * already revoked (or removed) returns [ExactUndoOutcome.NONE], never a false success.
+     *
+     * [deletionCredential] is re-checked before any write. [canCommit] and [admission] are evaluated
+     * immediately before BEGIN, following the existing write semantics: once admitted, the transaction
+     * finishes atomically even if the owner is invalidated afterwards. A word that is deleted after the
+     * preparation but before this call is refused with [ExactUndoOutcome.STALE].
+     */
+    fun commitUndo(prepared: PreparedUndo, admission: StudyAdmission? = null,
+                   canCommit: () -> Boolean = { true }): ExactUndoOutcome {
+        if (deletions.isStale(prepared.entryKey, prepared.deletionCredential)) return ExactUndoOutcome.STALE
+        val db = writableDatabase
+        check(!db.inTransaction()) { "学习变更不能嵌套在未提交事务中" }
+        if (!canCommit()) return ExactUndoOutcome.REJECTED
+        // Linearized immediately before BEGIN, exactly like change()/record()/commitStudyFeedback().
+        if (!admit(admission)) return ExactUndoOutcome.REJECTED
+        var revoked = false
+        db.beginTransaction()
+        try {
+            revoked = db.update("events", ContentValues().apply { put("revoked", 1) },
+                "id=? AND entry_key=? AND time=? AND revoked=0",
+                arrayOf(prepared.eventId, prepared.entryKey, prepared.eventTime.toString())) > 0
+            db.setTransactionSuccessful()
+        } finally { db.endTransaction() }
+        if (revoked) changes.publishCommitted()
+        return if (revoked) ExactUndoOutcome.REVOKED else ExactUndoOutcome.NONE
+    }
+
     fun updateWord(key: String, mastered: Boolean, note: String,
                    deletionCredential: Long = deletions.capture()): Boolean {
         // A late detail save must never edit a word that was deleted after this detail was opened.
@@ -237,11 +342,24 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
      * NOT_FOUND means there was nothing to delete (safe no-op); DELETED means a word was actually
      * removed. Any failure rolls back fully, does not publish and does not invalidate in-flight
      * queries for this word.
+     *
+     * [admission] and [canCommit] are optional so existing callers keep the exact old two-argument
+     * behavior (`null`/`{ true }` are always admitted). When supplied, they are evaluated immediately
+     * before BEGIN, following the same semantics as every other admitted write; a refusal returns
+     * [DeleteOutcome.REJECTED] without opening a transaction. Only this key's learning rows are
+     * deleted: the independent `user_entries` row, the original dictionary asset, other words and
+     * exported PDFs are untouched, exactly as before.
      */
-    fun deleteWord(entryKey: String, deletionCredential: Long): DeleteOutcome {
+    fun deleteWord(entryKey: String, deletionCredential: Long,
+                   admission: StudyAdmission? = null,
+                   canCommit: () -> Boolean = { true }): DeleteOutcome {
         if (deletions.isStale(entryKey, deletionCredential)) return DeleteOutcome.STALE
         val db = writableDatabase
         check(!db.inTransaction()) { "学习变更不能嵌套在未提交事务中" }
+        if (!canCommit()) return DeleteOutcome.REJECTED
+        // Linearized immediately before BEGIN; an already-admitted delete may finish even if the owner
+        // is invalidated afterwards. Only a refusal made before this point cancels the transaction.
+        if (!admit(admission)) return DeleteOutcome.REJECTED
         db.beginTransaction()
         val deleted: Boolean
         try {
@@ -983,6 +1101,14 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
     private fun latestEventId(db: SQLiteDatabase, key: String): String? = db.rawQuery(
         "SELECT id FROM events WHERE entry_key=? AND revoked=0 ORDER BY time DESC, id DESC LIMIT 1", arrayOf(key)
     ).use { c -> if (c.moveToFirst()) c.getString(0) else null }
+
+    /** The exact id/time identity of the current latest active event, using the same ordering as [latestEventId]. */
+    private data class ActiveEventIdentity(val id: String, val time: Long)
+
+    private fun latestActiveEvent(db: SQLiteDatabase, key: String): ActiveEventIdentity? = db.rawQuery(
+        "SELECT id, time FROM events WHERE entry_key=? AND revoked=0 ORDER BY time DESC, id DESC LIMIT 1",
+        arrayOf(key)
+    ).use { c -> if (c.moveToFirst()) ActiveEventIdentity(c.text("id"), c.long("time")) else null }
 
     fun events(): List<QueryEvent> = buildList {
         readableDatabase.rawQuery("SELECT * FROM events", null).use { c ->

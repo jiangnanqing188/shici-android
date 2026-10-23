@@ -23,8 +23,11 @@ import com.shici.app.BuildConfig
 import com.shici.app.capture.*
 import com.shici.app.core.*
 import com.shici.app.data.DeleteOutcome
+import com.shici.app.data.ExactUndoOutcome
+import com.shici.app.data.PreparedUndo
 import com.shici.app.data.RestoreOutcome
 import com.shici.app.data.RevokeOutcome
+import com.shici.app.data.UndoPrepareOutcome
 import com.shici.app.export.PdfExporter
 import com.shici.app.export.LostPdfFileCleanup
 import java.io.ByteArrayOutputStream
@@ -54,12 +57,48 @@ class MainActivity : Activity() {
         private const val CAPTURE_PERMISSION = 11
         private const val NOTIFICATION_PERMISSION = 12
     }
+
+    /**
+     * Stable page identity. Navigation, selection, restoration and late-result delivery all compare
+     * this enum; display order is never used as the identity. [legacyTab] is only the historical
+     * instance-state index (0 home, 1 vocabulary, 2 statistics, 3 settings, 4 study), so an old
+     * "tab=3" still restores settings and can never turn into the new lookup page.
+     */
+    private enum class MainPage(val label: String, val legacyTab: Int) {
+        HOME("首页", 0),
+        LOOKUP("查词", -1),
+        VOCABULARY("生词本", 1),
+        STUDY("背词", 4),
+        STATISTICS("统计", 2),
+        PERSONAL_ENTRY("添加/补词", -1),
+        SETTINGS("设置", 3);
+
+        companion object {
+            val mainPages = listOf(HOME, LOOKUP, VOCABULARY, STUDY, STATISTICS, PERSONAL_ENTRY)
+            fun fromLegacyTab(tab: Int): MainPage = when (tab) {
+                0 -> HOME
+                1 -> VOCABULARY
+                2 -> STATISTICS
+                3 -> SETTINGS
+                4 -> STUDY
+                else -> HOME
+            }
+            fun fromStableName(name: String?): MainPage? =
+                name?.let { runCatching { valueOf(it) }.getOrNull() }
+        }
+    }
+
     private val app get() = application as ShiciApplication
     private val main = Handler(Looper.getMainLooper())
     private lateinit var root: LinearLayout
     private lateinit var body: LinearLayout
-    private lateinit var nav: LinearLayout
+    private var page = MainPage.HOME
+    // Legacy mirror only: old instrumented hosts set this field and call render(), and old saved
+    // state used it. Product navigation never derives identity from this index; [page] is authoritative.
     private var currentTab = 0
+    // The sole product navigation view. Page identity stays [page]; the component only receives
+    // stable MainPage.name ids and paints the current selection in place.
+    private lateinit var navigation: MainNavigation
     private var words = emptyList<LearnedWord>()
     // Deletion generation of the snapshot the current [words] cache was read at; details opened from
     // this cache stay bound to this data instead of capturing a newer epoch at construction time.
@@ -70,6 +109,46 @@ class MainActivity : Activity() {
     private var wordsVersion = 0L
     private var stats = LearningStats(0, 0, 0, 0, 0)
     private var search = ""
+    // Lookup page draft: the text and selection live in fields so a background snapshot refresh
+    // (which deliberately does not re-render this page) and rotation cannot destroy the user's input.
+    private var lookupQuery = ""
+    private var lookupSelectionStart = 0
+    private var lookupSelectionEnd = 0
+    private var lookupInputView: EditText? = null
+    // Personal-entry page: the page owns one editor generation at a time. A source captured from a
+    // lookup card keeps that card's original deletion credential and user-row snapshot; a direct
+    // navigation read is the only path allowed to capture a fresh credential, at the explicit action.
+    private class PersonalEntrySource(
+        val entryKey: String, val headword: String, val raw: String,
+        val original: DictionaryEntry?, var user: UserDictionaryEntry?,
+        val credential: Long, var readRevision: Long, val newHeadword: Boolean
+    )
+    private data class PersonalEntryDraft(
+        val headword: String, val pos: String, val meaning: String,
+        val baseUpdatedAt: Long, val newHeadword: Boolean
+    )
+    private class PersonalDraftConfirm(val source: PersonalEntrySource, val draft: PersonalEntryDraft)
+    private var personalSource: PersonalEntrySource? = null
+    private var personalDraft: PersonalEntryDraft? = null
+    private var personalEditorDraft: PersonalEntryDraft? = null
+    private var personalRestoredDraft: PersonalEntryDraft? = null
+    private var personalDraftConfirm: PersonalDraftConfirm? = null
+    private var personalHeadword = ""
+    private var personalStatusText = ""
+    private var personalStatusView: TextView? = null
+    private var personalOwner = SupplementEditorOwner()
+    private var personalSession = Any()
+    private var personalNeedsResume = false
+    private val personalGate = QueryGate()
+    private val personalOpenGate = QueryGate()
+    // One explicit card-to-page hand-off. [invalid] is set by the source card's dismiss, by page
+    // navigation and by onStop/onDestroy; the worker and the delivery callback both require the same
+    // live instance, so a late read can never open a new writable page from a retired card.
+    private class PersonalHandoff(val cardToken: Any, private val cardLive: () -> Boolean) {
+        @Volatile var invalid = false
+        fun cardStillLive() = cardLive()
+    }
+    @Volatile private var pendingPersonalHandoff: PersonalHandoff? = null
     private var selectedKey: String? = null
     private var consentGeneration = -1L
     private val refreshGate = LearningRefreshGate()
@@ -162,9 +241,36 @@ class MainActivity : Activity() {
     private var dictionarySummary = "词库尚未校验；正在后台加载"
     private var dictionaryStatusView: TextView? = null
     private var activeDialog: AlertDialog? = null
+    // One scoped-delete flow at a time. Every dialog keeps its own identity: a late dismiss can
+    // settle only the flow it belongs to, and the admission is invalidated by page navigation,
+    // onStop and onDestroy before any transaction that has not been admitted yet.
+    private class DeleteFlow(
+        val key: String,
+        val binding: WordDetailBinding,
+        private val ownerAlive: () -> Boolean
+    ) {
+        @Volatile var closed = false
+        val admission = StudyAdmission { !closed && ownerAlive() }
+        var currentDialog: AlertDialog? = null
+        /**
+         * The scope chooser must be consumed exactly once per flow. A replayed item callback is the
+         * same explicit choice, so it must not prepare again, mount a second confirmation or switch
+         * to the other scope; a genuinely new flow gets a fresh instance of this marker.
+         */
+        @Volatile var scopeConsumed = false
+        /**
+         * The write confirmation must be consumed exactly once per flow. A replayed positive
+         * callback is the same confirmation, so it must not queue a second commit, settle the first
+         * already-queued operation or touch a replacement flow.
+         */
+        @Volatile var commitConsumed = false
+        /** True only while this flow was never retired and its page/owner still exists. */
+        fun isLive() = !closed && ownerAlive()
+    }
+    @Volatile private var deleteFlow: DeleteFlow? = null
     private var stopCaptureButton: Button? = null
     private val wide get() = resources.configuration.screenWidthDp >= 840
-    private val contentWidthDp get() = resources.configuration.screenWidthDp - (if (wide) 188 + 64 else 40)
+    private val contentWidthDp get() = resources.configuration.screenWidthDp - (if (wide) 216 + 64 else 40)
     private val splitContent get() = contentWidthDp >= 840 && resources.configuration.fontScale <= 1.3f
     private fun inlineAt(widthDp: Int) = widthDp >= 440 * resources.configuration.fontScale
     private val statusListener: (CaptureState) -> Unit = { state ->
@@ -189,8 +295,35 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        currentTab = savedInstanceState?.getInt("tab") ?: 0
+        // New stable key first; the historical "tab" indices remain readable, with tab=3 -> settings.
+        page = MainPage.fromStableName(savedInstanceState?.getString("page"))
+            ?: savedInstanceState?.let { if (it.containsKey("tab")) MainPage.fromLegacyTab(it.getInt("tab")) else null }
+            ?: MainPage.HOME
+        currentTab = page.legacyTab
         search = savedInstanceState?.getString("search") ?: ""
+        lookupQuery = savedInstanceState?.getString("lookup_query") ?: ""
+        lookupSelectionStart = savedInstanceState?.getInt("lookup_sel_start", lookupQuery.length) ?: lookupQuery.length
+        lookupSelectionEnd = savedInstanceState?.getInt("lookup_sel_end", lookupSelectionStart) ?: lookupSelectionStart
+        personalHeadword = savedInstanceState?.getString("pe_headword") ?: ""
+        if (page == MainPage.PERSONAL_ENTRY) {
+            val hasDraft = savedInstanceState?.getBoolean("pe_has_draft", false) == true
+            if (hasDraft) {
+                val draft = PersonalEntryDraft(
+                    savedInstanceState.getString("pe_draft_headword") ?: personalHeadword,
+                    savedInstanceState.getString("pe_draft_pos") ?: "",
+                    savedInstanceState.getString("pe_draft_meaning") ?: "",
+                    savedInstanceState.getLong("pe_draft_base", 0L),
+                    savedInstanceState.getBoolean("pe_draft_new", false)
+                )
+                personalHeadword = draft.headword
+                // A restored draft is never an automatic write identity: the old editor/lease is
+                // gone, so the page asks for a fresh user-triggered read before any editing.
+                personalRestoredDraft = draft
+                personalStatusText = "页面已重建。已保留草稿文字，但不会沿用离开前的写入身份；请重新读取当前词义后再确认。"
+            } else if (personalHeadword.isNotBlank()) {
+                personalStatusText = "页面已重建。请重新读取当前词义后再继续；离开前的编辑身份已失效。"
+            }
+        }
         consentGeneration = savedInstanceState?.getLong("consent", -1L) ?: -1L
         lostExportRequestCode = savedInstanceState?.getInt("export_request", -1) ?: -1
         if (lostExportRequestCode >= 0) LearningExportSession.reserveRequestCode(lostExportRequestCode)
@@ -204,14 +337,29 @@ class MainActivity : Activity() {
         refreshGate.start()
         CaptureStatus.observe(statusListener)
         app.repository.changes.observe(dataListener)
+        // A stopped personal-entry page kept its draft text but lost its editor lease. Re-render the
+        // page in the explicit re-read state instead of leaving a disabled, closed editor on screen.
+        if (page == MainPage.PERSONAL_ENTRY && personalNeedsResume) {
+            personalNeedsResume = false
+            personalStatusText = if (personalRestoredDraft != null)
+                "已保留草稿文字；离开时的编辑身份已关闭。请重新读取当前词义并再次确认。"
+            else "离开时的编辑身份已关闭。请重新读取当前词义后再继续。"
+            render()
+        }
         refresh()
         loadDictionaryStatus()
     }
     override fun onStop() {
         manualGate.next()
+        // A scoped delete or card-to-page hand-off that has not reached its transaction yet must not
+        // pop a writable surface after this Activity is no longer in front.
+        closeDeleteFlow()
+        personalOpenGate.next()
+        cancelPendingPersonalHandoff()
         // The supplement editor belongs to this stopped page: refuse every queued save that has not
         // reached its transaction yet. A save admitted before this point keeps its atomic commit.
         closeSupplementEditors()
+        closePersonalEntryOwner(keepDraft = true)
         app.repository.changes.remove(dataListener)
         refreshGate.stop()
         if (exportSession.cancelPreparation()) { exportDialog?.dismiss(); updateExportButton() }
@@ -227,8 +375,12 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         refreshGate.stop(); exportSession.clear(); manualGate.next()
         backupExportSession.clear(); restoreSession.clear()
+        personalGate.next(); personalOpenGate.next()
+        closeDeleteFlow()
+        cancelPendingPersonalHandoff()
         // Close an already-queued supplement save even if this page never received onStop.
         closeSupplementEditors()
+        closePersonalEntryOwner(keepDraft = false)
         // Invalidate the study surface's cross-thread admission before the Activity is gone. Workers
         // that already reached their transaction may finish atomically; ones still reading refuse it.
         if (studyScreenDelegate.isInitialized()) studyScreen.onDestroy()
@@ -236,8 +388,35 @@ class MainActivity : Activity() {
         activeDialog?.dismiss(); activeDialog = null
         super.onDestroy()
     }
-    override fun onSaveInstanceState(outState: Bundle) {
-        outState.putInt("tab", currentTab); outState.putString("search", search)
+    @Deprecated("Legacy Activity back handling is retained; no AndroidX dependency is added")
+    override fun onBackPressed() {
+        // Back from any functional page returns home and closes that page's editor generation;
+        // pressing back on home keeps the platform exit behavior.
+        if (page != MainPage.HOME) {
+            selectPage(MainPage.HOME)
+            return
+        }
+        @Suppress("DEPRECATION")
+        super.onBackPressed()
+    }
+    override fun onSaveInstanceState(outState: Bundle) {        captureLookupDraft()
+        outState.putString("page", page.name)
+        // Historical state writer retained for old readers: only the five original indices exist.
+        outState.putInt("tab", page.legacyTab)
+        outState.putString("search", search)
+        outState.putString("lookup_query", lookupQuery)
+        outState.putInt("lookup_sel_start", lookupSelectionStart)
+        outState.putInt("lookup_sel_end", lookupSelectionEnd)
+        outState.putString("pe_headword", personalHeadword)
+        val draft = personalDraft ?: personalRestoredDraft ?: personalDraftConfirm?.draft
+        if (page == MainPage.PERSONAL_ENTRY && draft != null) {
+            outState.putBoolean("pe_has_draft", true)
+            outState.putString("pe_draft_headword", draft.headword)
+            outState.putString("pe_draft_pos", draft.pos)
+            outState.putString("pe_draft_meaning", draft.meaning)
+            outState.putLong("pe_draft_base", draft.baseUpdatedAt)
+            outState.putBoolean("pe_draft_new", draft.newHeadword)
+        }
         outState.putLong("consent", consentGeneration)
         outState.putInt("export_request", exportSession.fileRequestCode ?: lostExportRequestCode)
         val pendingBackupRequests = ArrayList<Int>()
@@ -264,25 +443,55 @@ class MainActivity : Activity() {
             insets
         }
         body = column().apply { setPadding(dp(if (wide) 32 else 20), dp(24), dp(if (wide) 32 else 20), dp(12)) }
-        nav = if (wide) column() else row()
-        nav.setPadding(dp(12), dp(12), dp(12), dp(12))
+        // One navigation component owns both layouts. Its ids are the stable MainPage names, so a
+        // restored/legacy selection never depends on display order or a child index.
+        navigation = MainNavigation(
+            context = this,
+            wide = wide,
+            items = MainPage.mainPages.map { MainNavigation.Item(it.name, it.label) },
+            settings = MainNavigation.Item(MainPage.SETTINGS.name, MainPage.SETTINGS.label),
+            selectedId = page.name,
+            onSelect = { id -> MainPage.fromStableName(id)?.let { selectPage(it) } }
+        )
         if (wide) {
-            nav.addView(text("拾词", 32f, Paper.green, true)); nav.addView(text("专注阅读\n随手拾词", 16f, Paper.secondary)); nav.space(40)
-            root.addView(ScrollView(this).apply { addView(nav) }, LinearLayout.LayoutParams(dp(188), -1))
+            root.addView(navigation.view, LinearLayout.LayoutParams(dp(216), -1))
             root.addView(body, LinearLayout.LayoutParams(0, -1, 1f))
         } else {
             root.addView(body, LinearLayout.LayoutParams(-1, 0, 1f))
-            root.addView(nav, LinearLayout.LayoutParams(-1, -2))
-        }
-        listOf("首页", "生词本", "统计", "设置", "背词").forEachIndexed { index, label ->
-            nav.addView(button(label) { currentTab = index; render() },
-                if (wide) LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) }
-                else LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(4) })
+            root.addView(navigation.view, LinearLayout.LayoutParams(-1, -2))
         }
         setContentView(root)
         root.requestApplyInsets()
         render()
     }
+
+    // Navigation rendering is a single delegation: MainNavigation restyles its own buttons in place
+    // by stable id, so no page is rediscovered by position and no scroll region is rebuilt.
+    private fun renderNavState() {
+        navigation.setSelected(page.name)
+    }
+
+    private fun selectPage(target: MainPage) {
+        if (target == page) { renderNavState(); return }
+        // Leaving the current page retires any uncommitted scoped delete or card hand-off. This is
+        // an explicit navigation event, so it may close those surfaces; later deliveries compare
+        // their own owner and stay no-ops.
+        closeDeleteFlow()
+        cancelPendingPersonalHandoff()
+        captureLookupDraft()
+        // Leaving the lookup page retires any in-flight manual query so a late result cannot open a
+        // writable card over another page.
+        if (page == MainPage.LOOKUP) manualGate.next()
+        // Changing page closes the personal-entry generation. A return starts from an explicit read;
+        // no closed owner, credential or late read is reused.
+        if (page == MainPage.PERSONAL_ENTRY) leavePersonalEntry()
+        personalOpenGate.next()
+        page = target
+        currentTab = target.legacyTab
+        if (target == MainPage.PERSONAL_ENTRY) startPersonalEntryFresh()
+        render()
+    }
+
 
     private fun refresh(version: Long = app.repository.changes.version, force: Boolean = false) {
         val request = refreshGate.request(version, force) ?: return
@@ -297,9 +506,11 @@ class MainActivity : Activity() {
                     words = snapshot.words; stats = snapshot.stats
                     wordsCredential = snapshot.deletionCredential; wordsVersion = snapshot.version
                     dialogDetail?.update(words.firstOrNull { it.entry.key == dialogDetail?.key })
-                    when (currentTab) {
-                        1 -> { renderWords(preserveDetail = true); updateExportButton() }
-                        3 -> Unit // Keep an in-progress manual/correction input intact.
+                    when (page) {
+                        MainPage.VOCABULARY -> { renderWords(preserveDetail = true); updateExportButton() }
+                        // Never rebuild a page that holds live input / an editor owner on an ordinary
+                        // background refresh. Leaving the page is the only path that invalidates them.
+                        MainPage.LOOKUP, MainPage.PERSONAL_ENTRY, MainPage.SETTINGS -> Unit
                         else -> render()
                     }
                 }.onFailure { toast("读取失败：${it.message}") }
@@ -324,18 +535,27 @@ class MainActivity : Activity() {
         .also { dictionaryStatusView = it }
 
     private fun render() {
+        // Compatibility bridge for the historical reflection host and any old caller that still
+        // writes the five legacy indices. Product navigation always keeps [currentTab] equal to
+        // [page]'s legacy mirror, so this cannot override an enum-selected page (LOOKUP and
+        // PERSONAL_ENTRY use -1). It is not the page identity.
+        if (currentTab != page.legacyTab && currentTab in 0..4) page = MainPage.fromLegacyTab(currentTab)
+        if (currentTab != page.legacyTab) currentTab = page.legacyTab
         floatingSwitch = null; floatingText = null; stopCaptureButton = null; searchList = null; detailPanel = null
         exportButton = null; inlineDetail = null; dictionaryStatusView = null
         backupExportButton = null; restoreButton = null; backupStatusView = null
+        lookupInputView = null; personalStatusView = null
         body.removeAllViews()
-        val navOffset = if (wide) 3 else 0
-        repeat(5) { index ->
-            val button = nav.getChildAt(index + navOffset) as Button
-            button.background = shape(if (index == currentTab) Paper.lightGreen else Paper.background, 8)
-            button.setTypeface(button.typeface, if (index == currentTab) Typeface.BOLD else Typeface.NORMAL)
-            button.isSelected = index == currentTab
+        renderNavState()
+        when (page) {
+            MainPage.HOME -> home()
+            MainPage.LOOKUP -> lookupPage()
+            MainPage.VOCABULARY -> vocabulary()
+            MainPage.STUDY -> study()
+            MainPage.STATISTICS -> statistics()
+            MainPage.PERSONAL_ENTRY -> personalEntryPage()
+            MainPage.SETTINGS -> settings()
         }
-        when (currentTab) { 0 -> home(); 1 -> vocabulary(); 2 -> statistics(); 3 -> settings(); 4 -> study() }
     }
     private fun scrolled(): LinearLayout {
         val content = column()
@@ -365,32 +585,29 @@ class MainActivity : Activity() {
         floatingText = text(CaptureStatus.state.message, 16f, Paper.secondary)
         session.addView(floatingText)
         session.addView(text("开启后，点悬浮「词」，直接在题目页面上划一笔查词", 16f, Paper.secondary))
-        session.divider()
-        val numbers = row()
-        addMetric(numbers, "今日查询", stats.todayQueries); addMetric(numbers, "今日新增", stats.todayNew)
-        session.addView(numbers)
+        session.addView(text("不需要悬浮权限时，也可以到「查词」页手动输入。", 16f, Paper.secondary))
         content.addView(session); content.space(24)
-        content.addView(text("最近查到的单词", 22f, bold = true)); content.space(8)
-        if (words.isEmpty()) {
-            val empty = panel()
-            empty.addView(text("查到的第一个单词，会留在这里", 18f))
-            empty.addView(text("开启悬浮查词，或在设置中手动输入单词。", 16f, Paper.secondary))
-            content.addView(empty)
-        } else words.take(5).forEach { word -> content.addView(wordRow(word) { showWordDialog(word) }); content.divider() }
-        content.space(24)
-        val demo = column().apply {
-            setPadding(dp(20), dp(16), dp(20), dp(16)); background = shape(Paper.lightGreen)
-            addView(text("原始离线词库 · 未逐条核对", 18f, Paper.green, true))
-            addView(dictionaryStatus())
-            addView(text(RawKajwebDictionary.provenance(RawKajwebDictionary.SOURCE, RawKajwebDictionary.VERSION), 16f, Paper.secondary))
-        }
-        content.addView(demo); content.space()
+        content.addView(text("主要功能", 22f, bold = true)); content.space(8)
+        content.addView(entryCard("查词", "日常输入查询；缺词可新增词义，已有词可补充个人释义。") { selectPage(MainPage.LOOKUP) })
+        content.space(8)
+        content.addView(entryCard("添加/补词", "只维护本机个人词性/释义，不产生查询次数、生词或复习记录。") { selectPage(MainPage.PERSONAL_ENTRY) })
+        content.space(8)
+        content.addView(entryCard("生词本", "查看和管理已经真实查询收录的个人生词。") { selectPage(MainPage.VOCABULARY) })
+        content.space(8)
+        content.addView(entryCard("背词", "继续原来的统一学习队列与复习反馈。") { selectPage(MainPage.STUDY) })
+        content.space(8)
+        content.addView(entryCard("统计", "查看真实查询与复习进度聚合。") { selectPage(MainPage.STATISTICS) })
+        content.space()
         content.addView(text("打开悬浮查词 → 点「词」→ 划过文字 → 抬笔即查", 16f, Paper.secondary))
         statusListener(CaptureStatus.state)
     }
-    private fun addMetric(row: LinearLayout, label: String, value: Int) {
-        val content = column().apply { addView(text(label, 16f, Paper.secondary)); addView(text(value.toString(), 30f, bold = true)) }
-        row.addView(content, LinearLayout.LayoutParams(0, -2, 1f))
+    private fun entryCard(title: String, description: String, action: () -> Unit): View = column().apply {
+        setPadding(dp(20), dp(14), dp(20), dp(14)); background = shape(Paper.surface, border = true)
+        addView(text(title, 20f, bold = true))
+        addView(text(description, 15f, Paper.secondary))
+        isClickable = true; isFocusable = true; minimumHeight = dp(64)
+        contentDescription = "打开$title"
+        setOnClickListener { action() }
     }
 
     private fun vocabulary() {
@@ -448,6 +665,7 @@ class MainActivity : Activity() {
                 inlineDetail?.update(words.firstOrNull { it.entry.key == inlineDetail?.key })
                 return@let
             }
+            inlineDetail?.let { closeDeleteFlowFor(it) }
             inlineDetail = null
             detail.removeAllViews()
             val selected = list.firstOrNull { it.entry.key == selectedKey } ?: list.firstOrNull()
@@ -459,6 +677,431 @@ class MainActivity : Activity() {
             }
         }
     }
+    /**
+     * Daily lookup lives on its own page. The input only ever feeds the existing [manualLookup]
+     * pipeline (same resolver, gates, revision checks and query-record rules); no query SQL or fake
+     * record is introduced here. Results still open the existing card, which now also offers the
+     * explicit "在补词页编辑/新增" hand-off without removing the in-place supplement editor.
+     */
+    private fun lookupPage() {
+        // View-only component. Its callbacks feed the existing fields/pipeline below; it never
+        // resolves a word, records an event or opens a second gate.
+        val screen = LookupScreen(
+            context = this,
+            initialText = lookupQuery,
+            selectionStart = lookupSelectionStart,
+            selectionEnd = lookupSelectionEnd,
+            onTextChanged = { text -> lookupQuery = text },
+            onQuery = { text ->
+                // Keep the original draft/revision/credential chain: capture the caret first, then
+                // run the same manualLookup that button/IME submissions always used.
+                lookupQuery = text
+                captureLookupDraft()
+                manualLookup(text)
+            },
+            onOpenPersonalEntry = { selectPage(MainPage.PERSONAL_ENTRY) }
+        )
+        // onSaveInstanceState, page switches and rotation capture the draft through this field.
+        lookupInputView = screen.input
+        body.addView(screen.view, LinearLayout.LayoutParams(-1, -1))
+    }
+
+    /** Saves the current lookup text and caret so a page switch or rotation never drops either. */
+    private fun captureLookupDraft() {
+        val view = lookupInputView ?: return
+        lookupQuery = view.text.toString()
+        val start = view.selectionStart.coerceAtLeast(0)
+        val end = view.selectionEnd.coerceAtLeast(0)
+        lookupSelectionStart = minOf(start, end).coerceIn(0, lookupQuery.length)
+        lookupSelectionEnd = maxOf(start, end).coerceIn(lookupSelectionStart, lookupQuery.length)
+    }
+
+    // ---- Personal-entry page --------------------------------------------------------------------
+
+    private fun startPersonalEntryFresh() {
+        closePersonalEntryOwner(keepDraft = false)
+        personalNeedsResume = false
+        personalStatusText = ""
+    }
+
+    private fun leavePersonalEntry() {
+        closePersonalEntryOwner(keepDraft = false)
+        personalNeedsResume = false
+        personalStatusText = ""
+    }
+
+    /**
+     * Ends the page's editor generation. [keepDraft] is used by onStop: the text is retained for an
+     * explicit re-read prompt, but the owner, leases, credential and in-flight page gate are dropped.
+     */
+    private fun closePersonalEntryOwner(keepDraft: Boolean) {
+        personalGate.next()
+        closeSupplementEditorOwner(personalOwner)
+        personalOwner = SupplementEditorOwner()
+        personalSession = Any()
+        val confirmingDraft = personalDraftConfirm?.draft
+        personalEditorDraft = null
+        personalDraftConfirm = null
+        if (!keepDraft) {
+            personalSource = null
+            personalDraft = null
+            personalRestoredDraft = null
+            personalHeadword = ""
+            personalStatusText = ""
+        } else if (page == MainPage.PERSONAL_ENTRY) {
+            personalNeedsResume = personalSource != null || personalDraft != null ||
+                personalRestoredDraft != null || confirmingDraft != null || personalHeadword.isNotBlank()
+            if (personalDraft != null) personalRestoredDraft = personalDraft
+            else if (confirmingDraft != null) personalRestoredDraft = confirmingDraft
+            personalSource = null
+            personalDraft = null
+        }
+    }
+
+    private fun cancelPersonalEntry() {
+        closePersonalEntryOwner(keepDraft = false)
+        personalNeedsResume = false
+        personalStatusText = "已取消本次补词，未保存任何内容"
+        render()
+    }
+
+    private fun personalEntryPage() {
+        // The component owns only the page skeleton/input/status/editor host. Every credential,
+        // revision, owner, lease, draft and save decision stays in this Activity.
+        val screen = PersonalEntryScreen(
+            context = this,
+            initialHeadword = personalHeadword,
+            statusText = personalStatusText,
+            canCancel = personalSource != null || personalDraft != null ||
+                personalRestoredDraft != null || personalDraftConfirm != null,
+            onHeadwordChanged = { text -> personalHeadword = text },
+            onRead = { raw -> readPersonalHeadword(raw) },
+            onCancel = { cancelPersonalEntry() }
+        )
+        // Assigned before any callback can run, so read/save/conflict status paints this page.
+        personalStatusView = screen.statusView
+        body.addView(screen.view, LinearLayout.LayoutParams(-1, -1))
+        val host = screen.editorHost
+        // Original priority and early-return order: confirmation, restored draft, then source card.
+        personalDraftConfirm?.let { confirm -> personalDraftConfirmCard(host, confirm); return }
+        personalRestoredDraft?.let { draft -> personalRestoredDraftCard(host, draft); return }
+        personalSource?.let { source -> personalSourceCard(host, source) }
+    }
+
+    private fun personalRestoredDraftCard(host: LinearLayout, draft: PersonalEntryDraft) {
+        val card = panel().apply {
+            addView(text("已恢复未保存草稿", 20f, bold = true))
+            addView(text("草稿词性：${draft.pos.ifBlank { "（空）" }}", 16f))
+            addView(text("草稿释义：${draft.meaning.ifBlank { "（空）" }}", 16f))
+            addView(text("本页不会沿用离开前的写入身份，也不会静默覆盖当前词义。请重新读取当前词义并确认后再编辑。", 15f, Paper.warning))
+        }
+        card.addView(button("重新读取当前词义并继续", true) {
+            readPersonalHeadword(draft.headword, draft)
+        })
+        card.addView(button("放弃草稿") {
+            personalRestoredDraft = null
+            personalDraft = null
+            personalStatusText = "已放弃草稿，未保存任何内容"
+            render()
+        })
+        host.addView(card)
+    }
+
+    private fun personalDraftConfirmCard(host: LinearLayout, confirm: PersonalDraftConfirm) {
+        val card = panel().apply {
+            addView(text("草稿需要再次确认", 20f, bold = true))
+            addView(text("草稿词性：${confirm.draft.pos.ifBlank { "（空）" }}", 16f))
+            addView(text("草稿释义：${confirm.draft.meaning.ifBlank { "（空）" }}", 16f))
+            addView(text("该词的本机词义在本页离开后已经更新。草稿不会自动覆盖新内容；若仍打开草稿，保存时会按离开时的词义版本校验，冲突会拒绝写入。", 15f, Paper.warning))
+        }
+        card.addView(button("查看当前词义并编辑", true) {
+            personalSource = confirm.source
+            personalDraftConfirm = null
+            personalRestoredDraft = null
+            personalEditorDraft = null
+            personalDraft = null
+            personalStatusText = "已载入当前词义；保存只写本机个人词义。"
+            render()
+        })
+        card.addView(button("仍打开草稿（保存时校验冲突）") {
+            personalSource = confirm.source
+            personalEditorDraft = confirm.draft
+            personalDraft = confirm.draft
+            personalDraftConfirm = null
+            personalRestoredDraft = null
+            personalStatusText = "已打开草稿；保存时会校验离开时的词义版本，不会静默覆盖。"
+            render()
+        })
+        card.addView(button("放弃草稿") {
+            personalSource = null
+            personalDraftConfirm = null
+            personalRestoredDraft = null
+            personalDraft = null
+            personalStatusText = "已放弃草稿，未保存任何内容"
+            render()
+        })
+        host.addView(card)
+    }
+
+    private fun personalSourceCard(host: LinearLayout, source: PersonalEntrySource) {
+        val card = panel()
+        card.addView(text(source.headword, 28f, bold = true).apply { typeface = Typeface.create("serif", Typeface.BOLD) })
+        val original = source.original
+        if (original != null) {
+            card.addView(text("原词库释义（只读）", 16f, bold = true))
+            card.addView(text("${original.partOfSpeech} ${original.meaning}".trim(), 16f))
+            card.addView(text(PersonalDictionary.provenance(original), 13f, Paper.warning))
+        } else {
+            card.addView(text("原始词库未收录这个词；保存只在本机新增用户词条。", 15f, Paper.warning))
+        }
+        card.addView(text("当前本机用户释义", 17f, bold = true))
+        val userView = text(if (source.user == null) "本机暂无用户补充" else
+            "${source.user?.partOfSpeech.orEmpty()} ${source.user?.meaning.orEmpty()}".trim(), 16f)
+        card.addView(userView)
+        card.addView(text("用户补充 · 仅本机", 13f, Paper.secondary))
+        card.space(8)
+        val editorHost = column()
+        card.addView(editorHost)
+        host.addView(card)
+        val initialDraft = personalEditorDraft
+        personalEditorDraft = null
+        val base = initialDraft?.baseUpdatedAt ?: (source.user?.updatedAt ?: 0L)
+        val initialPos = initialDraft?.pos ?: (source.user?.partOfSpeech ?: "")
+        val initialMeaning = initialDraft?.meaning ?: (source.user?.meaning ?: "")
+        if (initialDraft != null || initialPos.isNotBlank() || initialMeaning.isNotBlank()) {
+            personalDraft = PersonalEntryDraft(source.headword, initialPos, initialMeaning, base, source.newHeadword)
+        }
+        addSupplementEditor(editorHost, personalOwner, source.entryKey, source.headword,
+            original = source.original, currentUser = source.user, credential = source.credential,
+            onSaved = { saved, _ ->
+                source.user = saved
+                source.readRevision = app.repository.changes.version
+                personalDraft = null
+                userView.text = "${saved.partOfSpeech} ${saved.meaning}".trim()
+                personalStatusText = "已保存到本机用户词库；本次保存不产生查询次数、生词或复习反馈。"
+                personalStatusView?.text = personalStatusText
+                personalStatusView?.setTextColor(Paper.green)
+            },
+            newHeadword = source.newHeadword,
+            showOriginal = false,
+            initialPos = initialPos,
+            initialMeaning = initialMeaning,
+            expectedUpdatedAtOverride = initialDraft?.baseUpdatedAt,
+            onDraftChanged = { pos, meaning ->
+                personalDraft = PersonalEntryDraft(source.headword, pos, meaning, base, source.newHeadword)
+            })
+    }
+
+    /**
+     * A direct navigation read is the only path allowed to capture a new deletion credential, and
+     * only at this explicit user action. Delivery is bound to the page, its session, and a gate; the
+     * before/after revision pair rejects mixed or stale reads instead of showing old meaning.
+     */
+    private fun readPersonalHeadword(raw: String, forDraft: PersonalEntryDraft? = null) {
+        if (page != MainPage.PERSONAL_ENTRY) return
+        val text = raw.trim()
+        if (text.isEmpty()) {
+            personalStatusView?.text = "请输入一个英文词头"
+            personalStatusView?.setTextColor(Paper.error)
+            return
+        }
+        personalHeadword = raw
+        if (forDraft == null) {
+            // A new explicit headword read ends any previous page editor before it starts. Its lease
+            // is closed, so nothing from the old source can be admitted after this point.
+            closeSupplementEditorOwner(personalOwner)
+            personalOwner = SupplementEditorOwner()
+            personalSource = null
+            personalDraft = null
+            personalDraftConfirm = null
+            personalRestoredDraft = null
+        }
+        val token = personalGate.next()
+        val session = personalSession
+        val credential = app.repository.deletions.capture()
+        personalStatusView?.text = "正在读取当前词义…"
+        personalStatusView?.setTextColor(Paper.secondary)
+        app.worker.execute {
+            if (!personalGate.accepts(token)) return@execute
+            val read = runCatching {
+                val before = app.repository.changes.version
+                val result = app.lookupWord(text)
+                val user = (result as? LookupResult.Match)?.let { app.repository.userEntry(it.form) }
+                val after = app.repository.changes.version
+                LookupRead(result, user, after, before == after)
+            }
+            main.post {
+                if (isDestroyed || page != MainPage.PERSONAL_ENTRY || personalSession !== session ||
+                    !personalGate.accepts(token)) return@post
+                read.onSuccess { lookup ->
+                    if (!lookup.stable || lookup.revision != app.repository.changes.version) {
+                        personalStatusText = "读取期间词义或本机补充已更新。为避免显示旧内容，本次结果已丢弃；请重新读取。"
+                        render()
+                        return@onSuccess
+                    }
+                    when (val result = lookup.result) {
+                        LookupResult.Invalid -> {
+                            personalStatusText = "请输入一个有效英文词头"
+                            render()
+                        }
+                        is LookupResult.Missing -> {
+                            if (app.repository.deletions.isStale(result.form, credential)) {
+                                personalStatusText = "读取已失效（词条已删除或数据已恢复），请重新读取"
+                                render()
+                            } else if (PersonalDictionary.normalizeNewKey(result.form) != result.form) {
+                                personalStatusText = "该结果不是单个规范英文词头（可能是短语或多词），不能作为新词头；请修改为一个英文单词。"
+                                render()
+                            } else {
+                                applyPersonalRead(PersonalEntrySource(result.form, result.form, text, null,
+                                    lookup.user, credential, lookup.revision, newHeadword = true), forDraft)
+                            }
+                        }
+                        is LookupResult.Match -> {
+                            val entry = result.entries.single()
+                            if (app.repository.deletions.isStale(entry.key, credential)) {
+                                personalStatusText = "读取已失效（词条已删除或数据已恢复），请重新读取"
+                                render()
+                            } else {
+                                val original = if (entry.source == PersonalDictionary.SOURCE) null
+                                else PersonalDictionary.storedEntry(entry)
+                                applyPersonalRead(PersonalEntrySource(entry.key, entry.headword, text,
+                                    original, lookup.user, credential, lookup.revision, newHeadword = false), forDraft)
+                            }
+                        }
+                    }
+                }.onFailure {
+                    personalStatusText = "词库不可用：${it.message}；未生成释义或新增记录"
+                    render()
+                }
+            }
+        }
+    }
+
+    private fun applyPersonalRead(source: PersonalEntrySource, forDraft: PersonalEntryDraft?) {
+        if (forDraft != null) {
+            val currentBase = source.user?.updatedAt ?: 0L
+            personalRestoredDraft = null
+            if (currentBase != forDraft.baseUpdatedAt) {
+                personalSource = null
+                personalDraft = null
+                personalEditorDraft = null
+                personalDraftConfirm = PersonalDraftConfirm(source, forDraft)
+                personalStatusText = "已重新读取当前词义；发现本机词义在离开后已更新，草稿需要再次确认，不会自动覆盖。"
+                render()
+                return
+            }
+            personalSource = source
+            personalEditorDraft = forDraft.copy(headword = source.headword, newHeadword = source.newHeadword)
+            personalDraft = personalEditorDraft
+            personalStatusText = "已重新读取当前词义并恢复草稿；保存前请确认内容。"
+            render()
+            return
+        }
+        personalSource = source
+        personalEditorDraft = null
+        personalDraft = null
+        personalRestoredDraft = null
+        personalDraftConfirm = null
+        personalStatusText = "已读取当前词义。保存只会更新本机个人词义。"
+        render()
+    }
+
+    /**
+     * Hand-off from a lookup card into the full personal-entry page. The card's original deletion
+     * credential, user-row snapshot and read revision are kept exactly as read; no fresh credential
+     * is captured and no newer revision is copied onto older content.
+     *
+     * The worker re-reads the user row around a committed-revision pair and requires the same
+     * revision the card was read at, both from the read pair and at delivery. [isCardLive] is the
+     * source card's own owner check; [pendingPersonalHandoff] is compared by identity, and onStop,
+     * page navigation or the card's dismiss invalidates it. A late callback therefore cannot open a
+     * new writable page, while a late dismiss of an old card never touches a new page.
+     */
+    private fun openPersonalEntryFromCard(
+        source: PersonalEntrySource,
+        cardToken: Any,
+        isCardLive: () -> Boolean,
+        onAccepted: () -> Unit
+    ) {
+        if (page != MainPage.LOOKUP) return
+        if (app.repository.deletions.isStale(source.entryKey, source.credential)) {
+            toast("该词已删除或数据已恢复，请重新查询")
+            return
+        }
+        if (!isCardLive()) return
+        cancelPendingPersonalHandoff()
+        val token = personalOpenGate.next()
+        val handoff = PersonalHandoff(cardToken, isCardLive)
+        pendingPersonalHandoff = handoff
+        // Fixed identity from the query card. Never replaced with a later version.
+        val expectedRevision = source.readRevision
+        val expectedUser = source.user
+        app.worker.execute {
+            if (!personalOpenGate.accepts(token) || handoff.invalid) return@execute
+            val check = runCatching {
+                val before = app.repository.changes.version
+                val user = app.repository.userEntry(source.entryKey)
+                val after = app.repository.changes.version
+                Triple(user, after, before == after)
+            }
+            if (!personalOpenGate.accepts(token) || handoff.invalid) return@execute
+            main.post {
+                if (isDestroyed || isFinishing || page != MainPage.LOOKUP ||
+                    !personalOpenGate.accepts(token) ||
+                    pendingPersonalHandoff !== handoff || handoff.invalid ||
+                    !handoff.cardStillLive()) {
+                    return@post
+                }
+                check.onSuccess { (userNow, revision, stable) ->
+                    // The source content was read at expectedRevision. Both the read span and the
+                    // delivery-time committed revision must still equal it; otherwise the old card
+                    // would be relabelled as the current world.
+                    if (!stable || revision != expectedRevision ||
+                        app.repository.changes.version != expectedRevision ||
+                        userNow != expectedUser ||
+                        app.repository.deletions.isStale(source.entryKey, source.credential)) {
+                        pendingPersonalHandoff = null
+                        toast("查询结果已更新，请重新查询后再编辑")
+                        return@onSuccess
+                    }
+                    pendingPersonalHandoff = null
+                    onAccepted()
+                    enterPersonalEntryFromSource(source)
+                }.onFailure {
+                    pendingPersonalHandoff = null
+                    toast("读取当前词义失败：${it.message}")
+                }
+            }
+        }
+    }
+
+    /**
+     * Invalidates an unaccepted card hand-off without touching the current page or its owner. A
+     * card-token mismatch means the pending hand-off belongs to a different card, so an old card's
+     * late dismiss can never cancel a newer one.
+     */
+    private fun cancelPendingPersonalHandoff(cardToken: Any? = null) {
+        val handoff = pendingPersonalHandoff ?: return
+        if (cardToken != null && handoff.cardToken !== cardToken) return
+        handoff.invalid = true
+        pendingPersonalHandoff = null
+    }
+
+    private fun enterPersonalEntryFromSource(source: PersonalEntrySource) {
+        captureLookupDraft()
+        // The accepted hand-off no longer needs its open gate; retire it before creating the page's
+        // own editor generation.
+        personalOpenGate.next()
+        closePersonalEntryOwner(keepDraft = false)
+        personalNeedsResume = false
+        personalSource = source
+        personalHeadword = source.headword
+        personalStatusText = "已沿用刚才查询结果的来源身份；保存只写本机个人词义。"
+        page = MainPage.PERSONAL_ENTRY
+        currentTab = page.legacyTab
+        render()
+    }
+
     private fun wordRow(word: LearnedWord, action: () -> Unit): View = column().apply {
         setPadding(dp(12), dp(8), dp(12), dp(8)); minimumHeight = dp(72)
         addView(text(word.entry.headword, 23f, bold = true).apply { typeface = Typeface.create("serif", Typeface.BOLD) })
@@ -508,8 +1151,8 @@ class MainActivity : Activity() {
                 dates.text = "当前已无有效查询；已保存的笔记仍保留。"
             } else {
                 definition.text = "${word.entry.partOfSpeech} ${word.entry.meaning}"
-                source.text = RawKajwebDictionary.provenance(word.source, word.version)
-                sourceBadge.text = RawKajwebDictionary.label(word.source, word.version)
+                source.text = PersonalDictionary.provenance(word.source, word.version)
+                sourceBadge.text = PersonalDictionary.label(word.source, word.version)
                 val formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")
                 fun date(time: Long) = Instant.ofEpochMilli(time).atZone(ZoneId.systemDefault()).format(formatter)
                 dates.text = "首次查询：${date(word.firstAt)}\n最近查询：${date(word.lastAt)}"
@@ -567,11 +1210,11 @@ class MainActivity : Activity() {
         content.addView(text(word.entry.headword, 30f, bold = true).apply { typeface = Typeface.create("serif", Typeface.BOLD) })
         val definition = text("${word.entry.partOfSpeech} ${word.entry.meaning}", 18f)
         content.addView(definition); content.space(8)
-        val sourceBadge = badge(RawKajwebDictionary.label(word.source, word.version))
+        val sourceBadge = badge(PersonalDictionary.label(word.source, word.version))
         content.addView(sourceBadge, LinearLayout.LayoutParams(-2, -2)); content.divider()
         val form = text("原词形：${word.lastForm}", 16f, Paper.secondary)
         content.addView(form)
-        val source = text(RawKajwebDictionary.provenance(word.source, word.version), 16f, Paper.secondary)
+        val source = text(PersonalDictionary.provenance(word.source, word.version), 16f, Paper.secondary)
         content.addView(source); content.space(16)
         val count = text("${word.queryCount} 次", 28f, bold = true)
         val queries = column().apply {
@@ -601,18 +1244,22 @@ class MainActivity : Activity() {
         content.addView(pair(save, undo, inlineAt(detailWidth - 48), 8)); content.space(8)
         content.addView(text("撤销只影响最近一次成功查询；之前的查询与已保存的笔记保留。", 16f, Paper.secondary))
         content.space(8)
-        val delete = button("删除生词") {}
+        val delete = button("移除学习记录…") {}
         delete.setTextColor(Paper.error)
         content.addView(delete)
         content.space(8)
-        content.addView(text("删除会清除该词的全部查询历史（含已撤销）、笔记与掌握状态，无法恢复；原始词库和其他生词不受影响。与“撤销最近一次查询”不同。", 16f, Paper.secondary))
+        content.addView(text("先选择范围：可以只撤销最近一次查询；或另行确认删除该词的全部学习记录（含已撤销查询、个人笔记、掌握状态与复习进度），删除后无法恢复。原始词库、独立本机词义、其他生词与已导出 PDF 均不受影响。", 16f, Paper.secondary))
         val binding = WordDetailBinding(word.entry.key, deletionCredential, snapshotVersion, save, undo, delete, mastered, note,
             form, count, dates, definition, source, sourceBadge, { !detailBusy },
             { app.repository.deletions.isStale(word.entry.key, deletionCredential) }, close,
             word.mastered, word.note)
         save.setOnClickListener { saveDetail(binding, word, close) }
-        undo.setOnClickListener { revokeLast(binding, word, close) }
-        delete.setOnClickListener { confirmDelete(binding, word) }
+        // The shortcut stays exact-event-only: it prepares the latest event under this binding's
+        // original credential and confirms that one event, never the dangerous full-history scope.
+        // The remove entry opens the scope chooser, which never deletes by itself and still needs a
+        // second confirmation for full history.
+        undo.setOnClickListener { startExactUndoFlow(binding, word, close) }
+        delete.setOnClickListener { openDeleteScope(binding, word, close) }
         binding.update(word)
         return binding
     }
@@ -645,80 +1292,273 @@ class MainActivity : Activity() {
             }
         }
     }
-    private fun revokeLast(binding: WordDetailBinding, word: LearnedWord, close: (() -> Unit)?) {
+    /**
+     * Shortcut entry of the exact single-event undo. It uses the same [DeleteFlow] start/settle,
+     * owner, busy, stale and admission protections as the scope chooser, but skips the chooser so
+     * the user never has to pick a dangerous scope for a "undo the latest query" action. The worker
+     * preparation and confirmation still freeze the exact event before any write.
+     */
+    private fun startExactUndoFlow(binding: WordDetailBinding, word: LearnedWord, close: (() -> Unit)?) {
         if (binding.isBusy() || detailBusy) return
+        if (binding.isStale()) {
+            binding.invalidate()
+            toast("该词已删除或数据已恢复，请刷新后重新打开详情再操作")
+            return
+        }
+        closeDeleteFlow()
+        val flow = DeleteFlow(word.entry.key, binding) { !isFinishing && !isDestroyed }
+        deleteFlow = flow
         binding.beginConfirm()
-        var proceed = false
-        val dialog = AlertDialog.Builder(this).setTitle("撤销最近一次查询？")
-            .setMessage("只撤销 ${word.entry.headword} 最近的一次成功事件，之前的查询和笔记保留。")
-            .setPositiveButton("撤销") { _, _ -> proceed = true; performRevoke(binding, word, close) }
-            .setNegativeButton("取消", null)
-            .create()
-        dialog.setOnDismissListener { if (!proceed) binding.cancelConfirm() }
+        prepareExactUndo(flow, word, close)
+    }
+
+    /**
+     * [flow] is the only scoped-delete flow allowed to act on the UI right now. A retired flow (page
+     * stop/destroy/navigation), a flow replaced by a newer one, and a flow whose owner is gone all
+     * fail this check, so their late callbacks cannot mount dialogs, rebind state or start work.
+     */
+    private fun isLiveDeleteFlow(flow: DeleteFlow): Boolean = deleteFlow === flow && flow.isLive()
+
+    /**
+     * Entry of the scope-choosing learning-record action. It never deletes immediately: the scope
+     * chooser is shown first and both scopes then have their own explicit confirmation, so the
+     * full-history path always needs a second, dangerous confirmation. The detail's original
+     * deletion credential and snapshot stay with the binding; no fresh credential is taken.
+     */
+    private fun openDeleteScope(binding: WordDetailBinding, word: LearnedWord, close: (() -> Unit)?) {
+        if (binding.isBusy() || detailBusy) return
+        if (binding.isStale()) {
+            binding.invalidate()
+            toast("该词已删除或数据已恢复，请刷新后重新打开详情再操作")
+            return
+        }
+        closeDeleteFlow()
+        val flow = DeleteFlow(word.entry.key, binding) { !isFinishing && !isDestroyed }
+        deleteFlow = flow
+        binding.beginConfirm()
+        var scopeChosen = false
+        val dialog = DeleteScopeDialog.createScopeDialog(this, word.entry.headword) { scope ->
+            // A queued chooser item can be delivered after onStop/onDestroy/navigation retired this
+            // flow, or after a newer flow replaced it. Such a retired callback must not branch,
+            // rebind currentDialog, dispatch preparation or mount any confirmation.
+            if (!isLiveDeleteFlow(flow)) return@createScopeDialog
+            // The same chooser item can be delivered more than once before or after the queued
+            // preparation. It is still one user choice: ignore every replay without changing the
+            // chosen scope, dispatching another preparation or mounting another confirmation.
+            if (flow.scopeConsumed) return@createScopeDialog
+            flow.scopeConsumed = true
+            scopeChosen = true
+            flow.currentDialog = null
+            when (scope) {
+                DeleteScope.UNDO_LAST_QUERY_ONLY -> prepareExactUndo(flow, word, close)
+                DeleteScope.DELETE_ALL_LEARNING_RECORDS -> showDeleteAllConfirm(flow, word)
+            }
+        }
+        flow.currentDialog = dialog
+        dialog.setOnDismissListener {
+            // A cancel/back settles only this flow. A chosen scope has already moved on to its own
+            // confirmation (or a read-only preparation), so this listener does nothing.
+            if (deleteFlow === flow && flow.currentDialog === dialog) {
+                flow.currentDialog = null
+                if (!scopeChosen) settleDeleteFlow(flow)
+            }
+        }
         dialog.show()
     }
-    private fun performRevoke(binding: WordDetailBinding, word: LearnedWord, close: (() -> Unit)?) {
-        if (detailBusy) { binding.cancelConfirm(); return }
-        detailBusy = true
-        binding.beginBusy()
+
+    /**
+     * Reads the exact latest event once under the detail's original credential. The worker is
+     * read-only; if the page/owner ended while it ran, no confirmation is shown and nothing is
+     * written. PREPARED carries the exact id/key/time that will be shown and committed.
+     */
+    private fun prepareExactUndo(flow: DeleteFlow, word: LearnedWord, close: (() -> Unit)?) {
+        // Never dispatch even the read-only preparation for a flow that is already retired; a late
+        // UNDO_LAST choice must not run work on behalf of an old page.
+        if (!isLiveDeleteFlow(flow)) return
         app.worker.execute {
-            // Resolve-and-revoke happens in the worker only after the stale check against the detail's
-            // original credential, so a stale confirm can never revoke an event of a re-collected word.
-            val result = runCatching { app.repository.revokeLatest(word.entry.key, binding.deletionCredential) }
+            val result = runCatching {
+                app.repository.prepareUndoLatest(word.entry.key, flow.binding.deletionCredential)
+            }
             main.post {
-                if (isDestroyed) return@post
-                detailBusy = false
-                binding.endBusy()
-                releaseDetailBusy()
-                val outcome = result.getOrNull()
-                // Deletion wins over a late result: a REVOKED that raced a committed deletion must not
-                // report success nor re-enable actions on an invalidated card.
-                if (app.repository.deletions.isStale(word.entry.key, binding.deletionCredential)) {
-                    binding.invalidate()
-                    toast("撤销失败：该词已删除，未撤销任何记录")
-                } else when {
-                    result.isFailure -> toast("撤销失败：${result.exceptionOrNull()?.message}")
-                    outcome == RevokeOutcome.REVOKED -> { close?.invoke(); toast("最近一次查询已撤销") }
-                    outcome == RevokeOutcome.STALE -> { binding.invalidate(); toast("撤销失败：该词已删除，未撤销任何记录") }
-                    else -> toast("没有可撤销的查询")
+                if (!isLiveDeleteFlow(flow)) return@post
+                result.onSuccess { preparation ->
+                    when (preparation.outcome) {
+                        UndoPrepareOutcome.PREPARED -> showExactUndoConfirm(
+                            flow, word, checkNotNull(preparation.prepared), close
+                        )
+                        UndoPrepareOutcome.NONE -> {
+                            settleDeleteFlow(flow); toast("没有可撤销的查询")
+                        }
+                        UndoPrepareOutcome.STALE -> {
+                            flow.binding.invalidate()
+                            val cleared = clearStaleDetail(flow.key, flow.binding)
+                            if (cleared && selectedKey == flow.key) selectedKey = null
+                            settleDeleteFlow(flow); releaseDetailBusy()
+                            toast("未撤销：该词已删除或已重新收录，请刷新后重新打开详情")
+                        }
+                        UndoPrepareOutcome.CHANGED -> {
+                            settleDeleteFlow(flow)
+                            toast("数据刚有变化，未撤销任何记录；请重试")
+                        }
+                    }
+                }.onFailure {
+                    settleDeleteFlow(flow)
+                    toast("撤销失败：${it.message}")
                 }
             }
         }
     }
-    private fun confirmDelete(binding: WordDetailBinding, word: LearnedWord) {
-        if (binding.isBusy() || detailBusy) return
-        binding.beginConfirm()
+
+    /** Confirms exactly the event time that was prepared; the shown target cannot move underneath. */
+    private fun showExactUndoConfirm(flow: DeleteFlow, word: LearnedWord,
+                                     prepared: PreparedUndo, close: (() -> Unit)?) {
+        // The preparation callback (or the scope chooser) may have raced a retirement: never build
+        // or attach a confirmation for a flow that is no longer the live one.
+        if (!isLiveDeleteFlow(flow)) return
         var proceed = false
-        val dialog = AlertDialog.Builder(this)
-            .setTitle("删除生词「${word.entry.headword}」？")
-            .setMessage("将永久删除「${word.entry.headword}」的全部查询历史（含已撤销）、笔记和掌握状态，删除后无法恢复；原始词库、其他生词和已导出的 PDF 不受影响。\n\n这与“撤销最近一次查询”不同：撤销只移除最近一次查询，保留其余历史和笔记。")
-            .setPositiveButton("删除") { _, _ -> proceed = true; performDelete(binding, word) }
-            .setNegativeButton("取消", null)
-            .create()
-        dialog.setOnDismissListener { if (!proceed) binding.cancelConfirm() }
+        val dialog = DeleteScopeDialog.createUndoLastConfirmDialog(
+            this, word.entry.headword, prepared.eventTime
+        ) {
+            if (!isLiveDeleteFlow(flow)) return@createUndoLastConfirmDialog
+            proceed = true
+            flow.currentDialog = null
+            commitExactUndo(flow, word, prepared, close)
+        }
+        // Re-check immediately before this flow owns and shows the new dialog, so a retired flow can
+        // never take currentDialog over or mount over the replacement page.
+        if (!isLiveDeleteFlow(flow)) return
+        flow.currentDialog = dialog
+        dialog.setOnDismissListener {
+            if (deleteFlow === flow && flow.currentDialog === dialog) {
+                flow.currentDialog = null
+                if (!proceed) settleDeleteFlow(flow)
+            }
+        }
         dialog.show()
     }
-    private fun performDelete(binding: WordDetailBinding, word: LearnedWord) {
-        if (detailBusy) { binding.cancelConfirm(); return }
+
+    /**
+     * Commits the exact prepared event. [admission] and [canCommit] are evaluated by the repository
+     * immediately before BEGIN: an owner/page invalidation that happened first refuses with
+     * REJECTED and writes nothing, while an already-admitted commit finishes atomically and is
+     * reported as such even if the page closes afterwards.
+     */
+    private fun commitExactUndo(flow: DeleteFlow, word: LearnedWord,
+                                prepared: PreparedUndo, close: (() -> Unit)?) {
+        // A confirmation delivered by a retired flow must not touch shared busy state, rewrite the
+        // current flow's binding or start a transaction; an already-started transaction is below.
+        if (!isLiveDeleteFlow(flow)) return
+        // A repeated delivery of this same confirmation is not a second operation. Consume it once
+        // per flow and ignore the replay before touching the shared busy flag, the flow or its
+        // admission: settling here would turn the first already-queued commit into a cancellation.
+        if (flow.commitConsumed) return
+        if (detailBusy) { settleDeleteFlow(flow); return }
+        flow.commitConsumed = true
         detailBusy = true
-        binding.beginBusy()
+        flow.binding.beginBusy()
         app.worker.execute {
-            val result = runCatching { app.repository.deleteWord(word.entry.key, binding.deletionCredential) }
+            val result = runCatching {
+                app.repository.commitUndo(prepared, admission = flow.admission) {
+                    deleteFlow === flow && !flow.closed && !flow.binding.isStale()
+                }
+            }
             main.post {
                 if (isDestroyed) return@post
                 detailBusy = false
+                flow.binding.endBusy()
+                val error = result.exceptionOrNull()
+                val outcome = result.getOrNull()
+                val staleNow = app.repository.deletions.isStale(
+                    word.entry.key, flow.binding.deletionCredential
+                )
+                when {
+                    error != null -> toast("撤销失败：${error.message}")
+                    // A REVOKED outcome is a committed write and is reported as such even if the word
+                    // was deleted immediately afterwards; the card is still frozen, never re-enabled.
+                    outcome == ExactUndoOutcome.REVOKED -> {
+                        if (staleNow) flow.binding.invalidate()
+                        close?.invoke()
+                        toast(if (staleNow) "最近一次查询已撤销；该词随后已被删除"
+                        else "最近一次查询已撤销")
+                    }
+                    staleNow -> {
+                        flow.binding.invalidate()
+                        toast("撤销失败：该词已删除，未撤销任何记录")
+                    }
+                    outcome == ExactUndoOutcome.REJECTED ->
+                        toast("操作已取消，未撤销任何记录")
+                    else -> toast("没有可撤销的查询（可能已被撤销）")
+                }
+                settleDeleteFlow(flow)
+                releaseDetailBusy()
+            }
+        }
+    }
+
+    /** Second, explicit confirmation for the dangerous per-word full-history scope. */
+    private fun showDeleteAllConfirm(flow: DeleteFlow, word: LearnedWord) {
+        // Same identity gate as the undo confirmation: a late queued choice for a retired flow may
+        // never mount the dangerous full-history dialog or rebind currentDialog.
+        if (!isLiveDeleteFlow(flow)) return
+        var proceed = false
+        val dialog = DeleteScopeDialog.createDeleteAllConfirmDialog(this, word.entry.headword) {
+            if (!isLiveDeleteFlow(flow)) return@createDeleteAllConfirmDialog
+            proceed = true
+            flow.currentDialog = null
+            performDeleteAll(flow, word)
+        }
+        // Check again at the actual attach point, after the dialog and its listener exist.
+        if (!isLiveDeleteFlow(flow)) return
+        flow.currentDialog = dialog
+        dialog.setOnDismissListener {
+            if (deleteFlow === flow && flow.currentDialog === dialog) {
+                flow.currentDialog = null
+                if (!proceed) settleDeleteFlow(flow)
+            }
+        }
+        dialog.show()
+    }
+
+    /**
+     * Full-history delete for exactly this key. The repository keeps the original transaction,
+     * rollback, change publication and deletion generation; only the pre-BEGIN admission is new.
+     * REJECTED is reported as "not deleted", never as "already absent"; a committed DELETED is
+     * reported as committed.
+     */
+    private fun performDeleteAll(flow: DeleteFlow, word: LearnedWord) {
+        // A retired flow's confirmation never starts the transaction or mutates shared busy state.
+        if (!isLiveDeleteFlow(flow)) return
+        // Same per-flow one-shot rule as the exact branch: a replayed positive callback must not
+        // settle the first queued full delete or invalidate its admission.
+        if (flow.commitConsumed) return
+        if (detailBusy) { settleDeleteFlow(flow); return }
+        flow.commitConsumed = true
+        detailBusy = true
+        flow.binding.beginBusy()
+        app.worker.execute {
+            val result = runCatching {
+                app.repository.deleteWord(word.entry.key, flow.binding.deletionCredential,
+                    admission = flow.admission) {
+                    deleteFlow === flow && !flow.closed && !flow.binding.isStale()
+                }
+            }
+            main.post {
+                if (isDestroyed) return@post
+                detailBusy = false
+                flow.binding.endBusy()
                 val error = result.exceptionOrNull()
                 val outcome = result.getOrNull()
                 when {
-                    error != null -> { binding.endBusy(); toast("删除失败：${error.message}") }
+                    error != null -> toast("删除失败：${error.message}")
+                    outcome == DeleteOutcome.REJECTED -> toast("操作已取消，未删除任何记录")
                     else -> {
                         // Every settled result (STALE/DELETED/NOT_FOUND) leaves the acting binding and
                         // any current detail for this exact word bound to an old generation: freeze it
                         // so it can never be re-enabled, and clear the current ones still showing the
                         // old cache. A genuinely newer detail for the same word (fresh snapshot or a new
                         // active query) is preserved; other words' selections and inputs are untouched.
-                        binding.invalidate()
-                        val cleared = clearStaleDetail(word.entry.key, binding)
+                        flow.binding.invalidate()
+                        val cleared = clearStaleDetail(word.entry.key, flow.binding)
                         if (cleared && selectedKey == word.entry.key) selectedKey = null
                         toast(when (outcome) {
                             DeleteOutcome.STALE -> "未删除：该词已删除或已重新收录，请刷新后重新打开详情再操作"
@@ -727,11 +1567,38 @@ class MainActivity : Activity() {
                         })
                     }
                 }
+                settleDeleteFlow(flow)
                 // The acting binding settled above; re-enable whichever details are now current so a
                 // detail rebuilt/opened during this operation is no longer stuck on the shared busy flag.
                 releaseDetailBusy()
             }
         }
+    }
+
+    /** Explicit page/stop teardown of an uncommitted delete flow: dismiss its dialog and refuse writes. */
+    private fun closeDeleteFlow() {
+        val flow = deleteFlow ?: return
+        deleteFlow = null
+        flow.closed = true
+        flow.admission.invalidate()
+        val dialog = flow.currentDialog
+        flow.currentDialog = null
+        if (dialog?.isShowing == true) dialog.dismiss()
+        flow.binding.cancelConfirm()
+    }
+
+    /** Settles a flow that produced no dialog (or whose dialog already closed) without any write. */
+    private fun settleDeleteFlow(flow: DeleteFlow) {
+        flow.closed = true
+        flow.admission.invalidate()
+        if (deleteFlow === flow) deleteFlow = null
+        flow.currentDialog = null
+        flow.binding.cancelConfirm()
+    }
+
+    /** Ends a delete flow only when it belongs to this exact detail binding. */
+    private fun closeDeleteFlowFor(binding: WordDetailBinding) {
+        if (deleteFlow?.binding === binding) closeDeleteFlow()
     }
     /**
      * After a deletion settles, freeze and clear every currently open detail that still belongs to the
@@ -752,6 +1619,7 @@ class MainActivity : Activity() {
                 (current.key == key && (current.isStale() ||
                     (current.snapshotVersion <= acting.snapshotVersion &&
                         current.deletionCredential <= acting.deletionCredential)))) {
+                closeDeleteFlowFor(current)
                 current.invalidate(); inlineDetail = null; cleared = true
             }
         }
@@ -760,6 +1628,7 @@ class MainActivity : Activity() {
                 (current.key == key && (current.isStale() ||
                     (current.snapshotVersion <= acting.snapshotVersion &&
                         current.deletionCredential <= acting.deletionCredential)))) {
+                closeDeleteFlowFor(current)
                 current.invalidate(); dialogDetail = null; current.dismiss(); cleared = true
             }
         }
@@ -773,7 +1642,10 @@ class MainActivity : Activity() {
         header.addView(button("关闭") { dialog.dismiss() }.apply { contentDescription = "关闭生词详情" })
         content.addView(header); content.divider()
         val binding = wordDetail(content, word, wordsCredential, wordsVersion) { dialog.dismiss() }
-        showPaperDialog(dialog, 640) { if (dialogDetail === binding) dialogDetail = null }
+        showPaperDialog(dialog, 640) {
+            closeDeleteFlowFor(binding)
+            if (dialogDetail === binding) dialogDetail = null
+        }
         dialogDetail = binding
     }
     private fun paperDialog(content: LinearLayout): AlertDialog = AlertDialog.Builder(this).create().apply {
@@ -857,16 +1729,13 @@ class MainActivity : Activity() {
             addView(text("考研 / 四级 / 六级 / 专四 / 专八五本原始词书合并；未应用核验或候选修订。仅查原词头，不猜词形，不回退演示词库。", 16f, Paper.warning))
         }
         library.addView(source); library.space(16)
-        val demo = panel().apply {
-            addView(text("手动输入查词", 20f, bold = true))
-            addView(text("无需悬浮窗或屏幕捕获权限；成功查询会形成真实的本地记录。", 16f, Paper.secondary)); space(12)
-            val input = inputField("例如 evidence、quantum", true)
-            val query = button("查询原始词库", true) { manualLookup(input.text.toString()) }
-            val sectionWidth = if (splitContent) (contentWidthDp - 24) / 2 else contentWidthDp
-            addView(pair(input, query, inlineAt(sectionWidth - 48))); space(12)
-            addView(text("未知词或未收录词形不生成释义、不新增记录；旧演示记录仍按旧来源展示。", 16f, Paper.secondary))
+        val lookupLink = panel().apply {
+            addView(text("查词与补词入口", 20f, bold = true))
+            addView(text("日常查词已移到独立“查词”页；词义维护已移到“添加/补词”页。设置不再承载查词输入。无悬浮窗或屏幕捕获权限时，仍可在查词页手动输入查询。", 16f, Paper.secondary)); space(12)
+            addView(button("打开查词页", true) { selectPage(MainPage.LOOKUP) })
+            addView(button("打开添加/补词页") { selectPage(MainPage.PERSONAL_ENTRY) })
         }
-        library.addView(demo); library.space(16)
+        library.addView(lookupLink); library.space(16)
         val backup = panel().apply {
             addView(text("备份与恢复", 20f, bold = true)); space(8)
             addView(text("把本机学习数据（全部词条与事件，含已撤销历史、笔记、掌握状态、统一背词进度与个人补充词库）导出为一个 .shicibackup 文件，或用备份完整覆盖当前数据。文件只通过系统文档选择器创建或读取，不联网、不上传。", 16f, Paper.secondary)); space(12)
@@ -1009,7 +1878,7 @@ class MainActivity : Activity() {
                 LookupRead(result, user, after, before == after)
             }
             main.post {
-                if (isDestroyed || !manualGate.accepts(token)) return@post
+                if (isDestroyed || page != MainPage.LOOKUP || !manualGate.accepts(token)) return@post
                 lookup.onSuccess { read ->
                     val result = read.result
                     when (result) {
@@ -1024,7 +1893,7 @@ class MainActivity : Activity() {
                                 // A supplement (or any committed data) changed after this read: drawing
                                 // the old result would hide the current user meaning, so no card is made.
                                 showManualLookupExpired()
-                            } else showManualMissing(result.form, raw, replaces, deletionCredential)
+                            } else showManualMissing(result.form, raw, replaces, deletionCredential, read.revision)
                         }
                         is LookupResult.Match -> {
                             val entry = result.entries.single()
@@ -1033,7 +1902,7 @@ class MainActivity : Activity() {
                             } else if (!read.isCurrent(app.repository.changes.version)) {
                                 showManualLookupExpired()
                             } else showManualDefinition(originalRaw, result.form, entry, read.user, replaces,
-                                deletionCredential)
+                                deletionCredential, read.revision)
                         }
                     }
                 }.onFailure { toast("词库不可用：${it.message}；未生成释义或新增记录") }
@@ -1062,12 +1931,14 @@ class MainActivity : Activity() {
      * creates no QueryEvent, count, vocabulary row or study card. Only the explicit "查询并收录"
      * action after a successful save enters the normal matched-card flow.
      */
-    private fun showManualMissing(form: String, raw: String, replaces: String?, deletionCredential: Long) {
+    private fun showManualMissing(form: String, raw: String, replaces: String?, deletionCredential: Long,
+                                  readRevision: Long) {
         // Display-entry check: a stale query must not create any writable card at all.
         if (app.repository.deletions.isStale(form, deletionCredential)) {
             toast("查询已失效（词条已删除或数据已恢复），请重新查询")
             return
         }
+        var sourceRevision = readRevision
         val content = panel()
         content.addView(text(form, 28f, bold = true).apply { typeface = Typeface.create("serif", Typeface.BOLD) })
         content.addView(text("原始词库未收录这个词。可以只在本机新增用户词条；保存本身不会产生查询记录或生词。", 16f, Paper.secondary))
@@ -1084,6 +1955,8 @@ class MainActivity : Activity() {
         // This dialog owns only the supplement editors opened from it; a later window's editor lease
         // must survive this dialog's late dismiss.
         val editorOwner = SupplementEditorOwner()
+        // Identity of this card's hand-off: only this card's own dismiss invalidates it.
+        val handoffToken = Any()
         lateinit var dialog: AlertDialog
         lateinit var guard: ManualMissingGuard
         val collect = button("查询并收录", true) {
@@ -1111,6 +1984,7 @@ class MainActivity : Activity() {
                 editorRoot = addSupplementEditor(editorHost, editorOwner, form, form, null, currentUser,
                     deletionCredential, onSaved = { saved, merged ->
                         currentUser = saved
+                        sourceRevision = app.repository.changes.version
                         meaningView.text = "${merged.partOfSpeech} ${merged.meaning}".trim()
                         status.text = "已保存到本机用户词库（仅本机；尚未收录为生词）"
                         status.setTextColor(Paper.green)
@@ -1120,6 +1994,21 @@ class MainActivity : Activity() {
                     }, onClosed = { add.isEnabled = true }, newHeadword = true)
             }
             content.addView(add); content.space(4)
+            // Explicit hand-off to the full page. It keeps this card's original credential and the
+            // current user-row snapshot; the card's own owner is closed only after acceptance.
+            content.addView(button("在补词页新增") {
+                if (app.repository.deletions.isStale(form, deletionCredential)) {
+                    invalidateManualMissing(guard); return@button
+                }
+                openPersonalEntryFromCard(
+                    PersonalEntrySource(form, form, raw, null, currentUser,
+                        deletionCredential, sourceRevision, newHeadword = true),
+                    cardToken = handoffToken,
+                    isCardLive = {
+                        manualMissingGuard === guard && !guard.invalid && dialog.isShowing
+                    }
+                ) { dialog.dismiss() }
+            }); content.space(4)
         }
         content.addView(collect); content.space(4)
         content.addView(meaningView); content.addView(status)
@@ -1132,6 +2021,7 @@ class MainActivity : Activity() {
         }
         // Closing the dialog ends only the editors this dialog opened, even before the detached-view callback.
         dialog.setOnDismissListener {
+            cancelPendingPersonalHandoff(handoffToken)
             closeSupplementEditorOwner(editorOwner)
             if (manualMissingGuard === guard) manualMissingGuard = null
         }
@@ -1142,7 +2032,8 @@ class MainActivity : Activity() {
 
     private fun showManualDefinition(raw: String, form: String, entry: DictionaryEntry,
                                       initialUser: UserDictionaryEntry?, replaces: String?,
-                                      deletionCredential: Long) {
+                                      deletionCredential: Long, readRevision: Long) {
+        var sourceRevision = readRevision
         val content = panel()
         content.addView(text(entry.headword, 28f, bold = true).apply { typeface = Typeface.create("serif", Typeface.BOLD) })
         val meta = text("原词形：$form · ${entry.partOfSpeech}")
@@ -1162,6 +2053,8 @@ class MainActivity : Activity() {
         // This card owns only the supplement editors opened from it, so a late dismiss of an older
         // card cannot close a newer card's live editor.
         val editorOwner = SupplementEditorOwner()
+        // Identity of this card's hand-off: only this card's own dismiss invalidates it.
+        val handoffToken = Any()
         lateinit var guard: ManualGuard
         val supplement = button("补充/编辑词义") {
             if (manualCardStale(guard)) { invalidateManualCard(guard); return@button }
@@ -1171,6 +2064,7 @@ class MainActivity : Activity() {
             editorRoot = addSupplementEditor(editorHost, editorOwner, entry.key, entry.headword, original, currentUser,
                 deletionCredential, onSaved = { saved, merged ->
                 currentUser = saved
+                sourceRevision = app.repository.changes.version
                 meta.text = "原词形：$form · ${merged.partOfSpeech}"
                 meaningView.text = merged.meaning
                 sourceView.text = PersonalDictionary.label(merged)
@@ -1180,15 +2074,30 @@ class MainActivity : Activity() {
             })
         }
         content.addView(supplement)
+        // Explicit hand-off to the full page. The card's original deletion credential and the
+        // current user-row snapshot are kept; opening this page never captures a fresh identity.
+        lateinit var dialog: AlertDialog
+        content.addView(button("在补词页编辑") {
+            if (manualCardStale(guard)) { invalidateManualCard(guard); return@button }
+            val original = if (entry.source == PersonalDictionary.SOURCE) null
+            else PersonalDictionary.storedEntry(entry)
+            openPersonalEntryFromCard(
+                PersonalEntrySource(entry.key, entry.headword, raw, original,
+                    currentUser, deletionCredential, sourceRevision, newHeadword = false),
+                cardToken = handoffToken,
+                isCardLive = { manualGuard === guard && !guard.invalid && dialog.isShowing }
+            ) { dialog.dismiss() }
+        })
         content.addView(supplementStatus)
         content.addView(editorHost)
-        val dialog = AlertDialog.Builder(this).setView(ScrollView(this).apply { addView(content) }).setNegativeButton("关闭", null).create()
+        dialog = AlertDialog.Builder(this).setView(ScrollView(this).apply { addView(content) }).setNegativeButton("关闭", null).create()
         activeDialog?.dismiss(); activeDialog = dialog
         val token = manualGate.next()
         guard = ManualGuard(entry.key, deletionCredential, status, undo, correct, retry, supplement)
         dialog.setOnDismissListener {
             // Closing this card window closes only the editors it opened; a newer card's editor lease
             // stays live, so its own save is still admitted on its owner.
+            cancelPendingPersonalHandoff(handoffToken)
             closeSupplementEditorOwner(editorOwner)
             if (manualGuard === guard) manualGuard = null
             if (manualGate.accepts(token)) manualGate.next()
@@ -1216,6 +2125,9 @@ class MainActivity : Activity() {
                                 undo.isEnabled = false; correct.isEnabled = false; retry.visibility = View.VISIBLE
                             }
                             saved -> {
+                                // The query record has committed; the displayed meaning snapshot is
+                                // unchanged, so the card's source identity is this settled revision.
+                                sourceRevision = app.repository.changes.version
                                 status.text = "已收录"; status.setTextColor(Paper.green)
                                 undo.isEnabled = true; correct.isEnabled = true; retry.visibility = View.GONE
                             }
@@ -1276,7 +2188,12 @@ class MainActivity : Activity() {
                                     credential: Long,
                                     onSaved: (UserDictionaryEntry, DictionaryEntry) -> Unit,
                                     onClosed: () -> Unit = {},
-                                    newHeadword: Boolean = false): LinearLayout {
+                                    newHeadword: Boolean = false,
+                                    initialPos: String? = null,
+                                    initialMeaning: String? = null,
+                                    expectedUpdatedAtOverride: Long? = null,
+                                    showOriginal: Boolean = true,
+                                    onDraftChanged: ((String, String) -> Unit)? = null): LinearLayout {
         // A window that has already been dismissed can never open a new writable editor, and neither
         // can a card whose query world (deletion/restore) has already been replaced. Return a
         // non-editable notice without registering a lease, so no late save can be admitted on it.
@@ -1297,19 +2214,30 @@ class MainActivity : Activity() {
             addView(text("只编辑用户词性/释义；原词库只读，不会被覆盖，也不计入查询或学习。", 13f, Paper.secondary))
         }
         content.addView(text(headword, 18f, bold = true))
-        original?.let {
+        if (showOriginal) original?.let {
             content.addView(text("原词库释义（只读）", 15f, bold = true))
             content.addView(text("${it.partOfSpeech} ${it.meaning}".trim(), 15f))
             content.addView(text(PersonalDictionary.provenance(it), 12f, Paper.warning))
         }
         val posInput = inputField("词性（可留空），如 n. / v.", singleLine = true).apply {
-            setText(currentUser?.partOfSpeech ?: "")
+            setText(initialPos ?: currentUser?.partOfSpeech ?: "")
         }
         val meaningInput = inputField("用户补充释义（必填）", singleLine = false).apply {
             minLines = 3; gravity = Gravity.TOP
-            setText(currentUser?.meaning ?: "")
+            setText(initialMeaning ?: currentUser?.meaning ?: "")
         }
         content.addView(posInput); content.space(4); content.addView(meaningInput)
+        if (onDraftChanged != null) {
+            val watcher = object : TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+                override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
+                    onDraftChanged(posInput.text.toString(), meaningInput.text.toString())
+                }
+                override fun afterTextChanged(s: Editable?) {}
+            }
+            posInput.addTextChangedListener(watcher)
+            meaningInput.addTextChangedListener(watcher)
+        }
         val status = text("", 14f, Paper.secondary); content.addView(status)
         val saveButton = button("保存到本机", true) {}
         val cancelButton = button("取消") {}
@@ -1330,7 +2258,7 @@ class MainActivity : Activity() {
             override fun onViewAttachedToWindow(v: View) { alive = true }
             override fun onViewDetachedFromWindow(v: View) { alive = false; closeEditor() }
         })
-        val expectedUpdatedAt = currentUser?.updatedAt ?: 0L
+        val expectedUpdatedAt = expectedUpdatedAtOverride ?: (currentUser?.updatedAt ?: 0L)
         saveButton.setOnClickListener {
             if (!alive || owner.closed || editorLease.closed || saving) return@setOnClickListener
             val meaning = meaningInput.text.toString()
