@@ -12,25 +12,31 @@ object ExportLayout {
     const val LINE_HEIGHT = 18f
     const val ROW_GAP = 14f
 
-    fun paginate(lineCounts: List<Int>): List<ExportPage> {
+    /**
+     * Flow rows onto pages. [top]/[bottom] are the body bounds in points; the defaults reproduce the
+     * original layout exactly, so a taller wrapped page header can move [top] down without changing
+     * the two-argument callers or their tests.
+     */
+    fun paginate(lineCounts: List<Int>, top: Float = TOP, bottom: Float = BOTTOM): List<ExportPage> {
         require(lineCounts.all { it > 0 })
+        require(top >= 0f && top < bottom) { "正文区域无效" }
         val pages = mutableListOf<ExportPage>()
         var slices = mutableListOf<TextSlice>()
-        var y = TOP
-        val capacity = ((BOTTOM - TOP) / LINE_HEIGHT).toInt()
+        var y = top
+        val capacity = ((bottom - top) / LINE_HEIGHT).toInt().coerceAtLeast(1)
         lineCounts.forEachIndexed { index, count ->
-            if (count <= capacity && y + count * LINE_HEIGHT > BOTTOM && slices.isNotEmpty()) {
+            if (count <= capacity && y + count * LINE_HEIGHT > bottom && slices.isNotEmpty()) {
                 pages += ExportPage(slices.toList())
                 slices = mutableListOf()
-                y = TOP
+                y = top
             }
             var line = 0
             while (line < count) {
-                val available = ((BOTTOM - y) / LINE_HEIGHT).toInt()
+                val available = ((bottom - y) / LINE_HEIGHT).toInt()
                 if (available <= 0) {
                     pages += ExportPage(slices.toList())
                     slices = mutableListOf()
-                    y = TOP
+                    y = top
                     continue
                 }
                 val take = minOf(available, count - line)
@@ -40,7 +46,7 @@ object ExportLayout {
                 if (line < count) {
                     pages += ExportPage(slices.toList())
                     slices = mutableListOf()
-                    y = TOP
+                    y = top
                 }
             }
         }

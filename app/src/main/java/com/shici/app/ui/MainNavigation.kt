@@ -17,7 +17,7 @@ import android.widget.ScrollView
  * caller decides what a selection means. [setSelected] restyles the existing buttons in place, so
  * it cannot reset the scroll position of either navigation region.
  *
- * Wide layout: a 216dp sidebar whose six main entries scroll in the weighted region above a
+ * Wide layout: a 216dp sidebar whose seven main entries scroll in the weighted region above a
  * divider; settings sits in its own fixed area below the divider. Narrow layout: a fixed bottom
  * bar whose main entries scroll horizontally, with settings on a separate full-width row that the
  * main row can never push off screen. Insets stay with the shell root; this view adds none.

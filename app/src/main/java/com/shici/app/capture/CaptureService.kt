@@ -76,6 +76,11 @@ class CaptureService : Service() {
     private var recognizer: TextRecognizer? = null
     private var bubble: View? = null
     private var panel: View? = null
+    // One explicit translation page at most. It is a normal overlay window owned by this service
+    // (never a Dialog), and closeTranslationScreen() retires both the window and its ML Kit
+    // session so a late callback can neither paint nor reopen anything.
+    private var translationScreen: TranslationScreen? = null
+    private var translationWindow: View? = null
     // Identity of the card that currently owns the floating panel. Every panel removal advances it,
     // so a click queued by an already-replaced failure card can neither close a newer card nor
     // publish a new capture request in that newer card's world.
@@ -563,6 +568,10 @@ class CaptureService : Service() {
         pageGuardTimeout?.let { main.removeCallbacks(it) }
         pageGuardTimeout = null
         gate.next()
+        // A page change is one of the lookup world's retirement paths; close any translation
+        // page that was derived from this now-unverifiable page instead of leaving a local result
+        // floating over a new page.
+        closeTranslationScreen()
         perf.stage("page", "changed")
         val definition = definitionGuard
         if (definition == null) {
@@ -594,6 +603,8 @@ class CaptureService : Service() {
         pageGuardTimeout = null
         guard.invalidate()
         gate.next()
+        // The page identity expired, so any translation page derived from it is retired too.
+        closeTranslationScreen()
         perf.stage("page", "guard_expired")
         val definition = definitionGuard
         if (definition == null) {
@@ -764,6 +775,9 @@ class CaptureService : Service() {
      */
     private fun beginLiveSelection() {
         if (stopped || !sessionIsActive() || requestedFrame.get() != null || live != null || liveView != null) return
+        // A new one-stroke capture always retires an open translation page first; a late
+        // translation result must never appear over the new lookup world.
+        closeTranslationScreen()
         synchronized(pageLock) {
             dismissPanel()
             if (!sessionIsActive()) return
@@ -1092,6 +1106,8 @@ class CaptureService : Service() {
     private fun definitionCardStale(guard: DefinitionGuard): Boolean =
         guard.invalid || app.repository.deletions.isStale(guard.key, guard.credential)
     private fun dismissPanel() {
+        // Closing any card also retires an open translation page and its late-callback owner.
+        closeTranslationScreen()
         // Closing the page card ends every editor it owned, even before its view detaches.
         closeSupplementEditors()
         perf.end("closed", "dismiss")
@@ -1201,7 +1217,9 @@ class CaptureService : Service() {
         perf.snapshot("multi_word")
         val content = card("选中原文")
         content.addView(text(raw, 18f)); content.space()
-        content.addView(text("识别到多个候选词，尚未查询或收录。译句未接入 · 请选择一个词查词；不会批量自动加入生词本。", 16f, Paper.warning)); content.space()
+        content.addView(text("识别到多个候选词，尚未查询或收录。你可以翻译整句，或选择一个词查词；不会批量自动加入生词本。", 16f, Paper.warning)); content.space()
+        content.addView(button("翻译整句（离线英译中）") { openTranslation(raw) }); content.space(8)
+        content.addView(button("编辑原文后翻译") { openTranslation(raw, focusInput = true) }); content.space(8)
         words.filter { RawKajwebDictionary.normalize(it) != null }.distinct().forEach { word ->
             content.addView(button("查词：$word") { lookup(word, raw, manual = manual) }); content.space(8)
         }
@@ -1210,13 +1228,89 @@ class CaptureService : Service() {
         content.addView(button("取消") { dismissPanel(); showBubble() })
         addPanel(scroll(content))
     }
+    /**
+     * Opens the explicit offline translation page for [raw].
+     *
+     * This is reached only from the multi-word OCR card's "翻译整句"/"编辑原文后翻译" buttons.
+     * Generating [raw] already happened during this lookup; opening the page starts no lookup,
+     * record, query count or study feedback, and the page opens no second window of its own.
+     *
+     * The old lookup card and its page admission are retired first. The translation page is a
+     * local-only world with no dictionary write admission, so there is no old page result that
+     * could be laundered; closing the page always returns to the floating button, never to a stale
+     * card. The window is a real `TYPE_APPLICATION_OVERLAY` owned by this service (not a Dialog),
+     * so a Service context can never trigger BadToken.
+     */
+    private fun openTranslation(raw: String, focusInput: Boolean = false) {
+        if (stopped || !sessionIsActive()) {
+            toast("查词服务已停止或会话已失效，无法打开译句；请重新开启全屏查词")
+            return
+        }
+        // Retires the multi-word card, the accepted-page guard, any old translation owner and any
+        // pending frame/epoch. A late callback from the old card or page can no longer act.
+        dismissPanel()
+        if (stopped || !sessionIsActive()) return
+        val screen = TranslationScreen(this, raw)
+        screen.onCloseRequested = { closeTranslationScreen(returnToBubble = true) }
+        val view = screen.view
+        val width = minOf(dp(520), (screenWidth - dp(24)).coerceAtLeast(dp(240)))
+        val maxHeight = (screenHeight * 3 / 4).coerceAtLeast(dp(280))
+        view.measure(
+            View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
+            View.MeasureSpec.makeMeasureSpec(maxHeight, View.MeasureSpec.AT_MOST)
+        )
+        val height = view.measuredHeight.coerceIn(1, maxHeight)
+        val params = WindowManager.LayoutParams(
+            width, height,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.CENTER
+            softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
+        }
+        view.isFocusableInTouchMode = true
+        translationScreen = screen
+        translationWindow = view
+        try {
+            windows.addView(view, params)
+            view.requestFocus()
+            perf.stage("translation", "opened")
+            if (focusInput) view.post { screen.focusInput() }
+        } catch (e: Exception) {
+            closeTranslationScreen()
+            toast("无法打开译句页面：${e.message}；本次未翻译、未收录")
+            if (sessionIsActive()) showBubble()
+        }
+    }
+
+    /**
+     * Single owner retirement for the translation window. Idempotent: the screen closes its ML Kit
+     * session first, then the window is removed, so a queued result can neither paint the removed
+     * page nor reopen any window. [returnToBubble] is used for the user's own close/Back action;
+     * lifecycle and page-change paths keep their existing messages/bubble policy.
+     */
+    private fun closeTranslationScreen(returnToBubble: Boolean = false) {
+        val screen = translationScreen
+        val view = translationWindow
+        if (screen == null && view == null) return
+        translationScreen = null
+        translationWindow = null
+        screen?.close()
+        view?.let { runCatching { windows.removeViewImmediate(it) } }
+        pageOverlayBoxes = emptyList()
+        endPageGuard()
+        perf.stage("translation", "closed")
+        if (returnToBubble && sessionIsActive() && bubble == null) showBubble()
+    }
+
     private fun showTextCorrection(raw: String) {
         // The user is explicitly correcting the previous OCR text; no automatic OCR/page evidence
         // is being admitted from here, so stop observing the old page.
         endPageGuard()
         gate.next()
         val content = card("纠正选中文字")
-        content.addView(text("保留大小写、标点与换行；确认后仍需选择一个词查词。译句未接入。"))
+        content.addView(text("保留大小写、标点与换行；确认后仍需选择一个词查词；也可在多词原文卡中另行选择“翻译整句”，只做本机离线译句、不查词也不收录。"))
         val input = inputField("选中的原文").apply { setText(raw) }
         content.addView(input)
         content.addView(button("确认文字", true) {
@@ -1643,6 +1737,9 @@ class CaptureService : Service() {
     override fun onDestroy() {
         perf.end("stopped", "session_stop")
         stopped = true
+        // Closing the session before removing anything else suppresses every in-flight ML Kit
+        // callback while the service/window is going away.
+        closeTranslationScreen()
         // A stopped service rejects every queued supplement save that has not reached its
         // transaction yet; an already-admitted save keeps its atomic commit.
         closeSupplementEditors()

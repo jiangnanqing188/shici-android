@@ -22,7 +22,15 @@ data class LearnedWord(
     val firstAt: Long,
     val lastAt: Long,
     val mastered: Boolean,
-    val note: String
+    val note: String,
+    /**
+     * Personal "生词收藏" marker (星标). It is deliberately independent from [mastered], the query
+     * count and the study schedule: starring a word never changes learning statistics, never feeds
+     * the review scheduler and never implies the word was mastered. Only words with at least one
+     * active (non-revoked) query are shown in the vocabulary list, so a marker left on a word whose
+     * queries were all revoked is retained in `words` but is not an active favourite.
+     */
+    val favorite: Boolean = false
 )
 
 data class LearningStats(

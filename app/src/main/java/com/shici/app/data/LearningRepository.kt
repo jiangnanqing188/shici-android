@@ -84,7 +84,7 @@ class StudyMembership(
 )
 
 /** Queries are serialized by ShiciApplication.worker; all mutations are transactional. */
-class LearningRepository(context: Context, name: String = "learning.db") : SQLiteOpenHelper(context, name, null, 3) {
+class LearningRepository(context: Context, name: String = "learning.db") : SQLiteOpenHelper(context, name, null, 4) {
     val changes = LearningChanges()
     val deletions = DeletionGate()
 
@@ -94,7 +94,8 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
         db.execSQL("""CREATE TABLE words (
             entry_key TEXT PRIMARY KEY, headword TEXT NOT NULL, pos TEXT NOT NULL,
             meaning TEXT NOT NULL, source TEXT NOT NULL, version TEXT NOT NULL,
-            mastered INTEGER NOT NULL DEFAULT 0, note TEXT NOT NULL DEFAULT '')""")
+            mastered INTEGER NOT NULL DEFAULT 0, note TEXT NOT NULL DEFAULT '',
+            favorite INTEGER NOT NULL DEFAULT 0 CHECK (favorite IN (0,1)))""")
         db.execSQL("""CREATE TABLE events (
             id TEXT PRIMARY KEY, entry_key TEXT NOT NULL REFERENCES words(entry_key),
             raw_text TEXT NOT NULL, final_form TEXT NOT NULL, time INTEGER NOT NULL,
@@ -106,10 +107,11 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        // Non-destructive v1/v2 -> v3. v1 gets the study tables/settings; both old versions then get
-        // the independent user dictionary and the unified study scope. Words, events, notes, mastery,
-        // study states/reviews, due dates, feedback seq and the pending card snapshot are untouched.
-        if (oldVersion !in 1..2 || newVersion != 3) {
+        // Non-destructive v1/v2/v3 -> v4. v1 gets the study tables/settings; v1/v2 then get the
+        // independent user dictionary and the unified study scope; v1–v3 all gain the `favorite`
+        // column with DEFAULT 0. Words, events, notes, mastery, study states/reviews, due dates,
+        // feedback seq and the pending card snapshot are untouched; nothing is dropped or rebuilt.
+        if (oldVersion !in 1..3 || newVersion != 4) {
             error("尚未提供从 $oldVersion 到 $newVersion 的迁移，保留原库而不删除数据")
         }
         if (oldVersion < 2) {
@@ -123,6 +125,11 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
             // the unified round is recorded explicitly instead of pretending the old book still applies.
             db.execSQL("UPDATE study_settings SET selected_book=?", arrayOf(StudyBook.ALL.id))
             db.execSQL("UPDATE study_session SET book=?", arrayOf(StudyBook.ALL.id))
+        }
+        if (oldVersion < 4) {
+            // ADD COLUMN only: every existing row keeps all prior fields and gets the non-favourite
+            // default. The CHECK mirrors a freshly created schema-4 database.
+            db.execSQL("ALTER TABLE words ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0 CHECK (favorite IN (0,1))")
         }
     }
 
@@ -333,6 +340,71 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
         return true
     }
 
+    // ---- Personal vocabulary favourites (生词收藏星标) -------------------------------------------
+
+    /**
+     * Sets or clears one word's personal star. Favourites are a display/collection marker only: this
+     * never writes an event, never changes [LearnedWord.mastered], the query count, notes, study
+     * states/reviews, due dates or the daily goal, and it never collects a dictionary word that was
+     * not already a learning word.
+     *
+     * Only a word that currently has at least one active (non-revoked) query can be starred: the
+     * conditional UPDATE requires that active event to exist in the same statement, so a word whose
+     * queries were all revoked (hidden from the vocabulary list) cannot be revived by starring it,
+     * and a `user_entries`-only headword (no `words` row) is never collected. A stored marker on a
+     * word that later loses all active queries stays raw in `words` but is not an active favourite;
+     * a later real query shows it again exactly as it was left. Whole-word history deletion removes
+     * the row (and the marker) entirely.
+     *
+     * [deletionCredential] must come from the snapshot the star was bound to; a word deleted or fully
+     * restored since then is refused as stale. [admission] and [canCommit] are evaluated immediately
+     * before BEGIN, like every other admitted write. Returns true if and only if a row actually
+     * changed: an idempotent repeat, a rejection, an inactive word and a stale credential all return
+     * false without publishing a change.
+     */
+    fun setFavorite(entryKey: String, favorite: Boolean, deletionCredential: Long,
+                    admission: StudyAdmission? = null,
+                    canCommit: () -> Boolean = { true }): Boolean {
+        if (deletions.isStale(entryKey, deletionCredential)) return false
+        val value = if (favorite) 1 else 0
+        val db = writableDatabase
+        check(!db.inTransaction()) { "学习变更不能嵌套在未提交事务中" }
+        if (!canCommit()) return false
+        if (!admit(admission)) return false
+        var changed = false
+        db.beginTransaction()
+        try {
+            changed = db.update("words", ContentValues().apply { put("favorite", value) },
+                """entry_key=? AND favorite<>? AND EXISTS (
+                       SELECT 1 FROM events e WHERE e.entry_key=words.entry_key AND e.revoked=0)""",
+                arrayOf(entryKey, value.toString())) > 0
+            db.setTransactionSuccessful()
+        } finally { db.endTransaction() }
+        if (changed) changes.publishCommitted()
+        return changed
+    }
+
+    /**
+     * Keys of the words currently shown as favourited in the personal vocabulary list, in the same
+     * recent-first order as [words]. A raw marker on a word with no active query is excluded, exactly
+     * like that word is excluded from the list itself. Read-only; never changes statistics.
+     */
+    fun favoriteKeys(): List<String> = buildList {
+        readableDatabase.rawQuery("""SELECT w.entry_key, MAX(e.time) AS last_at
+            FROM words w JOIN events e ON e.entry_key=w.entry_key AND e.revoked=0
+            WHERE w.favorite=1 GROUP BY w.entry_key ORDER BY last_at DESC, w.headword""", null).use { c ->
+            while (c.moveToNext()) add(c.text("entry_key"))
+        }
+    }
+
+    /** Number of active learning words shown as favourited (same predicate as [favoriteKeys]). */
+    fun favoriteCount(): Int =
+        readableDatabase.rawQuery("""SELECT COUNT(DISTINCT w.entry_key)
+            FROM words w JOIN events e ON e.entry_key=w.entry_key AND e.revoked=0
+            WHERE w.favorite=1""", null).use { c ->
+            if (c.moveToFirst()) c.getInt(0) else 0
+        }
+
     /**
      * Deletes one word's whole personal history: every event (revoked included), the words row with
      * its note/mastery, and this key's study state, feedback and any pending card, in a single
@@ -347,8 +419,10 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
      * behavior (`null`/`{ true }` are always admitted). When supplied, they are evaluated immediately
      * before BEGIN, following the same semantics as every other admitted write; a refusal returns
      * [DeleteOutcome.REJECTED] without opening a transaction. Only this key's learning rows are
-     * deleted: the independent `user_entries` row, the original dictionary asset, other words and
-     * exported PDFs are untouched, exactly as before.
+     * deleted, including its `favorite` marker because the whole `words` row goes away: the
+     * independent `user_entries` row, the original dictionary asset, other words and exported PDFs
+     * are untouched, exactly as before. A single revoke or a cleared star never uses this path and
+     * therefore never removes learning data.
      */
     fun deleteWord(entryKey: String, deletionCredential: Long,
                    admission: StudyAdmission? = null,
@@ -392,9 +466,10 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
         db.beginTransactionNonExclusive()
         try {
             val words = ArrayList<BackupWord>()
-            db.rawQuery("SELECT entry_key, headword, pos, meaning, source, version, mastered, note FROM words ORDER BY entry_key", null).use { c ->
+            db.rawQuery("SELECT entry_key, headword, pos, meaning, source, version, mastered, note, favorite FROM words ORDER BY entry_key", null).use { c ->
                 while (c.moveToNext()) words += BackupWord(c.text("entry_key"), c.text("headword"), c.text("pos"),
-                    c.text("meaning"), c.text("source"), c.text("version"), c.int("mastered") == 1, c.text("note"))
+                    c.text("meaning"), c.text("source"), c.text("version"), c.int("mastered") == 1, c.text("note"),
+                    c.int("favorite") == 1)
             }
             val events = ArrayList<BackupEvent>()
             db.rawQuery("SELECT id, entry_key, raw_text, final_form, time, revoked FROM events ORDER BY time, id", null).use { c ->
@@ -423,7 +498,7 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
                     it.dayKey, it.createdAt)
             }
             // Stored independently of `words`, so a new headword saved without any query event is still
-            // part of the full v3 backup.
+            // part of the full v4 backup.
             val userEntries = readUserEntries(db).map {
                 BackupUserEntry(it.entryKey, it.partOfSpeech, it.meaning, it.updatedAt)
             }
@@ -461,6 +536,9 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
                     put("entry_key", word.entryKey); put("headword", word.headword); put("pos", word.partOfSpeech)
                     put("meaning", word.meaning); put("source", word.source); put("version", word.version)
                     put("mastered", if (word.mastered) 1 else 0); put("note", word.note)
+                    // v1–v3 payloads decode every word with favorite=false, so restoring an old file
+                    // intentionally clears the current local stars; a v4 file restores them exactly.
+                    put("favorite", if (word.favorite) 1 else 0)
                 })
             }
             data.userEntries.forEach { user ->
@@ -1087,7 +1165,8 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
                 val word = LearnedWord(
                     PersonalDictionary.merge(original, users[key]) ?: original,
                     c.text("source"), c.text("version"), c.text("last_form"), c.int("query_count"),
-                    c.long("first_at"), c.long("last_at"), c.int("mastered") == 1, c.text("note")
+                    c.long("first_at"), c.long("last_at"), c.int("mastered") == 1, c.text("note"),
+                    c.int("favorite") == 1
                 )
                 if (search.isBlank() || listOf(word.entry.headword, word.entry.meaning, word.lastForm, word.note)
                         .any { it.contains(search.trim(), ignoreCase = true) }) words += word

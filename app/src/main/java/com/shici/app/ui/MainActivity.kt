@@ -67,6 +67,9 @@ class MainActivity : Activity() {
     private enum class MainPage(val label: String, val legacyTab: Int) {
         HOME("首页", 0),
         LOOKUP("查词", -1),
+        // Stable identity only: the historical tab indices below are untouched, and LOOKUP,
+        // TRANSLATION and PERSONAL_ENTRY never borrow a legacy index.
+        TRANSLATION("译句", -1),
         VOCABULARY("生词本", 1),
         STUDY("背词", 4),
         STATISTICS("统计", 2),
@@ -74,7 +77,9 @@ class MainActivity : Activity() {
         SETTINGS("设置", 3);
 
         companion object {
-            val mainPages = listOf(HOME, LOOKUP, VOCABULARY, STUDY, STATISTICS, PERSONAL_ENTRY)
+            val mainPages = listOf(
+                HOME, LOOKUP, TRANSLATION, VOCABULARY, STUDY, STATISTICS, PERSONAL_ENTRY
+            )
             fun fromLegacyTab(tab: Int): MainPage = when (tab) {
                 0 -> HOME
                 1 -> VOCABULARY
@@ -92,7 +97,32 @@ class MainActivity : Activity() {
     private val main = Handler(Looper.getMainLooper())
     private lateinit var root: LinearLayout
     private lateinit var body: LinearLayout
-    private var page = MainPage.HOME
+    @Volatile private var page = MainPage.HOME
+    // True while this Activity is started. Favorite writes are admitted on the worker thread and use
+    // this plus [interactionEpoch] to refuse a mutation queued by a page that has since stopped or
+    // navigated away. A background snapshot refresh never changes either value.
+    @Volatile private var foreground = false
+    @Volatile private var interactionEpoch = 0L
+    // Vocabulary page filter/selection. They live in fields (not in rebuilt views) so an ordinary
+    // snapshot refresh or a split-detail rebuild keeps the user's search, filter, checks and detail.
+    private var onlyFavorites = false
+    private val exportSelection = linkedSetOf<String>()
+    // Export scope intent, kept together with [exportSelection] across refreshes, search/favorite
+    // filters, navigation and rotation. `false` is the untouched default: no checkbox has ever been
+    // edited for this page, so the export means "everything surviving the current filter"
+    // (`selectedKeys = null`). Once the user checks, unchecks, selects all or clears, this becomes
+    // `true` and [exportSelection] is the explicit allow-list: an empty set is an explicit zero and
+    // must never fall back to "all". Only the visible "use all current results" action resets it.
+    private var exportSelectionExplicit = false
+    private var favoriteFilterView: FavoriteFilterView? = null
+    // Translation page draft and the single owner of its ML Kit session. The draft survives page
+    // switches and rotation; the translator itself is closed on leave/stop/destroy and is recreated
+    // only when the page is entered again (which performs a local model check, never a download).
+    private var translationInput = ""
+    private var translationSelectionStart = 0
+    private var translationSelectionEnd = 0
+    private var translationScreen: TranslationScreen? = null
+    private var translationNeedsResume = false
     // Legacy mirror only: old instrumented hosts set this field and call render(), and old saved
     // state used it. Product navigation never derives identity from this index; [page] is authoritative.
     private var currentTab = 0
@@ -170,8 +200,8 @@ class MainActivity : Activity() {
     private var cleaningLostExport = false
     private var exportDialog: AlertDialog? = null
     private var exportButton: Button? = null
-    private var inlineDetail: WordDetailBinding? = null
-    private var dialogDetail: WordDetailBinding? = null
+    @Volatile private var inlineDetail: WordDetailBinding? = null
+    @Volatile private var dialogDetail: WordDetailBinding? = null
     // A save/revoke/delete in the open detail is in flight; every detail control is frozen, and a
     // rebuilt view or a late refresh must not re-enable a button for the duration.
     private var detailBusy = false
@@ -195,6 +225,7 @@ class MainActivity : Activity() {
     private var floatingText: TextView? = null
     private var syncSwitch = false
     private var searchList: LinearLayout? = null
+    private var wordListHeader: TextView? = null
     private var detailPanel: LinearLayout? = null
     private val manualGate = QueryGate()
     // One cross-thread admission lease per open supplement editor. A lease is closed by its own
@@ -304,6 +335,35 @@ class MainActivity : Activity() {
         lookupQuery = savedInstanceState?.getString("lookup_query") ?: ""
         lookupSelectionStart = savedInstanceState?.getInt("lookup_sel_start", lookupQuery.length) ?: lookupQuery.length
         lookupSelectionEnd = savedInstanceState?.getInt("lookup_sel_end", lookupSelectionStart) ?: lookupSelectionStart
+        translationInput = savedInstanceState?.getString("translation_draft") ?: ""
+        translationSelectionStart = savedInstanceState?.getInt(
+            "translation_sel_start", translationInput.length
+        ) ?: translationInput.length
+        translationSelectionEnd = savedInstanceState?.getInt(
+            "translation_sel_end", translationSelectionStart
+        ) ?: translationSelectionStart
+        if (translationSelectionStart > translationSelectionEnd) {
+            val swap = translationSelectionStart
+            translationSelectionStart = translationSelectionEnd
+            translationSelectionEnd = swap
+        }
+        translationSelectionStart = translationSelectionStart.coerceIn(0, translationInput.length)
+        translationSelectionEnd = translationSelectionEnd.coerceIn(
+            translationSelectionStart, translationInput.length
+        )
+        onlyFavorites = savedInstanceState?.getBoolean("favorites_only", false) ?: false
+        savedInstanceState?.getStringArrayList("export_selection")?.let { exportSelection.addAll(it) }
+        // Old bundles carried no intent flag: a restored non-empty list was the historical explicit
+        // allow-list, while a restored empty list meant the default "current filter" scope. New
+        // bundles carry the flag explicitly, so an intentionally emptied selection restores as an
+        // explicit zero instead of silently turning back into "all".
+        exportSelectionExplicit = savedInstanceState?.let { state ->
+            if (state.containsKey("export_selection_explicit")) {
+                state.getBoolean("export_selection_explicit", false)
+            } else {
+                exportSelection.isNotEmpty()
+            }
+        } ?: false
         personalHeadword = savedInstanceState?.getString("pe_headword") ?: ""
         if (page == MainPage.PERSONAL_ENTRY) {
             val hasDraft = savedInstanceState?.getBoolean("pe_has_draft", false) == true
@@ -334,6 +394,7 @@ class MainActivity : Activity() {
     }
     override fun onStart() {
         super.onStart()
+        foreground = true
         refreshGate.start()
         CaptureStatus.observe(statusListener)
         app.repository.changes.observe(dataListener)
@@ -346,10 +407,25 @@ class MainActivity : Activity() {
             else "离开时的编辑身份已关闭。请重新读取当前词义后再继续。"
             render()
         }
+        // A stopped translation page was detached and its ML Kit owner closed. Rebuild it from the
+        // retained draft with a fresh owner; opening it only checks the local model state and never
+        // starts a translation or a model download by itself.
+        if (page == MainPage.TRANSLATION && translationNeedsResume) {
+            translationNeedsResume = false
+            render()
+        }
         refresh()
         loadDictionaryStatus()
     }
     override fun onStop() {
+        // Refuse every favorite mutation that was queued by a surface that is no longer in front.
+        foreground = false
+        interactionEpoch++
+        // Retain the visible draft, then release the ML Kit owner. The next onStart rebuilds the page
+        // with a fresh owner only on the local model check, never an automatic translation/download.
+        captureTranslationDraft()
+        closeTranslationOwner()
+        translationNeedsResume = page == MainPage.TRANSLATION
         manualGate.next()
         // A scoped delete or card-to-page hand-off that has not reached its transaction yet must not
         // pop a writable surface after this Activity is no longer in front.
@@ -373,6 +449,12 @@ class MainActivity : Activity() {
         super.onStop()
     }
     override fun onDestroy() {
+        foreground = false
+        interactionEpoch++
+        // Idempotent: also covers a destroy that never received onStop. The translator, its pending
+        // callbacks and the async result window are all retired before this Activity is gone.
+        captureTranslationDraft()
+        closeTranslationOwner()
         refreshGate.stop(); exportSession.clear(); manualGate.next()
         backupExportSession.clear(); restoreSession.clear()
         personalGate.next(); personalOpenGate.next()
@@ -407,6 +489,15 @@ class MainActivity : Activity() {
         outState.putString("lookup_query", lookupQuery)
         outState.putInt("lookup_sel_start", lookupSelectionStart)
         outState.putInt("lookup_sel_end", lookupSelectionEnd)
+        captureTranslationDraft()
+        outState.putString("translation_draft", translationInput)
+        outState.putInt("translation_sel_start", translationSelectionStart)
+        outState.putInt("translation_sel_end", translationSelectionEnd)
+        outState.putBoolean("favorites_only", onlyFavorites)
+        outState.putStringArrayList("export_selection", ArrayList(exportSelection))
+        // The intent is part of the selection identity: an explicit empty selection is 0 words, not
+        // the default "all". Old readers without this key keep their historical interpretation.
+        outState.putBoolean("export_selection_explicit", exportSelectionExplicit)
         outState.putString("pe_headword", personalHeadword)
         val draft = personalDraft ?: personalRestoredDraft ?: personalDraftConfirm?.draft
         if (page == MainPage.PERSONAL_ENTRY && draft != null) {
@@ -473,12 +564,18 @@ class MainActivity : Activity() {
 
     private fun selectPage(target: MainPage) {
         if (target == page) { renderNavState(); return }
-        // Leaving the current page retires any uncommitted scoped delete or card hand-off. This is
-        // an explicit navigation event, so it may close those surfaces; later deliveries compare
-        // their own owner and stay no-ops.
+        // A new page retires mutations (for example a favorite write) queued by the old page.
+        interactionEpoch++
         closeDeleteFlow()
         cancelPendingPersonalHandoff()
         captureLookupDraft()
+        captureTranslationDraft()
+        // Leaving the translation page releases its translator; the draft fields stay for the next
+        // explicit visit. A re-entry creates a new owner and performs only a local state check.
+        if (page == MainPage.TRANSLATION) {
+            closeTranslationOwner()
+            translationNeedsResume = false
+        }
         // Leaving the lookup page retires any in-flight manual query so a late result cannot open a
         // writable card over another page.
         if (page == MainPage.LOOKUP) manualGate.next()
@@ -510,7 +607,9 @@ class MainActivity : Activity() {
                         MainPage.VOCABULARY -> { renderWords(preserveDetail = true); updateExportButton() }
                         // Never rebuild a page that holds live input / an editor owner on an ordinary
                         // background refresh. Leaving the page is the only path that invalidates them.
-                        MainPage.LOOKUP, MainPage.PERSONAL_ENTRY, MainPage.SETTINGS -> Unit
+                        // TRANSLATION owns an ML Kit session and a draft; it is deliberately excluded.
+                        MainPage.LOOKUP, MainPage.TRANSLATION, MainPage.PERSONAL_ENTRY,
+                        MainPage.SETTINGS -> Unit
                         else -> render()
                     }
                 }.onFailure { toast("读取失败：${it.message}") }
@@ -541,15 +640,20 @@ class MainActivity : Activity() {
         // PERSONAL_ENTRY use -1). It is not the page identity.
         if (currentTab != page.legacyTab && currentTab in 0..4) page = MainPage.fromLegacyTab(currentTab)
         if (currentTab != page.legacyTab) currentTab = page.legacyTab
+        // A rebuild never leaves an old translator alive behind detached views. Except for the
+        // translation page itself (rebuilt immediately below), this is the page-leave path.
+        if (translationScreen != null) { captureTranslationDraft(); closeTranslationOwner() }
         floatingSwitch = null; floatingText = null; stopCaptureButton = null; searchList = null; detailPanel = null
+        wordListHeader = null
         exportButton = null; inlineDetail = null; dictionaryStatusView = null
         backupExportButton = null; restoreButton = null; backupStatusView = null
-        lookupInputView = null; personalStatusView = null
+        lookupInputView = null; personalStatusView = null; favoriteFilterView = null
         body.removeAllViews()
         renderNavState()
         when (page) {
             MainPage.HOME -> home()
             MainPage.LOOKUP -> lookupPage()
+            MainPage.TRANSLATION -> translationPage()
             MainPage.VOCABULARY -> vocabulary()
             MainPage.STUDY -> study()
             MainPage.STATISTICS -> statistics()
@@ -590,6 +694,8 @@ class MainActivity : Activity() {
         content.addView(text("主要功能", 22f, bold = true)); content.space(8)
         content.addView(entryCard("查词", "日常输入查询；缺词可新增词义，已有词可补充个人释义。") { selectPage(MainPage.LOOKUP) })
         content.space(8)
+        content.addView(entryCard("译句", "输入英文句子，用本机离线模型整句翻译；不查词、不收录、不上传原文。") { selectPage(MainPage.TRANSLATION) })
+        content.space(8)
         content.addView(entryCard("添加/补词", "只维护本机个人词性/释义，不产生查询次数、生词或复习记录。") { selectPage(MainPage.PERSONAL_ENTRY) })
         content.space(8)
         content.addView(entryCard("生词本", "查看和管理已经真实查询收录的个人生词。") { selectPage(MainPage.VOCABULARY) })
@@ -622,6 +728,30 @@ class MainActivity : Activity() {
         content.addView(header); content.space(16)
         val input = inputField("搜索单词、释义或笔记", true).apply { setText(search) }
         content.addView(input); content.space(16)
+        // Product filter for the same snapshot the list/export read. The widget itself never touches
+        // the repository; it only selects which rows this page shows. Star/unstar never deletes data.
+        favoriteFilterView = FavoriteFilterView(this).apply {
+            setOnlyFavorites(this@MainActivity.onlyFavorites, notify = false)
+            onFilterChanged = { value ->
+                this@MainActivity.onlyFavorites = value
+                renderWords(preserveDetail = true)
+                updateExportButton()
+            }
+        }
+        content.addView(favoriteFilterView); content.space(8)
+        val selectionRow = row().apply { gravity = Gravity.CENTER_VERTICAL }
+        selectionRow.addView(button("全选当前结果") { selectAllFilteredForExport() },
+            LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(8) })
+        selectionRow.addView(button("清空勾选") { clearExportSelection() },
+            LinearLayout.LayoutParams(0, -2, 1f))
+        content.addView(selectionRow); content.space(8)
+        // The only explicit way back to the default scope. Clearing the checks is a deliberate zero
+        // and never doubles as "all", so this separate action must stay visible to the user.
+        content.addView(button("使用当前结果全部（不勾选）") { useAllFilteredForExport() },
+            LinearLayout.LayoutParams(-1, -2))
+        content.space(8)
+        content.addView(text("勾选只决定 PDF 导出范围，不改词库、查询次数或学习进度。默认（尚未勾选/清空）导出当前筛选全部；一旦勾选、取消或清空，就按你的勾选集合导出，清空即 0 个，不会自动变回全部；点“使用当前结果全部（不勾选）”才回到默认全量。全选只包含当前搜索/仅收藏筛出的词，日期范围仍在导出选项中取交集。", 13f, Paper.secondary))
+        content.space(8)
         searchList = column()
         if (splitContent) {
             val container = row()
@@ -634,25 +764,70 @@ class MainActivity : Activity() {
             override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
             override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
                 search = s.toString(); updateExportButton()
-                renderWords()
+                renderWords(preserveDetail = true)
             }
             override fun afterTextChanged(s: Editable?) {}
         })
         renderWords()
     }
-    private fun filteredWords() = words.filter { word -> search.isBlank() ||
-        listOf(word.entry.headword, word.entry.meaning, word.lastForm, word.note).any { it.contains(search.trim(), true) } }
+    private fun filteredWords() = words.filter { word ->
+        (!onlyFavorites || word.favorite) && (search.isBlank() ||
+            listOf(word.entry.headword, word.entry.meaning, word.lastForm, word.note)
+                .any { it.contains(search.trim(), true) })
+    }
+    /**
+     * The frozen scope for one request. `null` is the untouched default ("all rows of the current
+     * filter"); a set — including an empty one — is the user's explicit allow-list. A defensive copy
+     * is taken here so later checkbox edits cannot rebind a request that already started.
+     */
+    private fun exportScopeKeys(): Set<String>? =
+        if (exportSelectionExplicit) exportSelection.toSet() else null
+
+    /** Rows the current filter would export under the present intent; an explicit set intersects it. */
+    private fun exportScopeCount(list: List<LearnedWord> = filteredWords()): Int =
+        if (exportSelectionExplicit) list.count { it.entry.key in exportSelection } else list.size
+
     private fun updateExportButton() {
-        // Eligibility is checked against a fresh repository read, never against the UI cache.
-        exportButton?.isEnabled = !exportSession.busy && lostExportRequestCode < 0 && !cleaningLostExport
+        // Eligibility is checked against a fresh repository read, never against the UI cache. An
+        // empty current filter, an intentionally emptied selection (explicit zero), a busy session
+        // or a lost SAF request can never start a new picker.
+        exportButton?.isEnabled = !exportSession.busy && lostExportRequestCode < 0 &&
+            !cleaningLostExport && exportScopeCount() > 0
+    }
+    private fun selectAllFilteredForExport() {
+        // An explicit "all of this filter" intent, remembered as the current keys: exactly the rows
+        // currently surviving search + "仅收藏". Hidden words are never added, and a later narrower
+        // filter or deletion intersects this list instead of widening it back to everything.
+        exportSelection.clear()
+        exportSelection.addAll(filteredWords().map { it.entry.key })
+        exportSelectionExplicit = true
+        renderWords(preserveDetail = true)
+        updateExportButton()
+    }
+    private fun clearExportSelection() {
+        // Clearing is itself an explicit choice: zero words, never an implicit "all".
+        exportSelection.clear()
+        exportSelectionExplicit = true
+        renderWords(preserveDetail = true)
+        updateExportButton()
+    }
+    private fun useAllFilteredForExport() {
+        // The only supported way back to the default scope, so an emptied selection can never be
+        // mistaken for "all". This is a visible user action, not a side effect of clearing.
+        exportSelection.clear()
+        exportSelectionExplicit = false
+        renderWords(preserveDetail = true)
+        updateExportButton()
     }
     private fun renderWords(preserveDetail: Boolean = false) {
         val list = filteredWords()
         searchList?.removeAllViews()
-        searchList?.addView(text("${list.size} 个词 · 最近查询优先", 14f, Paper.secondary))
+        val summary = listSummary(list)
+        wordListHeader = text(summary, 14f, Paper.secondary)
+        searchList?.addView(wordListHeader)
         if (list.isEmpty()) searchList?.addView(text(if (words.isEmpty()) "还没有生词。成功查询后会自动收录。" else "没有匹配的生词。", 18f))
         list.forEach { word ->
-            searchList?.addView(wordRow(word) {
+            searchList?.addView(vocabularyRow(word) {
                 selectedKey = word.entry.key
                 if (splitContent) renderWords() else showWordDialog(word)
             }.apply {
@@ -676,6 +851,55 @@ class MainActivity : Activity() {
                 val card = panel(); detail.addView(card); inlineDetail = wordDetail(card, selected, wordsCredential, wordsVersion)
             }
         }
+    }
+    private fun listSummary(list: List<LearnedWord>): String {
+        val filters = buildList {
+            if (search.isNotBlank()) add("搜索“${search.trim()}”")
+            if (onlyFavorites) add("仅收藏")
+        }
+        val count = if (filters.isEmpty()) "${list.size} 个词"
+        else "筛选结果 ${list.size} 个词（${filters.joinToString(" · ")}）"
+        val scope = when {
+            !exportSelectionExplicit -> "导出范围：当前筛选全部（${list.size} 个）"
+            exportSelection.isEmpty() -> "已清空勾选：导出 0 个（不会回退为全部）"
+            else -> {
+                val inFilter = list.count { it.entry.key in exportSelection }
+                "已勾选 ${exportSelection.size} 个（当前筛选内 $inFilter 个；与搜索/仅收藏/日期取交集）"
+            }
+        }
+        return "$count · 最近查询优先 · $scope"
+    }
+    private fun refreshListSummary() { wordListHeader?.text = listSummary(filteredWords()) }
+    /**
+     * One vocabulary row: an export checkbox, the original clickable word content and a star. The
+     * checkbox only edits the in-memory export allow-list (never the database); the star sends one
+     * frozen key/target/credential to the real repository through the existing worker.
+     */
+    private fun vocabularyRow(word: LearnedWord, action: () -> Unit): View {
+        val container = row().apply { gravity = Gravity.CENTER_VERTICAL; minimumHeight = dp(72) }
+        val check = CheckBox(this).apply {
+            isChecked = word.entry.key in exportSelection
+            contentDescription = "勾选导出 ${word.entry.headword}"
+            setOnCheckedChangeListener { _, checked ->
+                // Any real checkbox edit switches the page into the explicit allow-list intent, so
+                // unchecking the last row keeps an explicit 0 instead of reverting to "all".
+                exportSelectionExplicit = true
+                if (checked) exportSelection += word.entry.key else exportSelection -= word.entry.key
+                refreshListSummary()
+                updateExportButton()
+            }
+        }
+        container.addView(check)
+        container.addView(wordRow(word, action), LinearLayout.LayoutParams(0, -2, 1f))
+        val star = button(if (word.favorite) "★" else "☆") { toggleListFavorite(word) }.apply {
+            textSize = 22f
+            minWidth = dp(48)
+            contentDescription =
+                if (word.favorite) "取消收藏 ${word.entry.headword}" else "收藏 ${word.entry.headword}"
+            setTextColor(if (word.favorite) Paper.warning else Paper.green)
+        }
+        container.addView(star)
+        return container
     }
     /**
      * Daily lookup lives on its own page. The input only ever feeds the existing [manualLookup]
@@ -714,6 +938,43 @@ class MainActivity : Activity() {
         val end = view.selectionEnd.coerceAtLeast(0)
         lookupSelectionStart = minOf(start, end).coerceIn(0, lookupQuery.length)
         lookupSelectionEnd = maxOf(start, end).coerceIn(lookupSelectionStart, lookupQuery.length)
+    }
+
+    // ---- Translation page -----------------------------------------------------------------------
+
+    /**
+     * A real embedded [TranslationScreen], not a sample. Its draft is restored from [translationInput]
+     * and its selection from the saved caret pair. The component itself starts only a local model
+     * state query; translation happens exclusively on the user's "翻译整句" tap and a model download
+     * only on the explicit Wi-Fi confirmation. Leaving/stop/destroy closes this owner, and the page
+     * is excluded from background re-rendering so an old asynchronous result cannot paint a new page.
+     */
+    private fun translationPage() {
+        val screen = TranslationScreen(
+            this,
+            initialText = translationInput,
+            initialSelectionStart = translationSelectionStart,
+            initialSelectionEnd = translationSelectionEnd
+        )
+        screen.onCloseRequested = { selectPage(MainPage.HOME) }
+        translationScreen = screen
+        body.addView(screen.view, LinearLayout.LayoutParams(-1, -1))
+    }
+
+    /** Retains the visible translation draft before its owner is closed. */
+    private fun captureTranslationDraft() {
+        val screen = translationScreen ?: return
+        val draft = screen.draft()
+        translationInput = draft.text
+        translationSelectionStart = draft.selectionStart
+        translationSelectionEnd = draft.selectionEnd
+    }
+
+    /** Single teardown path for the Activity-owned translator. Idempotent; the view is host-owned. */
+    private fun closeTranslationOwner() {
+        val screen = translationScreen ?: return
+        translationScreen = null
+        screen.close()
     }
 
     // ---- Personal-entry page --------------------------------------------------------------------
@@ -1120,17 +1381,20 @@ class MainActivity : Activity() {
     private class WordDetailBinding(
         val key: String, val deletionCredential: Long, val snapshotVersion: Long,
         private val save: Button, private val undo: Button, private val delete: Button,
-        private val mastery: Switch, private val note: EditText,
+        private val star: Button, private val mastery: Switch, private val note: EditText,
         private val form: TextView, private val count: TextView, private val dates: TextView,
         private val definition: TextView, private val source: TextView, private val sourceBadge: TextView,
         private val mutationAllowed: () -> Boolean,
         private val stale: () -> Boolean,
         private val onClose: (() -> Unit)?,
-        private var savedMastered: Boolean, private var savedNote: String
+        private var savedMastered: Boolean, private var savedNote: String,
+        private var savedFavorite: Boolean
     ) {
         private var busy = false
         private var confirming = false
-        private var invalidated = false
+        private var favoriteBusy = false
+        @Volatile private var invalidated = false
+        @Volatile private var closed = false
         private var wordPresent = true
 
         fun update(word: LearnedWord?) {
@@ -1159,17 +1423,27 @@ class MainActivity : Activity() {
                 if (note.text.toString() == savedNote && savedNote != word.note) note.setText(word.note)
                 if (mastery.isChecked == savedMastered) mastery.isChecked = word.mastered
                 savedNote = word.note; savedMastered = word.mastered
+                savedFavorite = word.favorite
+                renderStar()
             }
             applyEnabled()
         }
 
         fun isBusy() = busy || confirming
         fun isStale() = stale()
-        fun dismiss() { onClose?.invoke() }
+        fun isClosed() = closed
+        fun isInvalidated() = invalidated
+        fun ownerAlive() = !closed && !invalidated
+        fun dismiss() { closed = true; onClose?.invoke() }
         fun beginConfirm() { confirming = true; applyEnabled() }
         fun cancelConfirm() { confirming = false; applyEnabled() }
         fun beginBusy() { busy = true; applyEnabled() }
         fun endBusy() { busy = false; confirming = false; applyEnabled() }
+        fun favoriteValue() = savedFavorite
+        /** Applies a committed star value without waiting for the refresh round-trip. */
+        fun setFavoriteState(value: Boolean) { savedFavorite = value; renderStar(); applyEnabled() }
+        fun beginFavoriteBusy() { favoriteBusy = true; applyEnabled() }
+        fun endFavoriteBusy() { favoriteBusy = false; applyEnabled() }
         // Re-applies the control state after the shared mutation flag changed, still honoring this
         // binding's own busy/confirming/invalidated state (so a frozen or invalidated card stays frozen).
         fun refreshEnabled() = applyEnabled()
@@ -1177,18 +1451,27 @@ class MainActivity : Activity() {
             invalidated = true
             busy = true; confirming = true
             save.isEnabled = false; undo.isEnabled = false; delete.isEnabled = false
+            star.isEnabled = false
             mastery.isEnabled = false; note.isEnabled = false
         }
         fun masteredValue() = mastery.isChecked
         fun noteValue() = note.text.toString()
 
+        private fun renderStar() {
+            star.text = if (savedFavorite) "★ 已收藏（点击取消）" else "☆ 收藏"
+            star.contentDescription =
+                if (savedFavorite) "取消收藏 $key" else "收藏 $key"
+            star.setTextColor(if (savedFavorite) Paper.warning else Paper.green)
+        }
+
         private fun applyEnabled() {
             // The binding's own key/original credential participates too: a stale or invalidated
             // detail can never be re-enabled by endBusy, update or a shared-busy release.
-            val active = !invalidated && !stale() && !busy && !confirming && mutationAllowed()
+            val active = !invalidated && !closed && !stale() && !busy && !confirming && mutationAllowed()
             save.isEnabled = active
             undo.isEnabled = active && wordPresent
             delete.isEnabled = active
+            star.isEnabled = active && wordPresent && !favoriteBusy
             mastery.isEnabled = active
             note.isEnabled = active
         }
@@ -1244,16 +1527,21 @@ class MainActivity : Activity() {
         content.addView(pair(save, undo, inlineAt(detailWidth - 48), 8)); content.space(8)
         content.addView(text("撤销只影响最近一次成功查询；之前的查询与已保存的笔记保留。", 16f, Paper.secondary))
         content.space(8)
+        val star = button(if (word.favorite) "★ 已收藏（点击取消）" else "☆ 收藏") {}
+        content.addView(star); content.space(8)
+        content.addView(text("星标只是个人收藏标记；取消星标不会删除任何学习记录，也不改掌握状态、查询次数或复习进度。", 16f, Paper.secondary))
+        content.space(8)
         val delete = button("移除学习记录…") {}
         delete.setTextColor(Paper.error)
         content.addView(delete)
         content.space(8)
-        content.addView(text("先选择范围：可以只撤销最近一次查询；或另行确认删除该词的全部学习记录（含已撤销查询、个人笔记、掌握状态与复习进度），删除后无法恢复。原始词库、独立本机词义、其他生词与已导出 PDF 均不受影响。", 16f, Paper.secondary))
-        val binding = WordDetailBinding(word.entry.key, deletionCredential, snapshotVersion, save, undo, delete, mastered, note,
+        content.addView(text("先选择范围：可以只撤销最近一次查询；或另行确认删除该词的全部学习记录（含已撤销查询、个人笔记、掌握状态、复习进度与收藏星标），删除后无法恢复。原始词库、独立本机词义、其他生词与已导出 PDF 均不受影响。", 16f, Paper.secondary))
+        val binding = WordDetailBinding(word.entry.key, deletionCredential, snapshotVersion, save, undo, delete, star, mastered, note,
             form, count, dates, definition, source, sourceBadge, { !detailBusy },
             { app.repository.deletions.isStale(word.entry.key, deletionCredential) }, close,
-            word.mastered, word.note)
+            word.mastered, word.note, word.favorite)
         save.setOnClickListener { saveDetail(binding, word, close) }
+        star.setOnClickListener { toggleDetailFavorite(binding) }
         // The shortcut stays exact-event-only: it prepares the latest event under this binding's
         // original credential and confirms that one event, never the dangerous full-history scope.
         // The remove entry opens the scope chooser, which never deletes by itself and still needs a
@@ -1263,6 +1551,107 @@ class MainActivity : Activity() {
         binding.update(word)
         return binding
     }
+    /**
+     * Owner check for a star commit. It is evaluated on the worker thread immediately before BEGIN
+     * (through both [StudyAdmission] and `canCommit`), so a detail closed by navigation/stop, or a
+     * word deleted/restored after the click, can never write. Nothing here re-captures a credential.
+     */
+    private fun favoriteOwnerLive(binding: WordDetailBinding, epoch: Long): Boolean =
+        foreground && epoch == interactionEpoch && !isFinishing && !isDestroyed &&
+            binding.ownerAlive() && !binding.isStale() &&
+            (inlineDetail === binding || dialogDetail === binding)
+
+    /**
+     * Stars/unstars exactly the frozen key with the detail's original credential and the target
+     * chosen at click time. A repeated click cannot retire the first valid write: the button is
+     * disabled while in flight and an idempotent repeat returns false without a false success.
+     */
+    private fun toggleDetailFavorite(binding: WordDetailBinding) {
+        if (binding.isBusy() || binding.isClosed() || binding.isInvalidated()) return
+        if (binding.isStale()) {
+            binding.invalidate()
+            toast("该词已删除或数据已恢复，请刷新后重新打开详情再操作")
+            return
+        }
+        val epoch = interactionEpoch
+        val key = binding.key
+        val credential = binding.deletionCredential
+        val target = !binding.favoriteValue()
+        val live = { favoriteOwnerLive(binding, epoch) }
+        val admission = StudyAdmission(live)
+        binding.beginFavoriteBusy()
+        app.worker.execute {
+            val result = runCatching {
+                app.repository.setFavorite(key, target, credential,
+                    admission = admission, canCommit = live)
+            }
+            main.post {
+                if (isDestroyed) return@post
+                binding.endFavoriteBusy()
+                if (!live()) {
+                    // Closed/stopped page or a newer deletion/restore: never report success. If this
+                    // card is still visible, freeze its now-stale controls.
+                    if (binding.isStale() && (inlineDetail === binding || dialogDetail === binding)) {
+                        binding.invalidate()
+                        toast("未变更：该词已删除或数据已恢复")
+                    }
+                    return@post
+                }
+                result.onSuccess { changed ->
+                    if (changed) {
+                        binding.setFavoriteState(target)
+                        toast(if (target) "已收藏" else "已取消收藏")
+                        // Re-read the same snapshot so the row order/filter and every other view of
+                        // this word agree; the repository already committed the frozen write.
+                        refresh()
+                    } else {
+                        toast("收藏状态已是目标值，未重复写入")
+                    }
+                }.onFailure { toast("收藏操作失败：${it.message}") }
+            }
+        }
+    }
+
+    /**
+     * List-row star. The row carries the key and target from the snapshot it rendered, and the
+     * credential of the list's [words] snapshot; neither is refreshed in the worker. A page change,
+     * stop, deletion or full restore refuses the write before BEGIN.
+     */
+    private fun toggleListFavorite(word: LearnedWord) {
+        if (page != MainPage.VOCABULARY || !foreground || isFinishing || isDestroyed) return
+        val epoch = interactionEpoch
+        val key = word.entry.key
+        val credential = wordsCredential
+        val target = !word.favorite
+        val live = {
+            foreground && epoch == interactionEpoch && page == MainPage.VOCABULARY &&
+                !isFinishing && !isDestroyed && !app.repository.deletions.isStale(key, credential)
+        }
+        val admission = StudyAdmission(live)
+        app.worker.execute {
+            val result = runCatching {
+                app.repository.setFavorite(key, target, credential,
+                    admission = admission, canCommit = live)
+            }
+            main.post {
+                if (isDestroyed) return@post
+                if (!live()) {
+                    if (page == MainPage.VOCABULARY &&
+                        app.repository.deletions.isStale(key, credential)) {
+                        toast("未变更：该词已删除或数据已恢复")
+                    }
+                    return@post
+                }
+                result.onSuccess { changed ->
+                    if (changed) {
+                        toast(if (target) "已收藏" else "已取消收藏")
+                        refresh()
+                    } else toast("收藏状态已是目标值，未重复写入")
+                }.onFailure { toast("收藏操作失败：${it.message}") }
+            }
+        }
+    }
+
     private fun saveDetail(binding: WordDetailBinding, word: LearnedWord, close: (() -> Unit)?) {
         if (binding.isBusy() || detailBusy) return
         val marked = binding.masteredValue()
@@ -1507,6 +1896,19 @@ class MainActivity : Activity() {
             flow.currentDialog = null
             performDeleteAll(flow, word)
         }
+        // The shared scope dialog predates favorites. Its dangerous confirmation must name the
+        // favorite flag too, because this word's star is deleted with the rest of its learning
+        // records (un-starring alone never deletes anything).
+        dialog.setMessage(
+            "将永久删除「${word.entry.headword}」的：\n" +
+                "• 全部查询历史（包括已撤销的）\n" +
+                "• 我的记忆笔记与掌握状态\n" +
+                "• 该词的复习进度、反馈记录和待答卡片\n" +
+                "• 该词的收藏星标（取消星标不会删除任何记录，但整词删除会一并移除）\n\n" +
+                "此操作无法恢复。独立保存的个人词义不会被删除；原始词库、其他生词和已导出的 PDF " +
+                "也不受影响。\n\n" +
+                "如果只想移除最近一次查询，请取消后选择“仅撤销最近一次有效查询”。"
+        )
         // Check again at the actual attach point, after the dialog and its listener exist.
         if (!isLiveDeleteFlow(flow)) return
         flow.currentDialog = dialog
@@ -1764,13 +2166,15 @@ class MainActivity : Activity() {
             addView(stopCaptureButton); space(8)
             addView(text("关闭会释放捕获和浮层，不会撤销系统悬浮窗权限。若需撤销，请在系统设置中操作。", 16f, Paper.secondary)); divider()
             addView(text("数据保存在本机", 18f, bold = true))
-            addView(text("屏幕画面仅在内存中短暂读取并本机识别，不写截图文件、不上传；一笔抬起自动查询，轻点/多指/取消不查询，多个词时选择其中一个词查询（译句未接入）。查询记录、释义快照、个人笔记与掌握状态保存在本机数据库。PDF 写入你选择的位置。", 16f, Paper.secondary))
+            addView(text("屏幕画面仅在内存中短暂读取并本机识别，不写截图文件、不上传；一笔抬起自动查询，轻点/多指/取消不查询，多个词时选择其中一个词查询，也可在多词原文卡中选择“翻译整句”。查询记录、释义快照、个人笔记、收藏与掌握状态保存在本机数据库。PDF 写入你选择的位置。", 16f, Paper.secondary)); divider()
+            addView(text("译句与网络", 18f, bold = true))
+            addView(text("“译句”页的英文由 Google ML Kit 在设备本机翻译，本应用不上传原文或译文、不使用在线翻译或收费服务。首次使用需你明确确认后下载英中离线模型（仅 Wi-Fi，约 30 MB 仅为估计），本应用不会自动下载，也不会自动改用移动数据或云端翻译。ML Kit 可能为更新模型、诊断和统计而与 Google 通信并发送性能/使用指标，因此本应用并非“完全不联网”；清单中的网络权限仅用于该 SDK。设备需支持 Google Play 服务，模型能否下载与译文质量仍需实测。", 16f, Paper.secondary))
         }
         boundaries.addView(privacy); boundaries.space(16)
         val limits = panel().apply {
             addView(text("原型限制", 20f, bold = true)); space(8)
-            addView(text("当前 PDF 仅支持搜索结果的 A4 记忆版。正式词典、发音、例句、自测版与日期筛选尚未实现；本地备份仅为完整覆盖恢复，不提供合并或云同步。", 16f, Paper.secondary))
-            divider(); addView(text("尚未真机验证速度、断网初装 OCR、海文兼容性与长时间功耗。", 16f, Paper.warning))
+            addView(text("PDF 导出已接入 A4 复习版与自测版＋答案页；支持按首次收录日期（含首尾）、最近查询/查询次数排序、仅收藏，以及“当前筛选全部”或手动勾选当前结果。导出选项只保存在本次导出中，不是全局设置；PDF 不是备份。正式词典、发音、例句仍未实现；本地备份仅为完整覆盖恢复，不提供合并或云同步。", 16f, Paper.secondary))
+            divider(); addView(text("本轮三功能仅完成代码接线与编译，未运行逻辑测试；未真机验证 PDF 版面/系统文件选择器、收藏交互、备份跨版本恢复、译句模型下载与真实质量，也未验证速度、断网初装 OCR、海文兼容性与长时间功耗。", 16f, Paper.warning))
         }
         boundaries.addView(limits)
         content.addView(pair(library, boundaries, splitContent, 24))
@@ -2335,57 +2739,174 @@ class MainActivity : Activity() {
     }
     private fun export() {
         if (lostExportRequestCode >= 0 || cleaningLostExport) return
+        // An explicitly emptied selection — or one fully excluded by the current filter — is a real
+        // zero scope. Refuse before any session, repository read, SAF picker or file work; it is
+        // never promoted to "all". The visible button is disabled for the same state.
+        if (exportSelectionExplicit && exportScopeCount() == 0) {
+            toast(
+                if (exportSelection.isEmpty())
+                    "已清空勾选（0 个）：请先勾选，或点“使用当前结果全部（不勾选）”"
+                else "当前勾选与筛选没有交集：请调整勾选或筛选"
+            )
+            updateExportButton(); return
+        }
+        // No picker for an empty current filter; the worker re-check below covers a stale cache.
+        if (filteredWords().isEmpty()) { toast("当前筛选没有可导出的生词"); return }
         val request = exportSession.begin(search) ?: return
         updateExportButton()
+        // One local zone and one defensive copy of the UI selection belong to this request. The
+        // repository read below is the only source of words; the UI cache is never exported.
+        val zone = ZoneId.systemDefault()
+        val date = LocalDate.now(zone)
+        val requestedKeys = exportScopeKeys()
+        // Freeze the current "仅收藏" filter with this request; later toggle changes cannot silently
+        // widen or narrow what the confirmation panel first showed.
+        val requestedFavoritesOnly = onlyFavorites
         app.worker.execute {
-            val result = runCatching { app.repository.exportSnapshot(request.search) }
+            val result = runCatching { app.repository.words(request.search) }
             main.post {
                 if (isDestroyed) return@post
-                result.onSuccess { snapshot ->
-                    if (!exportSession.freeze(request, snapshot)) return@onSuccess
-                    if (snapshot.words.isEmpty()) {
-                        exportSession.cancel(request.id); updateExportButton(); toast("没有可导出的生词")
-                    } else confirmExport(request, snapshot)
+                result.onSuccess { loaded ->
+                    if (loaded.isEmpty()) {
+                        exportSession.cancel(request.id); updateExportButton()
+                        toast("没有可导出的生词"); return@onSuccess
+                    }
+                    // Favorites come from the very same returned rows as the words being filtered
+                    // and sorted, so the filter, sort and favorite set cannot disagree.
+                    val favorites = loaded.asSequence().filter { it.favorite }
+                        .map { it.entry.key }.toHashSet()
+                    val initialOptions = ExportOptions(
+                        favoritesOnly = requestedFavoritesOnly,
+                        selectedKeys = requestedKeys,
+                        zone = zone
+                    )
+                    val initial = LearningExportSelection.snapshot(
+                        loaded, request.search, date, initialOptions, favorites
+                    )
+                    if (!exportSession.freeze(request, initial)) return@onSuccess
+                    if (initial.words.isEmpty()) {
+                        exportSession.cancel(request.id); updateExportButton()
+                        toast("当前选择与筛选没有可导出的生词"); return@onSuccess
+                    }
+                    // Pass this request's own frozen selection into the panel. The global list can
+                    // still be edited while the worker reads; it must never rebind this request.
+                    confirmExport(
+                        request, loaded, favorites, date, zone,
+                        requestedFavoritesOnly, requestedKeys
+                    )
                 }.onFailure {
-                    if (exportSession.cancel(request.id)) { updateExportButton(); toast("读取导出数据失败：${it.message}") }
+                    if (exportSession.cancel(request.id)) {
+                        updateExportButton(); toast("读取导出数据失败：${it.message}")
+                    }
                 }
             }
         }
     }
-    private fun confirmExport(request: LearningExportSession.Request, snapshot: LearningExportSnapshot) {
+    private fun confirmExport(
+        request: LearningExportSession.Request,
+        loadedWords: List<LearnedWord>,
+        favorites: Set<String>,
+        date: LocalDate,
+        zone: ZoneId,
+        favoritesOnlyAtRequest: Boolean,
+        selectedKeysAtRequest: Set<String>?
+    ) {
         val content = panel()
         val dialog = paperDialog(content)
-        content.addView(text("导出生词记忆单", 24f, bold = true)); content.space(12)
-        content.addView(text("当前搜索结果 · ${snapshot.words.size} 个单词", 18f))
-        if (snapshot.search.isNotBlank()) content.addView(text("搜索条件：${snapshot.search}", 16f, Paper.secondary))
-        content.addView(text("A4 · 记忆版 · 最近查询优先", 16f, Paper.secondary)); content.space(16)
-        val notice = column().apply {
-            setPadding(dp(16), dp(12), dp(16), dp(12)); background = shape(Paper.background, 8)
-            addView(text(LearningExportText.notice(snapshot.words), 16f, Paper.warning, true))
-            snapshot.words.map { it.source to it.version }.distinct().forEach { (source, version) ->
-                addView(text(RawKajwebDictionary.provenance(source, version), 16f, Paper.secondary))
-            }
-            addView(text("导出包含词头、原始释义、各自来源版本与核对状态、原词形、查询次数、掌握状态和已保存的笔记；不包含自测题。", 16f, Paper.secondary))
+        content.addView(text("导出生词", 24f, bold = true)); content.space(8)
+        content.addView(text("内容已从本机数据库读取为一份内存快照。确认后即使用户再搜索、星标或后台刷新，也不会替换本次已选内容。", 14f, Paper.secondary))
+        content.space(12)
+        // The panel opens with this request's captured selection, not a fresh read of the mutable
+        // list. Later checkbox edits in the vocabulary list cannot rebind an in-flight request;
+        // edits made inside this panel still flow into the refreeze below.
+        val selectedKeysAtOpen = selectedKeysAtRequest
+        val optionsView = ExportOptionsView(this).apply {
+            setFavoritesAvailable(true)
+            setOptions(ExportOptions(
+                favoritesOnly = favoritesOnlyAtRequest,
+                selectedKeys = selectedKeysAtOpen,
+                zone = zone
+            ))
+            setSelectedKeys(selectedKeysAtOpen)
         }
-        content.addView(notice); content.space(12)
-        content.addView(text("已从数据库读取并按本次搜索条件冻结内容；尚未保存的笔记与状态不会导出。取消不会创建导出文件。", 16f, Paper.secondary)); content.space(24)
-        val cancel = button("取消") { dialog.dismiss() }.apply { background = shape(Paper.background, 8); setTextColor(Paper.ink) }
-        val choose = button("选择保存位置", true) {
+        content.addView(optionsView); content.space(12)
+        val summary = text("", 16f); content.addView(summary)
+        content.space(8)
+        content.addView(text("复习版只输出词条与释义；自测版先输出不含释义/笔记的题面，再从新页输出同编号、同顺序的完整答案页。PDF 不是备份，不会改动词库或已导出文件。", 13f, Paper.secondary))
+        content.space(16)
+        val choose: Button = button("选择保存位置", true) {
+            val checked = optionsView.readOptions()
+            val options = checked.options
+            if (options == null) {
+                toast(checked.error ?: "导出选项无效")
+                return@button
+            }
+            // Rebuild from the frozen in-memory rows with the exact validated options (including a
+            // defensive copy of selectedKeys and the local zone). No repository re-read happens now.
+            val frozenSelection = LearningExportSelection.snapshot(
+                loadedWords, request.search, date, options, favorites
+            )
+            if (frozenSelection.words.isEmpty()) {
+                toast("当前选项与筛选没有可导出的生词，未创建文件")
+                return@button
+            }
+            if (!exportSession.refreeze(request, frozenSelection)) {
+                toast("导出已失效，请关闭后重新开始")
+                return@button
+            }
             val frozen = exportSession.choose(request) ?: return@button
             dialog.dismiss()
+            val base = when (frozen.options.mode) {
+                ExportMode.SELF_TEST -> "拾词-生词自测单"
+                ExportMode.REVIEW -> "拾词-生词记忆单"
+            }
             val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE)
-                .setType("application/pdf").putExtra(Intent.EXTRA_TITLE, "拾词-生词记忆单-${frozen.date}.pdf")
+                .setType("application/pdf")
+                .putExtra(Intent.EXTRA_TITLE, "$base-${frozen.date}.pdf")
             runCatching { startActivityForResult(intent, request.id) }.onFailure {
                 exportSession.cancel(request.id); toast("无法打开文件保存：${it.message}")
             }
             updateExportButton()
         }
-        content.addView(pair(cancel, choose, inlineAt(minOf(resources.configuration.screenWidthDp - 32, 560) - 48), 12))
-        showPaperDialog(dialog, 560) {
+        fun updateSummary(validation: ExportOptionsView.Validation) {
+            val options = validation.options
+            if (options == null) {
+                summary.text = "无法导出：${validation.error ?: "选项无效"}"
+                summary.setTextColor(Paper.error)
+                choose.isEnabled = false
+                return
+            }
+            val selected = LearningExportSelection.select(loadedWords, options, favorites)
+            val dates = when {
+                options.from != null && options.to != null ->
+                    "首次收录 ${options.from} 至 ${options.to}（含首尾自然日）"
+                options.from != null -> "首次收录 ${options.from} 起（含当天）"
+                options.to != null -> "首次收录至 ${options.to}（含当天）"
+                else -> "不限首次收录日期"
+            }
+            val mode = if (options.mode == ExportMode.SELF_TEST) "自测版＋答案页" else "复习版"
+            val sort = if (options.sort == ExportSort.QUERY_COUNT) "查询次数优先" else "最近查询优先"
+            val scope = if (options.selectedKeys == null)
+                "当前筛选全部（${loadedWords.size} 个搜索候选${if (options.favoritesOnly) "，仅收藏" else ""}）"
+            else "手动勾选 ${options.selectedKeys.size} 个（与当前筛选/仅收藏/日期取交集）"
+            summary.text = "内容：$mode\n日期：$dates\n排序：$sort\n范围：$scope\n预计导出：${selected.size} 词"
+            summary.setTextColor(if (selected.isEmpty()) Paper.warning else Paper.ink)
+            choose.isEnabled = selected.isNotEmpty()
+        }
+        optionsView.onValidationChanged = { updateSummary(it) }
+        content.addView(pair(
+            button("取消") { dialog.dismiss() }.apply {
+                background = shape(Paper.background, 8); setTextColor(Paper.ink)
+            },
+            choose,
+            inlineAt(minOf(resources.configuration.screenWidthDp - 32, 640) - 48), 12
+        ))
+        showPaperDialog(dialog, 640) {
             if (exportDialog === dialog) exportDialog = null
             if (exportSession.cancelPreparation(request.id)) updateExportButton()
         }
         exportDialog = dialog
+        updateSummary(optionsView.readOptions())
     }
     private fun cleanLostPdf(uri: Uri) {
         cleaningLostExport = true
@@ -2405,7 +2926,7 @@ class MainActivity : Activity() {
         app.worker.execute {
             val error = runCatching {
                 val output = contentResolver.openOutputStream(uri, "wt") ?: error("无法写入所选位置")
-                output.use { PdfExporter.write(snapshot.words, it, snapshot.date) }
+                output.use { PdfExporter.write(snapshot, it) }
             }.exceptionOrNull()
             main.post { if (!isDestroyed && exportSession.cancel(requestCode)) {
                 toast(if (error == null) "PDF 已写入所选位置" else "导出失败：${error.message}；目标文件可能不完整，请删除后重试")
@@ -2513,6 +3034,9 @@ class MainActivity : Activity() {
         content.addView(text("从备份完整恢复", 24f, bold = true)); content.space(12)
         content.addView(text("备份创建时间：${date(backup.createdAt)}", 18f))
         content.addView(text("词条 ${backup.wordCount} 个 · 事件 ${backup.eventCount} 条", 18f))
+        if (backup.hasFavorites) {
+            content.addView(text("收藏星标：${backup.favoriteCount} 个当前列表可见词条（隐藏词上的星标仍会随备份写回）", 18f))
+        }
         if (backup.legacyNoStudyData) {
             content.addView(text("这是旧版格式（v1）备份：只含生词与查询记录，不含背词进度和个人补充词库。", 16f, Paper.warning, true))
             content.addView(text("恢复后背词进度为空、个人补充词库为空，所选范围与每日目标恢复为默认值。", 16f, Paper.warning))
@@ -2524,13 +3048,17 @@ class MainActivity : Activity() {
                 content.addView(text("个人补充词库：${backup.userEntryCount} 个词条（含未产生查询记录的新词头）", 18f))
             }
         }
+        if (backup.noFavorites) {
+            content.addView(text("这是 v1/v2/v3 旧版备份：不含收藏星标。完整恢复会清空当前本机的全部收藏，且不会按同名词条隐式保留；如需保留当前收藏，请先另存当前版本备份。", 16f, Paper.warning, true))
+        }
         content.addView(text("备份应用版本：${backup.appVersionName}（${backup.appVersionCode}）", 16f, Paper.secondary)); content.space(12)
         val warning = column().apply {
             setPadding(dp(16), dp(12), dp(16), dp(12)); background = shape(Paper.background, 8)
             addView(text(if (backup.wordCount == 0 && backup.eventCount == 0 &&
-                    backup.stateCount == 0 && backup.userEntryCount == 0 && backup.data.session == null)
-                "这是一个空备份：确认恢复后会清空当前全部学习数据和个人补充词库。" else
-                "恢复会用备份内容完整替换当前全部学习数据与个人补充词库（不合并、不猜测冲突）；备份里没有的词、查询记录和补充词条也会被移除。",
+                    backup.stateCount == 0 && backup.userEntryCount == 0 &&
+                    backup.favoriteCount == 0 && backup.data.session == null)
+                "这是一个空备份：确认恢复后会清空当前全部学习数据、收藏星标和个人补充词库。" else
+                "恢复会用备份内容完整替换当前全部学习数据、收藏星标与个人补充词库（不合并、不猜测冲突）；备份里没有的词、查询记录、收藏和补充词条也会被移除。",
                 16f, Paper.warning, true))
             addView(text("恢复前必须先把当前数据另存为一个安全备份文件；只有写入关闭并读回校验一致、且数据未在此期间变化时才会覆盖。", 16f, Paper.secondary))
             addView(text("备份是本地明文个人数据，未加密、不防恶意篡改。", 16f, Paper.secondary))

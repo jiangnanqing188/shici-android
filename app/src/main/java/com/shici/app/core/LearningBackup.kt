@@ -12,7 +12,11 @@ import java.time.ZoneId
 /** Raised for any malformed, truncated, oversized, future-version or inconsistent backup file. */
 class BackupFormatException(message: String) : Exception(message)
 
-/** One raw `words` row; no derived counts or cache. `entryKey` equals `headword` in the real model. */
+/**
+ * One raw `words` row; no derived counts or cache. `entryKey` equals `headword` in the real model.
+ * [favorite] is the personal vocabulary star marker. It is raw persisted state, not mastery and not
+ * a query count; a v1/v2/v3 file has no such column and decodes to `false`.
+ */
 data class BackupWord(
     val entryKey: String,
     val headword: String,
@@ -21,7 +25,8 @@ data class BackupWord(
     val source: String,
     val version: String,
     val mastered: Boolean,
-    val note: String
+    val note: String,
+    val favorite: Boolean = false
 )
 
 /** One raw `events` row, revoked events included. */
@@ -106,7 +111,8 @@ data class BackupUserEntry(
  * Full raw payload across every persisted table; counts/dates are re-aggregated from these rows,
  * never cached here. The study fields default to an empty v2 database so a v1 file (or a synthetic
  * two-table payload) decodes to an empty review set with default settings. [userEntries] defaults to
- * empty so v1/v2 files remain readable; only a v3 file carries the personal supplement dictionary.
+ * empty so v1/v2 files remain readable; only a v3+ file carries the personal supplement dictionary.
+ * Word favourites are carried per word inside [words] (format v4+; older files decode to `false`).
  */
 data class LearningBackupData(
     val words: List<BackupWord>,
@@ -132,10 +138,24 @@ data class LearningBackup(
     val stateCount get() = data.states.size
     val reviewCount get() = data.reviews.size
     val userEntryCount get() = data.userEntries.size
+    /**
+     * Favourites that will actually be visible in the vocabulary list after this restore: a star on
+     * a word whose queries are all revoked is still persisted raw, but the list only shows words with
+     * at least one active query, so it is not counted as an active favourite here.
+     */
+    val favoriteCount: Int
+        get() {
+            val activeKeys = data.events.asSequence().filterNot { it.revoked }.map { it.entryKey }.toHashSet()
+            return data.words.count { it.favorite && it.entryKey in activeKeys }
+        }
     /** A v1/schema1 file carries no study data; the preview must say so explicitly. */
     val legacyNoStudyData: Boolean get() = formatVersion < LearningBackupCodec.STUDY_FORMAT_VERSION
     /** A v1/v2 file carries no personal supplement dictionary; restoring it clears local supplements. */
-    val noPersonalDictionary: Boolean get() = formatVersion < LearningBackupCodec.FORMAT_VERSION
+    val noPersonalDictionary: Boolean get() = formatVersion < LearningBackupCodec.USER_DICTIONARY_FORMAT_VERSION
+    /** True when the file carries the v4 `words.favorite` column (it may still contain zero stars). */
+    val hasFavorites: Boolean get() = formatVersion >= LearningBackupCodec.FAVORITE_FORMAT_VERSION
+    /** A v1/v2/v3 file has no favourite column at all; restoring it clears the current local stars. */
+    val noFavorites: Boolean get() = !hasFavorites
 }
 
 /**
@@ -144,18 +164,25 @@ data class LearningBackup(
  * unencrypted, tamper-evident (SHA-256 only) personal-data file, not a secure vault.
  *
  * Format v2 adds study settings/states/reviews and the pending card after the v1 two tables. Format
- * v3 appends the independent user supplement dictionary. v1/v2 files remain readable; v1 decodes to
+ * v3 appends the independent user supplement dictionary. Format v4 appends one favourite boolean to
+ * every word row and raises the database schema to 4. v1/v2/v3 files remain readable; v1 decodes to
  * default settings plus an empty review set, and v1/v2 decode with an empty personal dictionary.
+ * A v1/v2/v3 word decodes with `favorite=false`, so restoring such a file clears local favourites.
  */
 object LearningBackupCodec {
     const val MAGIC = "SHICIBKP"
-    const val FORMAT_VERSION = 3
+    const val FORMAT_VERSION = 4
+    /** First format that carries the independent user supplement dictionary (v3, schema 3). */
+    const val USER_DICTIONARY_FORMAT_VERSION = 3
+    /** First format that carries the `words.favorite` star marker (v4, schema 4). */
+    const val FAVORITE_FORMAT_VERSION = 4
     const val STUDY_FORMAT_VERSION = 2
     const val LEGACY_FORMAT_VERSION = 1
     const val FILE_SUFFIX = ".shicibackup"
     const val MIME_TYPE = "application/octet-stream"
     const val APP_IDENTITY = "com.shici.app"
-    const val DB_SCHEMA_VERSION = 3
+    const val DB_SCHEMA_VERSION = 4
+    const val USER_DICTIONARY_DB_SCHEMA_VERSION = 3
     const val STUDY_DB_SCHEMA_VERSION = 2
     const val LEGACY_DB_SCHEMA_VERSION = 1
     const val MAX_FILE_BYTES = 64L * 1024 * 1024
@@ -178,7 +205,7 @@ object LearningBackupCodec {
         data.words.forEach { word ->
             writer.writeString(word.entryKey); writer.writeString(word.headword); writer.writeString(word.partOfSpeech)
             writer.writeString(word.meaning); writer.writeString(word.source); writer.writeString(word.version)
-            writer.writeBoolean(word.mastered); writer.writeString(word.note)
+            writer.writeBoolean(word.mastered); writer.writeString(word.note); writer.writeBoolean(word.favorite)
         }
         data.events.forEach { event ->
             writer.writeString(event.id); writer.writeString(event.entryKey); writer.writeString(event.rawText)
@@ -238,9 +265,12 @@ object LearningBackupCodec {
             throw BackupFormatException("备份格式版本 $format 高于当前支持的 $FORMAT_VERSION，请先升级应用")
         }
         if (format < LEGACY_FORMAT_VERSION) throw BackupFormatException("备份格式版本 $format 不受支持")
-        // v1 has no study section; v1/v2 predate the independent personal supplement dictionary.
+        // v1 has no study section; v1/v2 predate the independent personal supplement dictionary; v1–v3
+        // predate the favourite column. Each boundary is a fixed format constant, never "current
+        // FORMAT_VERSION", so raising the current format can never make a v3 file lose its dictionary.
         val hasStudy = format >= STUDY_FORMAT_VERSION
-        val hasUserDictionary = format >= FORMAT_VERSION
+        val hasUserDictionary = format >= USER_DICTIONARY_FORMAT_VERSION
+        val hasFavorites = format >= FAVORITE_FORMAT_VERSION
         val identity = reader.readString("应用标识")
         if (identity != APP_IDENTITY) throw BackupFormatException("备份来自其他应用（$identity），已拒绝恢复")
         val appVersionName = reader.readString("应用版本名")
@@ -249,6 +279,7 @@ object LearningBackupCodec {
         val expectedSchema = when (format) {
             LEGACY_FORMAT_VERSION -> LEGACY_DB_SCHEMA_VERSION
             STUDY_FORMAT_VERSION -> STUDY_DB_SCHEMA_VERSION
+            USER_DICTIONARY_FORMAT_VERSION -> USER_DICTIONARY_DB_SCHEMA_VERSION
             FORMAT_VERSION -> DB_SCHEMA_VERSION
             else -> throw BackupFormatException("备份格式版本 $format 不受支持")
         }
@@ -271,10 +302,12 @@ object LearningBackupCodec {
             val version = reader.readString("来源版本")
             val mastered = reader.readBoolean("掌握状态")
             val note = reader.readString("笔记")
+            // v4 appends the star marker after the note; v1–v3 have no such byte and default to false.
+            val favorite = if (hasFavorites) reader.readBoolean("收藏状态") else false
             if (entryKey.isEmpty() || headword.isEmpty()) throw BackupFormatException("备份存在空词条键或空词头")
             if (entryKey != headword) throw BackupFormatException("备份词条键与词头不一致（$entryKey / $headword）")
             if (!keys.add(entryKey)) throw BackupFormatException("备份存在重复词条键：$entryKey")
-            words += BackupWord(entryKey, headword, partOfSpeech, meaning, source, version, mastered, note)
+            words += BackupWord(entryKey, headword, partOfSpeech, meaning, source, version, mastered, note, favorite)
         }
 
         val events = ArrayList<BackupEvent>()
