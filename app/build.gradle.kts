@@ -11,8 +11,8 @@ android {
         applicationId = "com.shici.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 40
-        versionName = "2.0.3"
+        versionCode = 43
+        versionName = "2.2.1"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
     buildFeatures { buildConfig = true }
@@ -29,7 +29,7 @@ android {
 
 dependencies {
     implementation("com.google.mlkit:text-recognition:16.0.1")
-    // On-device English -> Chinese sentence translation. Models are downloaded only after the
+    // Optional on-device English -> Chinese component. Models are downloaded only after the
     // user's explicit confirmation in TranslationScreen; text is processed on the device.
     implementation("com.google.mlkit:translate:17.0.3")
     testImplementation("junit:junit:4.13.2")

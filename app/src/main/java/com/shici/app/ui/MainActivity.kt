@@ -69,7 +69,9 @@ class MainActivity : Activity() {
         LOOKUP("查词", -1),
         // Stable identity only: the historical tab indices below are untouched, and LOOKUP,
         // TRANSLATION and PERSONAL_ENTRY never borrow a legacy index.
-        TRANSLATION("译句", -1),
+        // The navigation label names the optional component explicitly; the stable id stays
+        // TRANSLATION so saved state, tests and legacy entry points keep their identity.
+        TRANSLATION("离线 AI 翻译", -1),
         VOCABULARY("生词本", 1),
         STUDY("背词", 4),
         STATISTICS("统计", 2),
@@ -694,7 +696,7 @@ class MainActivity : Activity() {
         content.addView(text("主要功能", 22f, bold = true)); content.space(8)
         content.addView(entryCard("查词", "日常输入查询；缺词可新增词义，已有词可补充个人释义。") { selectPage(MainPage.LOOKUP) })
         content.space(8)
-        content.addView(entryCard("译句", "输入英文句子，用本机离线模型整句翻译；不查词、不收录、不上传原文。") { selectPage(MainPage.TRANSLATION) })
+        content.addView(entryCard("离线 AI 翻译（可选组件）", "初装不下载模型；由你明确确认后仅 Wi-Fi 下载，组件就绪才可编辑和翻译。用 Google ML Kit 本机整句翻译，不查词、不收录、不上传原文；其他功能不依赖它。") { selectPage(MainPage.TRANSLATION) })
         content.space(8)
         content.addView(entryCard("添加/补词", "只维护本机个人词性/释义，不产生查询次数、生词或复习记录。") { selectPage(MainPage.PERSONAL_ENTRY) })
         content.space(8)
@@ -943,11 +945,13 @@ class MainActivity : Activity() {
     // ---- Translation page -----------------------------------------------------------------------
 
     /**
-     * A real embedded [TranslationScreen], not a sample. Its draft is restored from [translationInput]
-     * and its selection from the saved caret pair. The component itself starts only a local model
-     * state query; translation happens exclusively on the user's "翻译整句" tap and a model download
-     * only on the explicit Wi-Fi confirmation. Leaving/stop/destroy closes this owner, and the page
-     * is excluded from background re-rendering so an old asynchronous result cannot paint a new page.
+     * The optional offline AI translation component, embedded as a real [TranslationScreen]. Its
+     * draft is restored from [translationInput] and its selection from the saved caret pair, even
+     * when the model is not downloaded and the source is shown read-only. The component itself
+     * starts only a local model state query; translation happens exclusively on the user's
+     * "翻译整句" tap and a model download only on the explicit Wi-Fi confirmation. Leaving/stop/
+     * destroy closes this owner, and the page is excluded from background re-rendering so an old
+     * asynchronous result cannot paint a new page.
      */
     private fun translationPage() {
         val screen = TranslationScreen(
@@ -2167,14 +2171,14 @@ class MainActivity : Activity() {
             addView(text("关闭会释放捕获和浮层，不会撤销系统悬浮窗权限。若需撤销，请在系统设置中操作。", 16f, Paper.secondary)); divider()
             addView(text("数据保存在本机", 18f, bold = true))
             addView(text("屏幕画面仅在内存中短暂读取并本机识别，不写截图文件、不上传；一笔抬起自动查询，轻点/多指/取消不查询，多个词时选择其中一个词查询，也可在多词原文卡中选择“翻译整句”。查询记录、释义快照、个人笔记、收藏与掌握状态保存在本机数据库。PDF 写入你选择的位置。", 16f, Paper.secondary)); divider()
-            addView(text("译句与网络", 18f, bold = true))
-            addView(text("“译句”页的英文由 Google ML Kit 在设备本机翻译，本应用不上传原文或译文、不使用在线翻译或收费服务。首次使用需你明确确认后下载英中离线模型（仅 Wi-Fi，约 30 MB 仅为估计），本应用不会自动下载，也不会自动改用移动数据或云端翻译。ML Kit 可能为更新模型、诊断和统计而与 Google 通信并发送性能/使用指标，因此本应用并非“完全不联网”；清单中的网络权限仅用于该 SDK。设备需支持 Google Play 服务，模型能否下载与译文质量仍需实测。", 16f, Paper.secondary))
+            addView(text("离线 AI 翻译组件与网络", 18f, bold = true))
+            addView(text("“离线 AI 翻译”是可选组件，不是查词、补词、生词本、PDF 或背词的前置条件。初装不下载任何模型；未下载时该页只显示组件说明与“下载并启用（仅 Wi-Fi）”入口，原文只读且草稿/选择位置保留，不开放编辑、翻译或复制。只有你明确确认后才由 Google ML Kit 下载英中离线模型（约 30 MB 只是估计，实际以系统为准），并采用 Wi-Fi 条件；不伪造下载进度，失败可主动重试，不会自动重下或改用移动数据。离开/关闭页面不会取消系统下载，系统下载可能继续，再次进入只重新检查本地状态。英文由 Google ML Kit 在设备本机翻译，本应用不上传原文或译文、不使用在线翻译或收费服务。ML Kit 可能为更新模型、诊断和统计而与 Google 通信并发送性能/使用指标，因此本应用并非“完全不联网”；清单中的网络权限仅用于该 SDK。设备需支持 Google Play 服务；模型能否下载、真实译文质量与兼容性仍需实测。", 16f, Paper.secondary))
         }
         boundaries.addView(privacy); boundaries.space(16)
         val limits = panel().apply {
             addView(text("原型限制", 20f, bold = true)); space(8)
             addView(text("PDF 导出已接入 A4 复习版与自测版＋答案页；支持按首次收录日期（含首尾）、最近查询/查询次数排序、仅收藏，以及“当前筛选全部”或手动勾选当前结果。导出选项只保存在本次导出中，不是全局设置；PDF 不是备份。正式词典、发音、例句仍未实现；本地备份仅为完整覆盖恢复，不提供合并或云同步。", 16f, Paper.secondary))
-            divider(); addView(text("本轮三功能仅完成代码接线与编译，未运行逻辑测试；未真机验证 PDF 版面/系统文件选择器、收藏交互、备份跨版本恢复、译句模型下载与真实质量，也未验证速度、断网初装 OCR、海文兼容性与长时间功耗。", 16f, Paper.warning))
+            divider(); addView(text("本页为开发阶段说明：本批实现阶段的离线编译只检查代码可编译，不能代替独立逻辑验收，也不等于功能通过。当前版本与限定验收进度以项目交付记录为准；已完成的限定范围验收不代表整包、真机或平板通过。真实 SDK 模型下载与推理质量、Google Play 兼容性、平板内存与速度、原生窗口、大字模式、海文物理笔及长期功耗仍未验证。", 16f, Paper.warning))
         }
         boundaries.addView(limits)
         content.addView(pair(library, boundaries, splitContent, 24))

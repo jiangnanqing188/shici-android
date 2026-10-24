@@ -1191,6 +1191,7 @@ class CaptureService : Service() {
                 }
                 val selected = HighlighterGeometry.hitWords(selection, elements)
                 val raw = HighlighterGeometry.selectedText(selected)
+                val words = selected.map { it.text }
                 when {
                     selected.isEmpty() -> {
                         perf.stage("ocr_empty", "failed")
@@ -1198,9 +1199,18 @@ class CaptureService : Service() {
                     }
                     selected.size == 1 && RawKajwebDictionary.normalize(selected.first().text) != null ->
                         lookup(selected.first().text, raw, credentialOverride = credential)
+                    isDirectEnglishSentence(raw, words) -> {
+                        // A clearly English multi-token sentence goes straight to the existing
+                        // overlay translation page with one opt-in auto intent for this frozen raw.
+                        // It starts no dictionary query/save for the sentence or any word.
+                        perf.stage("ocr_sentence", "direct_result")
+                        openTranslation(raw, autoTranslate = true, selectionWords = words)
+                    }
                     else -> {
+                        // One malformed token, punctuation-only or otherwise unclear text keeps the
+                        // visible correction/selection card; it is never guessed to be a sentence.
                         perf.stage("ocr_multiple", "needs_confirmation")
-                        showSelectedText(raw, selected.map { it.text })
+                        showSelectedText(raw, words)
                     }
                 }
             }
@@ -1210,6 +1220,25 @@ class CaptureService : Service() {
                 showMessage("本地文字识别异常（OCR 未返回结果，不是词库未命中）。本次未查询、未收录。请点「重试取词」或手动纠错。")
             }
         }.addOnCompleteListener { crop.recycle() }
+    }
+
+    /**
+     * True only for a clearly English multi-token sentence that may open the translation result
+     * directly. Empty text, punctuation-only text, a single malformed token and text dominated by
+     * non-Latin letters stay on the visible correction/selection path instead of being guessed to
+     * be a sentence. This classifies the already accepted OCR result; it does not change OCR,
+     * capture, page admission or any dictionary/record path.
+     */
+    private fun isDirectEnglishSentence(raw: String, words: List<String>): Boolean {
+        val tokens = Regex("[A-Za-z]+(?:['’\\-][A-Za-z]+)*")
+            .findAll(raw).map { it.value }.toList()
+        if (tokens.size < 2) return false
+        val englishWords = words.count { Regex("[A-Za-z]").containsMatchIn(it) }
+        if (englishWords < 2) return false
+        val letters = raw.count { it.isLetter() }
+        if (letters == 0) return false
+        val latin = raw.count { it in 'A'..'Z' || it in 'a'..'z' }
+        return latin * 2 >= letters
     }
 
     private fun showSelectedText(raw: String, words: List<String>, manual: Boolean = false) {
@@ -1231,17 +1260,25 @@ class CaptureService : Service() {
     /**
      * Opens the explicit offline translation page for [raw].
      *
-     * This is reached only from the multi-word OCR card's "翻译整句"/"编辑原文后翻译" buttons.
-     * Generating [raw] already happened during this lookup; opening the page starts no lookup,
-     * record, query count or study feedback, and the page opens no second window of its own.
+     * This is reached from the multi-word OCR card's "翻译整句"/"编辑原文后翻译" buttons and from
+     * the direct result path for a clearly English multi-token sentence. Generating [raw] already
+     * happened during this lookup; opening the page starts no lookup, record, query count or study
+     * feedback, and the page opens no second window of its own.
+     *
+     * [autoTranslate] is the explicit, one-shot capture-entry intent. Only this capture entry sets
+     * it; it submits [raw] at most once after the local model is Ready and never downloads on its
+     * own. [selectionWords] adds only the secondary "返回选词" action for looking up one word; the
+     * sentence itself never queries or collects. Closing/dismissing the page or starting a new
+     * stroke retires the screen, its translator and every late callback.
      *
      * The old lookup card and its page admission are retired first. The translation page is a
      * local-only world with no dictionary write admission, so there is no old page result that
-     * could be laundered; closing the page always returns to the floating button, never to a stale
-     * card. The window is a real `TYPE_APPLICATION_OVERLAY` owned by this service (not a Dialog),
-     * so a Service context can never trigger BadToken.
+     * could be laundered. The window is a real `TYPE_APPLICATION_OVERLAY` owned by this service
+     * (not a Dialog), so a Service context can never trigger BadToken.
      */
-    private fun openTranslation(raw: String, focusInput: Boolean = false) {
+    private fun openTranslation(raw: String, focusInput: Boolean = false,
+                                autoTranslate: Boolean = false,
+                                selectionWords: List<String> = emptyList()) {
         if (stopped || !sessionIsActive()) {
             toast("查词服务已停止或会话已失效，无法打开译句；请重新开启全屏查词")
             return
@@ -1250,7 +1287,24 @@ class CaptureService : Service() {
         // pending frame/epoch. A late callback from the old card or page can no longer act.
         dismissPanel()
         if (stopped || !sessionIsActive()) return
-        val screen = TranslationScreen(this, raw)
+        val returnToSelection: (() -> Unit)? =
+            if (autoTranslate && selectionWords.isNotEmpty()) {
+                {
+                    // Explicit user choice to inspect one word: retire this local sentence page
+                    // first, then return to the original per-word card. Still no automatic query
+                    // or collection for the sentence or any word.
+                    closeTranslationScreen()
+                    // The translation page has already retired the lift page guard; this is now an
+                    // explicit user-selected word lookup, so it keeps the original lookup/save
+                    // chain without pretending the old automatic page admission still exists.
+                    if (sessionIsActive()) showSelectedText(raw, selectionWords, manual = true)
+                }
+            } else null
+        val screen = TranslationScreen(
+            this, raw,
+            autoTranslate = autoTranslate,
+            onSelectionRequested = returnToSelection
+        )
         screen.onCloseRequested = { closeTranslationScreen(returnToBubble = true) }
         val view = screen.view
         val width = minOf(dp(520), (screenWidth - dp(24)).coerceAtLeast(dp(240)))
