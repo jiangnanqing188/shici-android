@@ -50,6 +50,20 @@ class CaptureService : Service() {
         const val EXTRA_RESULT = "result"
         const val EXTRA_DATA = "data"
         const val EXTRA_GENERATION = "generation"
+        /**
+         * Stable request for the user-tapped "手动查词" exit from a capture failure card.
+         *
+         * The intent is explicit to MainActivity and carries no frame, OCR result, deletion
+         * credential or query admission. Only the card's click sends it; MainActivity only
+         * navigates to LOOKUP and may prefill [EXTRA_MANUAL_LOOKUP_TEXT]. It must not submit a
+         * query, record an event or replay any old operation on its own.
+         *
+         * MainActivity is already exported and this intent names it explicitly, so no manifest
+         * entry, intent-filter or new permission is introduced.
+         */
+        const val ACTION_MANUAL_LOOKUP = "com.shici.app.action.MANUAL_LOOKUP"
+        const val EXTRA_MANUAL_LOOKUP = "com.shici.app.extra.MANUAL_LOOKUP"
+        const val EXTRA_MANUAL_LOOKUP_TEXT = "com.shici.app.extra.MANUAL_LOOKUP_TEXT"
         private const val CHANNEL = "capture"
         private const val ENTRY_FRAME_TIMEOUT_MS = 2_500L
         private const val VERIFY_FRAME_TIMEOUT_MS = 1_500L
@@ -458,8 +472,9 @@ class CaptureService : Service() {
                 val failedGeneration = sessionGeneration
                 val failedEpoch = lookupEpoch
                 if (closeFailedCaptureRequest(awaiting)) {
+                    val pageChanged = RecognitionFeedback.notice(RecognitionFailure.PAGE_CHANGED)
                     main.post { failLiveLookupIfCurrent(failedGeneration, failedEpoch,
-                        "抬笔后页面已改变。本次未查询、未收录。请在页面稳定后点「重试取词」。", "page_changed_gap") }
+                        pageChanged.message, "page_changed_gap", pageChanged.nextStep) }
                     return
                 }
                 // Main delivery won the race; record the change for the pending guard below.
@@ -713,15 +728,15 @@ class CaptureService : Service() {
         when (purpose) {
             FramePurpose.ENTRY -> {
                 perf.end("failed", if (request.rejectedBlack) "frame_black_timeout" else "frame_timeout")
-                showMessage(if (request.rejectedBlack)
-                    "未拿到新画面：只收到黑帧（页面可能尚未就绪、锁屏或禁止截图）。本次未识别文字、未查询、未收录；不会复用旧截图或绕过保护。请点「重试取词」重新划词。"
-                    else "未拿到新画面：没有收到新的有效屏幕画面（安全页面可能禁止截图）。本次未识别文字、未查询、未收录；不会复用旧截图。请点「重试取词」重新划词。")
+                showRecognitionFailure(RecognitionFeedback.notice(
+                    if (request.rejectedBlack) RecognitionFailure.NO_FRAME_ENTRY_BLACK
+                    else RecognitionFailure.NO_FRAME_ENTRY))
             }
             FramePurpose.VERIFY -> {
                 perf.end("failed", if (request.rejectedBlack) "verify_black_timeout" else "verify_timeout")
-                showMessage(if (request.rejectedBlack)
-                    "抬笔后没有拿到新画面：只收到黑帧。本次未查询、未收录，也没有写入生词本。请点「重试取词」重新划词。"
-                    else "抬笔后没有拿到新画面：未收到新的有效画面。本次未查询、未收录，也没有写入生词本。请点「重试取词」重新划词。")
+                showRecognitionFailure(RecognitionFeedback.notice(
+                    if (request.rejectedBlack) RecognitionFailure.NO_FRAME_VERIFY_BLACK
+                    else RecognitionFailure.NO_FRAME_VERIFY))
             }
         }
     }
@@ -923,7 +938,8 @@ class CaptureService : Service() {
         }
         if (!session.entryFingerprint.matches(fingerprint)) {
             bitmap.recycle()
-            failLiveLookup("抬笔后的画面与起点页面不一致（划选期间页面已改变）。本次未查询、未收录。请在页面稳定后点「重试取词」。", "page_changed")
+            val pageChanged = RecognitionFeedback.notice(RecognitionFailure.PAGE_CHANGED)
+            failLiveLookup(pageChanged.message, "page_changed", pageChanged.nextStep)
             return
         }
         // Fresh lift frame, clean of bubble/ink/card, and materially the same page as the entry
@@ -953,19 +969,20 @@ class CaptureService : Service() {
      * replacement token), clear a live session/new stroke, end a new page guard, or rebuild UI after
      * stop. No old token is ever re-opened by this check.
      */
-    private fun failLiveLookupIfCurrent(generation: Long, epoch: Long, message: String, stage: String) {
+    private fun failLiveLookupIfCurrent(generation: Long, epoch: Long, message: String, stage: String,
+                                        nextStep: String? = null) {
         if (stopped || generation != sessionGeneration || CaptureStatus.generation != generation) return
         if (epoch != lookupEpoch || !sessionIsActive()) return
-        failLiveLookup(message, stage)
+        failLiveLookup(message, stage, nextStep)
     }
 
-    private fun failLiveLookup(message: String, stage: String) {
+    private fun failLiveLookup(message: String, stage: String, nextStep: String? = null) {
         removeLiveLayer()
         live = null
         endPageGuard()
         gate.next()
         perf.end("failed", stage)
-        showMessage(message)
+        showMessage(message, nextStep = nextStep)
     }
 
     private fun addLiveLayer(view: LiveSelectionView): Boolean = try {
@@ -1137,7 +1154,7 @@ class CaptureService : Service() {
         val token = gate.next()
         removePanelView()
         val pending = column().apply { setPadding(dp(24), dp(24), dp(24), dp(24)); background = shape(Paper.surface) }
-        pending.addView(text("正在本地识别笔迹附近的文字…", 20f, bold = true))
+        pending.addView(text(RecognitionFeedback.RECOGNIZING, 20f, bold = true))
         pending.addView(button("重新划选") { beginLiveSelection() }); pending.space(8)
         pending.addView(button("取消") { dismissPanel(); showBubble() })
         addPanel(pending)
@@ -1166,7 +1183,7 @@ class CaptureService : Service() {
             crop.recycle()
             if (sessionIsActive() && gate.accepts(token)) {
                 perf.stage("ocr", "failed")
-                showMessage("本地文字识别异常（OCR 未返回结果，不是词库未命中）。本次未查询、未收录。请点「重试取词」或手动纠错。")
+                showRecognitionFailure(RecognitionFeedback.notice(RecognitionFailure.OCR_UNAVAILABLE))
             }
             return
         }
@@ -1186,18 +1203,45 @@ class CaptureService : Service() {
                                         box.top.toFloat(), box.right.toFloat(), box.bottom.toFloat()), area), index, lineBox))
                                 }
                             }
+                        } else {
+                            // A missing line box must not discard this line's elements. Only a
+                            // non-positive-area element box is unusable here: it can never be hit
+                            // and would distort the derived context. Build that context solely from
+                            // this line's own usable element boxes; with none, add no candidate.
+                            val lineWords = line.elements.mapNotNull { element ->
+                                element.boundingBox?.takeIf { it.width() > 0 && it.height() > 0 }?.let { box ->
+                                    val bounds = HighlighterGeometry.restoreBox(FloatBox(box.left.toFloat(), box.top.toFloat(),
+                                        box.right.toFloat(), box.bottom.toFloat()), area)
+                                    HighlighterWord(element.text, bounds, index, bounds)
+                                }
+                            }
+                            if (lineWords.isNotEmpty()) {
+                                val lineBox = FloatBox(lineWords.minOf { it.bounds.left }, lineWords.minOf { it.bounds.top },
+                                    lineWords.maxOf { it.bounds.right }, lineWords.maxOf { it.bounds.bottom })
+                                lineWords.forEach { add(it.copy(lineBounds = lineBox)) }
+                            }
                         }
                     } }
                 }
                 val selected = HighlighterGeometry.hitWords(selection, elements)
                 val raw = HighlighterGeometry.selectedText(selected)
                 val words = selected.map { it.text }
+                // normalize() accepts any Unicode letters, so "dictionary-shaped" is not the same
+                // as "English". Only an English candidate may enter the single-word query path;
+                // otherwise a non-Latin OCR token would be shown as a dictionary miss even though
+                // no English word was recognized in the first place.
+                val singleForm = selected.singleOrNull()?.let { word ->
+                    RawKajwebDictionary.normalize(word.text)?.takeIf { RecognitionFeedback.hasLatinLetter(it) }
+                }
+                val hasEnglishCandidate = words.any { word ->
+                    RawKajwebDictionary.normalize(word)?.let { RecognitionFeedback.hasLatinLetter(it) } == true
+                }
                 when {
                     selected.isEmpty() -> {
                         perf.stage("ocr_empty", "failed")
-                        showMessage("没有识别到笔迹附近的文字（OCR 结果为空，不是词库未命中）。本次未查询、未收录；请沿完整单词点「重试取词」，或手动纠错。")
+                        showRecognitionFailure(RecognitionFeedback.notice(RecognitionFailure.OCR_EMPTY))
                     }
-                    selected.size == 1 && RawKajwebDictionary.normalize(selected.first().text) != null ->
+                    singleForm != null ->
                         lookup(selected.first().text, raw, credentialOverride = credential)
                     isDirectEnglishSentence(raw, words) -> {
                         // A clearly English multi-token sentence goes straight to the existing
@@ -1205,6 +1249,12 @@ class CaptureService : Service() {
                         // It starts no dictionary query/save for the sentence or any word.
                         perf.stage("ocr_sentence", "direct_result")
                         openTranslation(raw, autoTranslate = true, selectionWords = words)
+                    }
+                    !hasEnglishCandidate -> {
+                        // OCR produced text that contains no queryable English word. This stays a
+                        // recognition/correction result and never becomes a dictionary miss.
+                        perf.stage("ocr_no_english", "needs_confirmation")
+                        showNoEnglish(raw)
                     }
                     else -> {
                         // One malformed token, punctuation-only or otherwise unclear text keeps the
@@ -1217,7 +1267,7 @@ class CaptureService : Service() {
         }.addOnFailureListener { _ ->
             if (sessionIsActive() && gate.accepts(token)) {
                 perf.stage("ocr", "failed")
-                showMessage("本地文字识别异常（OCR 未返回结果，不是词库未命中）。本次未查询、未收录。请点「重试取词」或手动纠错。")
+                showRecognitionFailure(RecognitionFeedback.notice(RecognitionFailure.OCR_UNAVAILABLE))
             }
         }.addOnCompleteListener { crop.recycle() }
     }
@@ -1249,13 +1299,43 @@ class CaptureService : Service() {
         content.addView(text("识别到多个候选词，尚未查询或收录。你可以翻译整句，或选择一个词查词；不会批量自动加入生词本。", 16f, Paper.warning)); content.space()
         content.addView(button("翻译整句（离线英译中）") { openTranslation(raw) }); content.space(8)
         content.addView(button("编辑原文后翻译") { openTranslation(raw, focusInput = true) }); content.space(8)
-        words.filter { RawKajwebDictionary.normalize(it) != null }.distinct().forEach { word ->
+        words.filter { word ->
+            RawKajwebDictionary.normalize(word)
+                ?.let { RecognitionFeedback.hasLatinLetter(it) } == true
+        }.distinct().forEach { word ->
             content.addView(button("查词：$word") { lookup(word, raw, manual = manual) }); content.space(8)
         }
         content.addView(button("纠正选中文字") { showTextCorrection(raw) }); content.space(8)
         content.addView(button("重新划选") { beginLiveSelection() }); content.space(8)
         content.addView(button("取消") { dismissPanel(); showBubble() })
         addPanel(scroll(content))
+    }
+
+    /**
+     * The OCR selection contained text but no queryable English word.
+     *
+     * This is deliberately not the dictionary's "未收录" card: no dictionary read has happened, so
+     * presenting a missing headword would misattribute a recognition outcome. The card keeps the
+     * existing correction and offline sentence-translation exits and adds the explicit manual
+     * lookup exit. It starts no query, creates no record and retries nothing on its own.
+     */
+    private fun showNoEnglish(raw: String) {
+        gate.next()
+        perf.snapshot("no_english")
+        val notice = RecognitionFeedback.notice(RecognitionFailure.NO_ENGLISH_WORD)
+        val content = card("未识别到英文")
+        content.addView(text(notice.message, 16f, Paper.warning)); content.space()
+        content.addView(text("下一步：${notice.nextStep}", 15f, Paper.secondary)); content.space()
+        content.addView(text("选中原文：\n$raw")); content.space()
+        content.addView(button("重新划选") { beginLiveSelection() }); content.space(8)
+        content.addView(button("纠正选中文字") { showTextCorrection(raw) }); content.space(8)
+        content.addView(button("翻译整句（离线英译中）") { openTranslation(raw) }); content.space(8)
+        val manual = button("手动查词（打开查词页）") {}
+        content.addView(manual); content.space(8)
+        content.addView(button("取消") { dismissPanel(); showBubble() })
+        addPanel(scroll(content))
+        val owner = panelOwner
+        manual.setOnClickListener { openManualLookup(owner, raw) }
     }
     /**
      * Opens the explicit offline translation page for [raw].
@@ -1430,13 +1510,23 @@ class CaptureService : Service() {
             }
         }
     }
-    private fun showMessage(message: String, raw: String = "", replaces: String? = null) {
+    /** Renders one pure recognition outcome through the existing terminal-card owner rules. */
+    private fun showRecognitionFailure(notice: RecognitionNotice, raw: String = "",
+                                       replaces: String? = null) {
+        showMessage(notice.message, raw, replaces, notice.nextStep)
+    }
+
+    private fun showMessage(message: String, raw: String = "", replaces: String? = null,
+                            nextStep: String? = null) {
         // A terminal message has no save/retry admission left; stop observing its page.
         endPageGuard()
         gate.next()
         perf.snapshot("message")
         val content = card("取词提示")
         content.addView(text(message, 16f, Paper.warning)); content.space()
+        if (nextStep != null) {
+            content.addView(text("下一步：$nextStep", 15f, Paper.secondary)); content.space()
+        }
         if (raw.isNotBlank()) {
             content.addView(text("选中原文：\n$raw")); content.space()
             content.addView(button("手动纠错") { showCorrection(raw, replaces) }); content.space(8)
@@ -1446,10 +1536,45 @@ class CaptureService : Service() {
         // later card. "返回做题" remains available unchanged.
         val retry = button("重试取词（重新划词）") {}
         content.addView(retry); content.space(8)
+        // Deliberate, user-tapped exit to the app's own lookup page. It carries only an optional
+        // prefill; it never submits a query, records an event or replays this failed attempt.
+        val manual = button("手动查词（打开查词页）") {}
+        content.addView(manual); content.space(8)
         content.addView(button("返回做题") { dismissPanel(); showBubble() })
         addPanel(scroll(content))
         val owner = panelOwner
         retry.setOnClickListener { retryLiveSelection(owner) }
+        manual.setOnClickListener { openManualLookup(owner, raw) }
+    }
+
+    /**
+     * Explicit user tap from a failure card into the app's daily-lookup page.
+     *
+     * Only this tap navigates. [owner] must still be the mounted card's identity, so a click queued
+     * by an already-replaced, dismissed or stopped card is a no-op. The intent carries no frame,
+     * OCR result, deletion credential or query admission: [raw] is only an optional prefilled
+     * draft and an empty raw sends no text at all. No query is submitted, no record/count is
+     * written and no old capture operation is replayed. MainActivity only navigates to LOOKUP and
+     * may prefill the draft; it must not query by itself.
+     */
+    private fun openManualLookup(owner: Long, raw: String) {
+        if (owner != panelOwner || panel == null) return
+        // Retire this failed card's world (live layer, pending frame, guard, editors) before
+        // leaving; the app is opened from this fresh user click, never from a capture callback.
+        dismissPanel()
+        if (sessionIsActive() && bubble == null) showBubble()
+        val request = Intent(this, MainActivity::class.java).apply {
+            action = ACTION_MANUAL_LOOKUP
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or
+                Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+            putExtra(EXTRA_MANUAL_LOOKUP, true)
+            if (raw.isNotBlank()) putExtra(EXTRA_MANUAL_LOOKUP_TEXT, raw)
+        }
+        try {
+            startActivity(request)
+        } catch (e: Exception) {
+            toast("无法打开查词页：${e.message}；本次没有查询或收录")
+        }
     }
 
     /**

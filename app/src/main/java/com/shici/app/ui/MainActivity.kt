@@ -76,11 +76,17 @@ class MainActivity : Activity() {
         STUDY("背词", 4),
         STATISTICS("统计", 2),
         PERSONAL_ENTRY("添加/补词", -1),
-        SETTINGS("设置", 3);
+        SETTINGS("设置", 3),
+        // Repeatable usage guide. It is a stable page name with no historical tab index; the
+        // legacy 0..4 mapping above is untouched, so an old saved tab can never become the guide.
+        GUIDE("使用引导", -1);
 
         companion object {
+            // Visible main order requested for this integration round. Identity stays the enum
+            // name/legacyTab, so only display order changes; settings remains the separate fixed
+            // entry supplied by the navigation component.
             val mainPages = listOf(
-                HOME, LOOKUP, TRANSLATION, VOCABULARY, STUDY, STATISTICS, PERSONAL_ENTRY
+                HOME, LOOKUP, VOCABULARY, STUDY, PERSONAL_ENTRY, TRANSLATION, STATISTICS, GUIDE
             )
             fun fromLegacyTab(tab: Int): MainPage = when (tab) {
                 0 -> HOME
@@ -197,6 +203,9 @@ class MainActivity : Activity() {
     private var backupExportButton: Button? = null
     private var restoreButton: Button? = null
     private var backupStatusView: TextView? = null
+    // Settings body is a pure-UI component; the Activity still owns every backup/capture view and
+    // async callback that is mounted into its hosts. Cleared on each render with the other hosts.
+    private var settingsScreen: SettingsScreen? = null
     private var restorePreviewDialog: AlertDialog? = null
     private var lostExportRequestCode = -1
     private var cleaningLostExport = false
@@ -393,6 +402,49 @@ class MainActivity : Activity() {
             if (code >= 0) { interruptedDocumentRequests += code; LearningExportSession.reserveRequestCode(code) }
         }
         buildShell()
+        // A fresh launch may carry the capture card's explicit "手动查词" request. A recreated
+        // Activity (savedInstanceState != null) never replays it over the restored draft.
+        if (savedInstanceState == null) applyManualLookupIntent(intent)
+    }
+    /**
+     * Explicit capture-card exit received while this Activity is already alive (CLEAR_TOP/SINGLE_TOP).
+     * Only navigates/prefills; it never submits a query, records a word or replays an old capture.
+     */
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        applyManualLookupIntent(intent)
+    }
+    /**
+     * Consumes [CaptureService.ACTION_MANUAL_LOOKUP] exactly once. Only the optional original text is
+     * used as a draft prefill; no frame, OCR data, credential or admission is accepted. Creating the
+     * page does not query or collect anything, and the action/extra are removed so rotation or a
+     * later re-entry cannot replay the old request.
+     */
+    private fun applyManualLookupIntent(intent: Intent?) {
+        val request = intent ?: return
+        if (request.action != CaptureService.ACTION_MANUAL_LOOKUP) return
+        val prefill = request.getStringExtra(CaptureService.EXTRA_MANUAL_LOOKUP_TEXT).orEmpty()
+        request.removeExtra(CaptureService.EXTRA_MANUAL_LOOKUP_TEXT)
+        request.removeExtra(CaptureService.EXTRA_MANUAL_LOOKUP)
+        request.action = null
+        if (prefill.isNotEmpty()) {
+            lookupQuery = prefill
+            lookupSelectionStart = prefill.length
+            lookupSelectionEnd = prefill.length
+        }
+        if (page == MainPage.LOOKUP) {
+            // The page is already mounted and its watcher only mirrors the draft; update the input
+            // and caret without submitting. An empty prefill keeps the user's existing draft.
+            if (prefill.isNotEmpty()) {
+                lookupInputView?.setText(prefill)
+                lookupInputView?.setSelection(prefill.length)
+            }
+        } else {
+            // selectPage performs the original page cleanup and retires old async owners; render
+            // builds LOOKUP from lookupQuery (the prefilled draft when one was supplied).
+            selectPage(MainPage.LOOKUP)
+        }
     }
     override fun onStart() {
         super.onStart()
@@ -415,6 +467,13 @@ class MainActivity : Activity() {
         if (page == MainPage.TRANSLATION && translationNeedsResume) {
             translationNeedsResume = false
             render()
+        }
+        // Returning from a system permission page updates only the two status badges; it does not
+        // rebuild the page, collapse the expanded details or replace Activity-owned hosts.
+        if (page == MainPage.SETTINGS) {
+            settingsScreen?.updatePermissionStatus(
+                overlayPermissionStatus(), notificationPermissionStatus()
+            )
         }
         refresh()
         loadDictionaryStatus()
@@ -611,7 +670,7 @@ class MainActivity : Activity() {
                         // background refresh. Leaving the page is the only path that invalidates them.
                         // TRANSLATION owns an ML Kit session and a draft; it is deliberately excluded.
                         MainPage.LOOKUP, MainPage.TRANSLATION, MainPage.PERSONAL_ENTRY,
-                        MainPage.SETTINGS -> Unit
+                        MainPage.SETTINGS, MainPage.GUIDE -> Unit
                         else -> render()
                     }
                 }.onFailure { toast("读取失败：${it.message}") }
@@ -649,6 +708,7 @@ class MainActivity : Activity() {
         wordListHeader = null
         exportButton = null; inlineDetail = null; dictionaryStatusView = null
         backupExportButton = null; restoreButton = null; backupStatusView = null
+        settingsScreen = null
         lookupInputView = null; personalStatusView = null; favoriteFilterView = null
         body.removeAllViews()
         renderNavState()
@@ -661,6 +721,7 @@ class MainActivity : Activity() {
             MainPage.STATISTICS -> statistics()
             MainPage.PERSONAL_ENTRY -> personalEntryPage()
             MainPage.SETTINGS -> settings()
+            MainPage.GUIDE -> guidePage()
         }
     }
     private fun scrolled(): LinearLayout {
@@ -675,6 +736,16 @@ class MainActivity : Activity() {
         val content = scrolled()
         content.addView(text("专注阅读，随手拾词", 16f, Paper.secondary))
         content.addView(text("让生词停在这里", if (wide) 36f else 28f, Paper.ink, true)); content.space(24)
+        // Non-blocking first-use recommendation. It never opens by itself, never steals focus and
+        // only writes the independent guide preference when the user taps "跳过，不再提示".
+        if (!guideSeen()) {
+            content.addView(UsageGuideEntries.homeCard(
+                this,
+                onOpenGuide = { selectPage(MainPage.GUIDE) },
+                onDismiss = { markGuideSeen(); render() }
+            ))
+            content.space(16)
+        }
         val session = panel()
         val heading = row().apply { gravity = Gravity.CENTER_VERTICAL }
         heading.addView(text("悬浮查词", 22f, bold = true), LinearLayout.LayoutParams(0, -2, 1f))
@@ -718,6 +789,40 @@ class MainActivity : Activity() {
         setOnClickListener { action() }
     }
 
+    // ---- Repeatable usage guide ----------------------------------------------------------------
+
+    /**
+     * Independent preference for the non-blocking HOME card. It is never written by onCreate,
+     * ordinary rendering, the guide page itself, navigation or back: only an explicit "跳过，不再
+     * 提示"/"跳过引导"/"看完了" tap calls [markGuideSeen].
+     */
+    private fun guideSeen(): Boolean =
+        getSharedPreferences("guide_prefs", MODE_PRIVATE)
+            .getBoolean(UsageGuide.SEEN_PREFERENCE_KEY, false)
+
+    private fun markGuideSeen() {
+        getSharedPreferences("guide_prefs", MODE_PRIVATE)
+            .edit().putBoolean(UsageGuide.SEEN_PREFERENCE_KEY, true).apply()
+    }
+
+    /**
+     * Repeatable help page. The component owns only presentation; page navigation goes through the
+     * existing [selectPage] cleanup (late async callbacks, translation owner, study owner, drafts),
+     * and no topic action queries, records, downloads or deletes anything.
+     */
+    private fun guidePage() {
+        val screen = UsageGuideScreen(
+            context = this,
+            firstRun = false,
+            initialTopicId = null,
+            onNavigate = { id -> MainPage.fromStableName(id)?.let { selectPage(it) } },
+            onDismissFirstRun = { markGuideSeen() },
+            onBack = { selectPage(MainPage.HOME) }
+        )
+        // The component is already a ScrollView; do not wrap it in scrolled().
+        body.addView(screen.view, LinearLayout.LayoutParams(-1, -1))
+    }
+
     private fun vocabulary() {
         val content = if (splitContent) body else scrolled()
         val inline = inlineAt(contentWidthDp)
@@ -753,6 +858,10 @@ class MainActivity : Activity() {
             LinearLayout.LayoutParams(-1, -2))
         content.space(8)
         content.addView(text("勾选只决定 PDF 导出范围，不改词库、查询次数或学习进度。默认（尚未勾选/清空）导出当前筛选全部；一旦勾选、取消或清空，就按你的勾选集合导出，清空即 0 个，不会自动变回全部；点“使用当前结果全部（不勾选）”才回到默认全量。全选只包含当前搜索/仅收藏筛出的词，日期范围仍在导出选项中取交集。", 13f, Paper.secondary))
+        content.space(8)
+        // One visible explanation for the whole list: the per-row "移除…" opens the original
+        // scope chooser (exact undo vs. whole-word delete requiring a second confirmation).
+        content.addView(VocabularyActions.listScopeHint(this))
         content.space(8)
         searchList = column()
         if (splitContent) {
@@ -821,7 +930,13 @@ class MainActivity : Activity() {
         renderWords(preserveDetail = true)
         updateExportButton()
     }
-    private fun renderWords(preserveDetail: Boolean = false) {
+    /**
+     * Rebuilds rows and (in split layout) the detail. [explicitSelection] is the exact row snapshot
+     * a caller acted on (for example the per-row remove entry); it is resolved by key inside this
+     * rebuild instead of trusting whatever [selectedKey] happened to be, so a later global selection
+     * can never substitute another word's binding.
+     */
+    private fun renderWords(preserveDetail: Boolean = false, explicitSelection: LearnedWord? = null) {
         val list = filteredWords()
         searchList?.removeAllViews()
         val summary = listSummary(list)
@@ -830,22 +945,25 @@ class MainActivity : Activity() {
         if (list.isEmpty()) searchList?.addView(text(if (words.isEmpty()) "还没有生词。成功查询后会自动收录。" else "没有匹配的生词。", 18f))
         list.forEach { word ->
             searchList?.addView(vocabularyRow(word) {
-                selectedKey = word.entry.key
-                if (splitContent) renderWords() else showWordDialog(word)
+                openVocabularySnapshot(word.entry.key)
             }.apply {
                 if (splitContent && selectedKey == word.entry.key) background = shape(Paper.lightGreen, 8)
             })
             searchList?.divider()
         }
         detailPanel?.let { detail ->
-            if (preserveDetail && inlineDetail != null) {
+            if (preserveDetail && explicitSelection == null && inlineDetail != null) {
                 inlineDetail?.update(words.firstOrNull { it.entry.key == inlineDetail?.key })
                 return@let
             }
             inlineDetail?.let { closeDeleteFlowFor(it) }
             inlineDetail = null
             detail.removeAllViews()
-            val selected = list.firstOrNull { it.entry.key == selectedKey } ?: list.firstOrNull()
+            // An explicit action resolves only its own exact key; it never falls back to the
+            // current/global selection, so the remove flow cannot bind a different word.
+            val selected = if (explicitSelection != null)
+                list.firstOrNull { it.entry.key == explicitSelection.entry.key }
+            else list.firstOrNull { it.entry.key == selectedKey } ?: list.firstOrNull()
             if (selected == null) detail.addView(text("选择一个生词，查看释义和记录", 18f, Paper.secondary))
             else {
                 selectedKey = selected.entry.key
@@ -901,7 +1019,50 @@ class MainActivity : Activity() {
             setTextColor(if (word.favorite) Paper.warning else Paper.green)
         }
         container.addView(star)
+        // Obvious per-word removal entry. It only invokes the existing scope chooser; both scopes
+        // keep their own confirmation and the whole-word delete still needs a second confirmation.
+        container.addView(
+            VocabularyActions.listRemoveButton(this, word.entry.headword) {
+                openListRemoval(word.entry.key)
+            }
+        )
         return container
+    }
+    /** Opens the detail for exactly [key] from the current list snapshot, never a later selection. */
+    private fun openVocabularySnapshot(key: String) {
+        if (page != MainPage.VOCABULARY) return
+        val exact = words.firstOrNull { it.entry.key == key } ?: return
+        selectedKey = exact.entry.key
+        if (splitContent) renderWords(explicitSelection = exact) else showWordDialog(exact)
+    }
+    /**
+     * The per-row "移除…" action. It re-reads the clicked row's exact snapshot by key and forms a
+     * fresh [WordDetailBinding] from that snapshot (split detail rebuild or dialog), then enters the
+     * original [openDeleteScope] flow. It never synthesizes credentials, calls the repository delete
+     * directly, or acts on a later/global selection; the binding's own stale/owner/admission checks
+     * and the dangerous second confirmation are unchanged.
+     */
+    private fun openListRemoval(key: String) {
+        if (page != MainPage.VOCABULARY || !foreground || isFinishing || isDestroyed) return
+        if (detailBusy) { toast("有保存或删除操作正在进行，请稍后再试"); return }
+        val exact = words.firstOrNull { it.entry.key == key } ?: run {
+            toast("该词已不在当前生词本快照，请刷新后重试"); refresh(); return
+        }
+        if (app.repository.deletions.isStale(key, wordsCredential)) {
+            toast("该词已删除或数据已恢复，请刷新后重新打开详情")
+            refresh(); return
+        }
+        selectedKey = key
+        val binding: WordDetailBinding = if (splitContent) {
+            renderWords(explicitSelection = exact)
+            inlineDetail?.takeIf { it.key == key } ?: run {
+                toast("未能建立该词详情，请重新打开生词本后再试"); return
+            }
+        } else showWordDialog(exact)
+        // A binding for another key, an old generation or an already closed surface must never start
+        // a delete flow even if a late callback somehow reaches here.
+        if (binding.key != key || binding.isStale() || binding.isClosed() || binding.isInvalidated()) return
+        openDeleteScope(binding, exact, null)
     }
     /**
      * Daily lookup lives on its own page. The input only ever feeds the existing [manualLookup]
@@ -1498,7 +1659,17 @@ class MainActivity : Activity() {
         val definition = text("${word.entry.partOfSpeech} ${word.entry.meaning}", 18f)
         content.addView(definition); content.space(8)
         val sourceBadge = badge(PersonalDictionary.label(word.source, word.version))
-        content.addView(sourceBadge, LinearLayout.LayoutParams(-2, -2)); content.divider()
+        content.addView(sourceBadge, LinearLayout.LayoutParams(-2, -2))
+        // The primary "从生词本移除…" entry is deliberately in the top section, so opening a detail
+        // from the list's remove entry shows it immediately instead of hiding it below long text.
+        // The callback enters the original scope/exact/owner flow through this binding only.
+        var removeBinding: WordDetailBinding? = null
+        val removeSection = VocabularyActions.detailSection(this, word.entry.headword) {
+            removeBinding?.let { openDeleteScope(it, word, close) }
+        }
+        content.addView(removeSection.view)
+        content.space(8)
+        content.divider()
         val form = text("原词形：${word.lastForm}", 16f, Paper.secondary)
         content.addView(form)
         val source = text(PersonalDictionary.provenance(word.source, word.version), 16f, Paper.secondary)
@@ -1535,15 +1706,13 @@ class MainActivity : Activity() {
         content.addView(star); content.space(8)
         content.addView(text("星标只是个人收藏标记；取消星标不会删除任何学习记录，也不改掌握状态、查询次数或复习进度。", 16f, Paper.secondary))
         content.space(8)
-        val delete = button("移除学习记录…") {}
-        delete.setTextColor(Paper.error)
-        content.addView(delete)
-        content.space(8)
-        content.addView(text("先选择范围：可以只撤销最近一次查询；或另行确认删除该词的全部学习记录（含已撤销查询、个人笔记、掌握状态、复习进度与收藏星标），删除后无法恢复。原始词库、独立本机词义、其他生词与已导出 PDF 均不受影响。", 16f, Paper.secondary))
-        val binding = WordDetailBinding(word.entry.key, deletionCredential, snapshotVersion, save, undo, delete, star, mastered, note,
+        // removeSection.removeButton is the binding's delete control, so the existing
+        // busy/confirming/stale/invalidated gating still freezes the visible remove entry.
+        val binding = WordDetailBinding(word.entry.key, deletionCredential, snapshotVersion, save, undo, removeSection.removeButton, star, mastered, note,
             form, count, dates, definition, source, sourceBadge, { !detailBusy },
             { app.repository.deletions.isStale(word.entry.key, deletionCredential) }, close,
             word.mastered, word.note, word.favorite)
+        removeBinding = binding
         save.setOnClickListener { saveDetail(binding, word, close) }
         star.setOnClickListener { toggleDetailFavorite(binding) }
         // The shortcut stays exact-event-only: it prepares the latest event under this binding's
@@ -1551,7 +1720,6 @@ class MainActivity : Activity() {
         // The remove entry opens the scope chooser, which never deletes by itself and still needs a
         // second confirmation for full history.
         undo.setOnClickListener { startExactUndoFlow(binding, word, close) }
-        delete.setOnClickListener { openDeleteScope(binding, word, close) }
         binding.update(word)
         return binding
     }
@@ -1911,7 +2079,7 @@ class MainActivity : Activity() {
                 "• 该词的收藏星标（取消星标不会删除任何记录，但整词删除会一并移除）\n\n" +
                 "此操作无法恢复。独立保存的个人词义不会被删除；原始词库、其他生词和已导出的 PDF " +
                 "也不受影响。\n\n" +
-                "如果只想移除最近一次查询，请取消后选择“仅撤销最近一次有效查询”。"
+                "如果只想撤销最近一次查询，请取消后选择“只撤销最近一次查询”。"
         )
         // Check again at the actual attach point, after the dialog and its listener exist.
         if (!isLiveDeleteFlow(flow)) return
@@ -2040,7 +2208,8 @@ class MainActivity : Activity() {
         }
         return cleared
     }
-    private fun showWordDialog(word: LearnedWord) {
+    /** Shows the detail dialog and returns its binding so an explicit row action can use the same flow. */
+    private fun showWordDialog(word: LearnedWord): WordDetailBinding {
         val content = panel()
         val dialog = paperDialog(content)
         val header = row().apply { gravity = Gravity.CENTER_VERTICAL }
@@ -2053,6 +2222,7 @@ class MainActivity : Activity() {
             if (dialogDetail === binding) dialogDetail = null
         }
         dialogDetail = binding
+        return binding
     }
     private fun paperDialog(content: LinearLayout): AlertDialog = AlertDialog.Builder(this).create().apply {
         setView(ScrollView(this@MainActivity).apply { addView(content) }, 0, 0, 0, 0)
@@ -2120,69 +2290,83 @@ class MainActivity : Activity() {
         content.addView(pair(mastery, frequent, splitContent, 24))
     }
     private fun settings() {
-        val content = scrolled()
-        content.addView(text("设置", 28f, bold = true)); content.space(24)
-        val library = column()
-        val source = panel().apply {
-            addView(text("词库来源", 20f, bold = true)); space(12)
-            val identity = column().apply {
-                setPadding(dp(16), dp(12), dp(16), dp(12)); background = shape(Paper.lightGreen, 8)
-                addView(text("原始离线词库 · 未逐条核对", 18f, Paper.green, true))
-                addView(dictionaryStatus())
-            }
-            addView(identity); space(12)
-            addView(text(RawKajwebDictionary.provenance(RawKajwebDictionary.SOURCE, RawKajwebDictionary.VERSION), 16f, Paper.secondary))
-            addView(text("考研 / 四级 / 六级 / 专四 / 专八五本原始词书合并；未应用核验或候选修订。仅查原词头，不猜词形，不回退演示词库。", 16f, Paper.warning))
-        }
-        library.addView(source); library.space(16)
-        val lookupLink = panel().apply {
-            addView(text("查词与补词入口", 20f, bold = true))
-            addView(text("日常查词已移到独立“查词”页；词义维护已移到“添加/补词”页。设置不再承载查词输入。无悬浮窗或屏幕捕获权限时，仍可在查词页手动输入查询。", 16f, Paper.secondary)); space(12)
-            addView(button("打开查词页", true) { selectPage(MainPage.LOOKUP) })
-            addView(button("打开添加/补词页") { selectPage(MainPage.PERSONAL_ENTRY) })
-        }
-        library.addView(lookupLink); library.space(16)
-        val backup = panel().apply {
-            addView(text("备份与恢复", 20f, bold = true)); space(8)
-            addView(text("把本机学习数据（全部词条与事件，含已撤销历史、笔记、掌握状态、统一背词进度与个人补充词库）导出为一个 .shicibackup 文件，或用备份完整覆盖当前数据。文件只通过系统文档选择器创建或读取，不联网、不上传。", 16f, Paper.secondary)); space(12)
-            backupExportButton = button("导出学习数据备份", true) { exportLearningBackup() }
-            addView(backupExportButton); space(8)
-            restoreButton = button("从备份完整恢复") { startRestore() }
-            addView(restoreButton); space(12)
-            addView(text("恢复是完整覆盖、不合并、不猜测冲突：备份里没有的词也会被移除。恢复前必须先把当前数据另存为一个安全备份文件，写回校验通过且数据未变化时才会覆盖。空备份可在确认后清空学习数据。备份是本地明文个人数据，未加密、不防恶意篡改，请妥善保存。", 16f, Paper.warning)); space(8)
-            backupStatusView = text("", 16f, Paper.secondary); addView(backupStatusView)
-            updateBackupButtons()
-        }
-        library.addView(backup)
-        val boundaries = column()
-        val privacy = panel().apply {
-            addView(text("权限与隐私", 20f, bold = true)); space(8)
-            addView(text("悬浮窗权限", 18f, bold = true))
-            val overlayAllowed = Settings.canDrawOverlays(this@MainActivity)
-            addView(badge(if (overlayAllowed) "已允许" else "未允许").apply {
-                if (!overlayAllowed) { setTextColor(Paper.secondary); background = shape(Paper.background, 8) }
-            }, LinearLayout.LayoutParams(-2, -2))
-            addView(text("仅用于在其他应用上显示查词浮层。这是权限状态展示，不是授权开关。", 16f, Paper.secondary)); divider()
-            addView(text("查词会话", 18f, bold = true))
-            floatingText = text(CaptureStatus.state.message, 16f, Paper.secondary); addView(floatingText)
-            addView(text("只在首页主动开启时申请悬浮窗、屏幕捕获及通知权限。全屏捕获可看到整个屏幕；划词时原页面始终显示，仅由透明笔迹层在这一次取词期间接收手势。", 16f, Paper.secondary)); space(12)
-            stopCaptureButton = button("关闭悬浮查词") { stopCapture(); toast("已请求停止查词") }
-            addView(stopCaptureButton); space(8)
-            addView(text("关闭会释放捕获和浮层，不会撤销系统悬浮窗权限。若需撤销，请在系统设置中操作。", 16f, Paper.secondary)); divider()
-            addView(text("数据保存在本机", 18f, bold = true))
-            addView(text("屏幕画面仅在内存中短暂读取并本机识别，不写截图文件、不上传；一笔抬起自动查询，轻点/多指/取消不查询，多个词时选择其中一个词查询，也可在多词原文卡中选择“翻译整句”。查询记录、释义快照、个人笔记、收藏与掌握状态保存在本机数据库。PDF 写入你选择的位置。", 16f, Paper.secondary)); divider()
-            addView(text("离线 AI 翻译组件与网络", 18f, bold = true))
-            addView(text("“离线 AI 翻译”是可选组件，不是查词、补词、生词本、PDF 或背词的前置条件。初装不下载任何模型；未下载时该页只显示组件说明与“下载并启用（仅 Wi-Fi）”入口，原文只读且草稿/选择位置保留，不开放编辑、翻译或复制。只有你明确确认后才由 Google ML Kit 下载英中离线模型（约 30 MB 只是估计，实际以系统为准），并采用 Wi-Fi 条件；不伪造下载进度，失败可主动重试，不会自动重下或改用移动数据。离开/关闭页面不会取消系统下载，系统下载可能继续，再次进入只重新检查本地状态。英文由 Google ML Kit 在设备本机翻译，本应用不上传原文或译文、不使用在线翻译或收费服务。ML Kit 可能为更新模型、诊断和统计而与 Google 通信并发送性能/使用指标，因此本应用并非“完全不联网”；清单中的网络权限仅用于该 SDK。设备需支持 Google Play 服务；模型能否下载、真实译文质量与兼容性仍需实测。", 16f, Paper.secondary))
-        }
-        boundaries.addView(privacy); boundaries.space(16)
-        val limits = panel().apply {
-            addView(text("原型限制", 20f, bold = true)); space(8)
-            addView(text("PDF 导出已接入 A4 复习版与自测版＋答案页；支持按首次收录日期（含首尾）、最近查询/查询次数排序、仅收藏，以及“当前筛选全部”或手动勾选当前结果。导出选项只保存在本次导出中，不是全局设置；PDF 不是备份。正式词典、发音、例句仍未实现；本地备份仅为完整覆盖恢复，不提供合并或云同步。", 16f, Paper.secondary))
-            divider(); addView(text("本页为开发阶段说明：本批实现阶段的离线编译只检查代码可编译，不能代替独立逻辑验收，也不等于功能通过。当前版本与限定验收进度以项目交付记录为准；已完成的限定范围验收不代表整包、真机或平板通过。真实 SDK 模型下载与推理质量、Google Play 兼容性、平板内存与速度、原生窗口、大字模式、海文物理笔及长期功耗仍未验证。", 16f, Paper.warning))
-        }
-        boundaries.addView(limits)
-        content.addView(pair(library, boundaries, splitContent, 24))
+        val screen = SettingsScreen(
+            context = this,
+            overlayStatus = overlayPermissionStatus(),
+            notificationStatus = notificationPermissionStatus(),
+            versionText = "内部版本 ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})",
+            provenanceText = RawKajwebDictionary.provenance(
+                RawKajwebDictionary.SOURCE, RawKajwebDictionary.VERSION
+            ),
+            onOpenOverlayPermission = { openOverlayPermissionSettings() },
+            onOpenNotificationSettings = { openNotificationSettings() },
+            onOpenUsageGuide = { selectPage(MainPage.GUIDE) }
+        )
+        settingsScreen = screen
+        // SettingsScreen already owns the ScrollView body; do not wrap it in scrolled().
+        body.addView(screen.view, LinearLayout.LayoutParams(-1, -1))
+
+        // Activity-owned backup actions/status keep the original callbacks, freeze rules and
+        // request-code handling; the component only hosts the views.
+        val exportButton = button("导出学习数据备份", true) { exportLearningBackup() }
+        backupExportButton = exportButton
+        screen.backupActionHost.addView(exportButton, LinearLayout.LayoutParams(-1, -2))
+        screen.backupActionHost.space(8)
+        val restore = button("从备份完整恢复") { startRestore() }
+        restoreButton = restore
+        screen.backupActionHost.addView(restore, LinearLayout.LayoutParams(-1, -2))
+
+        val backupStatus = text("", 16f, Paper.secondary)
+        backupStatusView = backupStatus
+        screen.backupStatusHost.addView(backupStatus)
+        updateBackupButtons()
+
+        // Dictionary verification keeps its original async update target.
+        screen.dictionaryStatusHost.addView(dictionaryStatus())
+
+        // Capture session status/stop stay owned by the Activity and the existing statusListener.
+        val captureStatus = text(CaptureStatus.state.message, 16f, Paper.secondary)
+        floatingText = captureStatus
+        screen.captureStatusHost.addView(captureStatus)
+        val stopButton = button("关闭悬浮查词") { stopCapture(); toast("已请求停止查词") }
+        stopCaptureButton = stopButton
+        screen.captureActionHost.addView(stopButton, LinearLayout.LayoutParams(-1, -2))
+
         statusListener(CaptureStatus.state)
+    }
+
+    /** Build-time badge snapshot; onStart refreshes it after a system settings round-trip. */
+    private fun overlayPermissionStatus(): SettingsScreen.PermissionStatus {
+        val granted = Settings.canDrawOverlays(this)
+        return SettingsScreen.PermissionStatus(if (granted) "已允许" else "未允许", granted)
+    }
+
+    private fun notificationPermissionStatus(): SettingsScreen.PermissionStatus {
+        if (Build.VERSION.SDK_INT < 33) {
+            return SettingsScreen.PermissionStatus("系统通知无需单独授权", true)
+        }
+        val granted = checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) ==
+            PackageManager.PERMISSION_GRANTED
+        return SettingsScreen.PermissionStatus(if (granted) "已允许" else "未允许", granted)
+    }
+
+    // These entries only open system settings pages. They never request projection/capture and do
+    // not reuse permissionError(), which would stop an active capture session as a side effect.
+    private fun openOverlayPermissionSettings() {
+        runCatching {
+            startActivity(
+                Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
+            )
+        }.onFailure { toast("无法打开悬浮窗权限设置：${it.message}") }
+    }
+
+    private fun openNotificationSettings() {
+        runCatching {
+            startActivity(
+                Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                    .putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
+            )
+        }.onFailure { toast("无法打开通知设置：${it.message}") }
     }
 
     private fun beginCapture() {

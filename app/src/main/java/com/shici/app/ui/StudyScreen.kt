@@ -10,9 +10,10 @@ import com.shici.app.ShiciApplication
 import com.shici.app.core.FeedbackKind
 import com.shici.app.core.StudyBook
 import com.shici.app.core.StudyCard
-import com.shici.app.core.StudyProgress
+import com.shici.app.core.StudyOverview
 import com.shici.app.core.StudyAdmission
 import com.shici.app.core.StudyRules
+import com.shici.app.core.StudyScopeSummary
 import com.shici.app.core.StudyView
 import com.shici.app.core.UnifiedStudyPool
 import com.shici.app.data.StudyCommitOutcome
@@ -25,10 +26,13 @@ import java.time.format.DateTimeFormatter
  * The real 背词 review surface. It draws from the repository's persisted study round and never keeps a
  * parallel in-memory ledger: a committed feedback is re-read, not patched. There is one unified
  * entrance: due reviews first, then new words from the personal query set (recent first) followed by
- * the fixed ky/cet6 books stably interleaved and deduplicated by entry key. Membership is built here
- * from the validated index and the live personal set; entry snapshots go through the application's
- * unified resolver so a user-supplied supplement is what the card shows. All database work runs on
- * the application's single worker; the view is rebuilt on the main thread after each commit.
+ * the fixed ky/cet6 books stably interleaved and deduplicated by entry key. The books are dealt even
+ * when the personal set is empty, so the default 20 new words never require a lookup first; the
+ * visible plan says so explicitly and separates due reviews from that new-word goal. Membership is
+ * built here from the validated index and the live personal set; entry snapshots go through the
+ * application's unified resolver so a user-supplied supplement is what the card shows. All database
+ * work runs on the application's single worker; the view is rebuilt on the main thread after each
+ * commit. The overview is derived only for display and is never persisted or used as a ledger.
  *
  * [context] is the owning Activity: once it is destroyed, every queued worker and every posted
  * continuation checks [Activity.isDestroyed] and does nothing, so an old screen can never touch a
@@ -61,7 +65,7 @@ class StudyScreen(
         content.removeAllViews()
         content.addView(context.text("背词复习 · 统一背诵", 26f, Paper.ink, true))
         content.addView(context.text("固定间隔复习，非经过验证的记忆算法；只按你的真实反馈推进。", 16f, Paper.secondary))
-        content.addView(context.text("到期复习优先；之后先学个人生词（最近查询优先），再按考研/六级原书顺序稳定交错。", 16f, Paper.secondary))
+        content.addView(context.text("个人已查词优先；不足时由考研/六级原书按序补足，默认合计 20 个新学词，无需先查词。", 16f, Paper.secondary))
         content.space(16)
         content.addView(context.text("正在读取学习进度…", 16f, Paper.secondary))
         load(content)
@@ -75,13 +79,21 @@ class StudyScreen(
             val result = runCatching {
                 // planFor loads the personal set and the pinned book index (long reads); studyView
                 // admits the pending-card write only after that, so a destroy during the load still
-                // persists nothing.
-                app.repository.studyView(planFor(), System.currentTimeMillis(), zone, admission)
+                // persists nothing. Reloading never clears an already persisted pending card: the
+                // repository returns it for the same day/scope before considering a new deal.
+                val plan = planFor()
+                val view = app.repository.studyView(plan.membership, System.currentTimeMillis(), zone, admission)
+                // Read-only and bounded: it only counts which personal words are still unlearned,
+                // so the visible plan can say whether the books must fill the new-word slots.
+                StudyLoad(
+                    view,
+                    StudyOverview.from(view, plan.scope, plan.personalKeys, app.repository.studiedKeys())
+                )
             }
             main.post {
                 if (context.isDestroyed) return@post
                 if (token != generation) return@post
-                result.onSuccess { bind(content, it) }
+                result.onSuccess { bind(content, it.view, it.overview) }
                     .onFailure {
                         content.removeAllViews()
                         content.addView(context.text("背词暂时不可用：${it.message}", 18f, Paper.error))
@@ -90,37 +102,50 @@ class StudyScreen(
         }
     }
 
+    private data class StudyLoad(val view: StudyView, val overview: StudyOverview)
+    private data class UnifiedPlan(
+        val membership: StudyMembership,
+        val scope: StudyScopeSummary,
+        val personalKeys: List<String>
+    )
+
     /**
      * The one unified plan: personal vocabulary in recent-query order first, then the two fixed
      * source books interleaved in their original order, deduplicated by entry key. 个人生词 is a
-     * runtime set, 考研/六级 are the pinned index; neither is turned into a separate queue here.
-     * Learned keys are filtered by the repository (due states keep priority), and personal priority
-     * never bypasses a due review. Snapshots resolve through the application's unified resolver so
-     * the card shows the latest original-or-user-supplement meaning instead of a stale word row.
+     * runtime set (possibly empty), 考研/六级 are the pinned index; neither is turned into a
+     * separate queue here. With no personal words the merged order is just the books, so the
+     * default 20 new words are dealt without any lookup. Learned keys are filtered by the
+     * repository (due states keep priority), and personal priority never bypasses a due review.
+     * Snapshots resolve through the application's unified resolver so the card shows the latest
+     * original-or-user-supplement meaning instead of a stale word row.
      */
-    private fun planFor(): StudyMembership {
+    private fun planFor(): UnifiedPlan {
         val books = app.studyBooks.getOrThrow()
         val kaoyan = books.orderedMembers(StudyBook.KAOYAN) ?: error("学习词书缺少${StudyBook.KAOYAN.label}归属")
         val cet6 = books.orderedMembers(StudyBook.CET6) ?: error("学习词书缺少${StudyBook.CET6.label}归属")
-        val keys = UnifiedStudyPool.merged(app.repository.personalMembers(), kaoyan, cet6)
-        return StudyMembership(StudyBook.ALL, keys) { app.resolveEntry(it) }
+        val personal = app.repository.personalMembers()
+        val keys = UnifiedStudyPool.merged(personal, kaoyan, cet6)
+        return UnifiedPlan(
+            StudyMembership(StudyBook.ALL, keys) { app.resolveEntry(it) },
+            StudyScopeSummary(personal.size, kaoyan.size, cet6.size, keys.size),
+            personal
+        )
     }
 
-    private fun bind(content: LinearLayout, view: StudyView) {
+    private fun bind(content: LinearLayout, view: StudyView, overview: StudyOverview) {
         content.removeAllViews()
         content.addView(context.text("背词复习 · 统一背诵", 26f, Paper.ink, true))
         content.addView(context.text("固定间隔复习，非经过验证的记忆算法；只按你的真实反馈推进。", 16f, Paper.secondary))
-        content.addView(context.text("统一范围：个人生词 + 考研 + 六级；同词只保留一份进度，不要求切换词书。", 16f, Paper.secondary))
         content.space(8)
+        content.addView(planBlock(overview, content))
+        content.space(12)
         content.addView(goalRow(view.settings.dailyNewGoal))
-        content.addView(context.text("范围 ${StudyRules.MIN_DAILY_NEW_GOAL}–${StudyRules.MAX_DAILY_NEW_GOAL}，默认 ${StudyRules.DEFAULT_DAILY_NEW_GOAL}。", 16f, Paper.secondary))
+        content.addView(context.text("每日新学目标范围 ${StudyRules.MIN_DAILY_NEW_GOAL}–${StudyRules.MAX_DAILY_NEW_GOAL}（默认 ${StudyRules.DEFAULT_DAILY_NEW_GOAL}）；调整不会重置今天已学的词。", 16f, Paper.secondary))
         content.addView(context.text("释义来自原始词书（未逐条核对）或本机用户补充；不联网、不自动生成。", 16f, Paper.secondary))
         content.divider()
-        content.addView(progressBlock(view.progress))
-        content.space(16)
         val card = view.card
         if (card == null) {
-            content.addView(context.text(emptyMessage(view.progress), 18f, Paper.ink))
+            content.addView(context.text(emptyMessage(overview), 18f, Paper.ink))
             return
         }
         content.addView(cardBlock(card, view.credential))
@@ -136,11 +161,42 @@ class StudyScreen(
         addView(context.button("+5", primary = false) { setGoal(goal + 5) })
     }
 
-    private fun progressBlock(progress: StudyProgress): LinearLayout = context.column().apply {
-        addView(context.text("今日新词 ${progress.introducedToday} 个 · 今日剩余新词额度 ${progress.newRemaining} 个", 18f))
-        addView(context.text("到期待复习 ${progress.dueNow} 词 · 今日已反馈 ${progress.todayAnswers} 次（${progress.todayReviewed} 词）· 累计已学 ${progress.totalIntroduced} 词",
+    /**
+     * The visible "今日计划 / 开始或继续学习" entrance. Every number comes from the persisted round
+     * through [StudyOverview]; this block never writes, never counts a feedback as a word and never
+     * folds due reviews into the new-word goal. The button only re-reads the round, so a persisted
+     * pending card is resumed instead of being cleared or re-dealt.
+     */
+    private fun planBlock(overview: StudyOverview, content: LinearLayout): LinearLayout = context.column().apply {
+        setPadding(context.dp(16), context.dp(16), context.dp(16), context.dp(16))
+        background = context.shape(Paper.surface, 12, true)
+        addView(context.text("今日计划", 20f, Paper.ink, true))
+        addView(context.text("新学目标 ${overview.dailyNewGoal} 词/天（默认 ${StudyRules.DEFAULT_DAILY_NEW_GOAL}）。无需先查词：个人已查词优先；个人不足时按原书顺序直接从考研/六级补足，合计占 ${overview.dailyNewGoal} 个新学词。",
             16f, Paper.secondary))
-        progress.nextDueAt?.let { addView(context.text("下一张到期：${time(it)}", 16f, Paper.secondary)) }
+        addView(context.text("统一范围：个人生词 ${overview.scope.personal} 词 + 考研 ${overview.scope.kaoyan} 词 + 六级 ${overview.scope.cet6} 词；按词条去重后 ${overview.scope.unified} 词，同词只保留一份进度。",
+            16f, Paper.secondary))
+        when {
+            overview.scope.personal == 0 ->
+                addView(context.text("个人生词为 0：现在会直接发考研/六级原书新词卡，不需要先查词。", 16f, Paper.green))
+            overview.personalUnlearned == 0 ->
+                addView(context.text("个人生词都已学过：新学名额由考研/六级原书按序补足。", 16f, Paper.green))
+            else ->
+                addView(context.text("个人还有 ${overview.personalUnlearned} 个未学生词，优先占用新学名额；用完后由考研/六级原书按序补足。", 16f, Paper.green))
+        }
+        addView(context.text("个人与词书共同占用同一个每日新学目标，不各算一份。", 16f, Paper.secondary))
+        addView(context.text("本次可学 ${overview.cardsAvailableNow} 张卡：新词 ${overview.newRemaining} 张 + 到期复习 ${overview.dueNow} 张（到期复习另列，不占新学目标，优先出现）。",
+            18f))
+        addView(context.text("今日已新学 ${overview.introducedToday} / ${overview.dailyNewGoal} 词 · 目标剩余 ${overview.goalRemaining} 词 · 当前还可新学 ${overview.newRemaining} 词（受目标与可用词库共同限制）。",
+            16f, Paper.secondary))
+        addView(context.text("今日已反馈 ${overview.todayAnswers} 次（涉及 ${overview.todayReviewed} 词）· 累计已学 ${overview.totalIntroduced} 词。",
+            16f, Paper.secondary))
+        if (!overview.startedToday && overview.pendingCard) {
+            addView(context.text("今天还没有提交反馈：当前卡只是待答，不计入已新学，也不算完成。", 16f, Paper.secondary))
+        }
+        overview.nextDueAt?.let { addView(context.text("下一张到期：${time(it)}", 16f, Paper.secondary)) }
+        addView(context.button(overview.entryLabel, primary = true) { if (!busy) load(content) })
+        addView(context.text("开始/继续只读取并接着今天已保存的进度和待答卡；不会清空待答卡、学习进度或每日目标。",
+            16f, Paper.secondary))
     }
 
     private fun cardBlock(card: StudyCard, credential: Long): LinearLayout = context.column().apply {
@@ -181,11 +237,15 @@ class StudyScreen(
         }
     }
 
-    private fun emptyMessage(progress: StudyProgress): String = when {
-        progress.dueNow > 0 -> "有 ${progress.dueNow} 个到期词，但暂时没有可显示的卡片。"
-        progress.newRemaining > 0 -> "可以开始学习新词。"
-        progress.nextDueAt != null -> "今日目标已完成，也没有到期复习；下一张 ${time(progress.nextDueAt!!)} 到期。"
-        else -> "统一范围内已全部学过，且暂无到期复习。"
+    private fun emptyMessage(overview: StudyOverview): String {
+        val nextDue = overview.nextDueAt
+        return when {
+            overview.dueNow > 0 -> "有 ${overview.dueNow} 个到期词，但暂时没有可显示的卡片；请刷新学习计划。"
+            overview.newRemaining > 0 -> "词库当前还有 ${overview.newRemaining} 个新词可学，但暂时没有可显示的卡片；请刷新学习计划。"
+            overview.goalRemaining > 0 -> "今日新学目标还剩 ${overview.goalRemaining} 词，但统一范围里已没有未学新词；没有到期复习。"
+            nextDue != null -> "今日新学目标已完成（${overview.introducedToday} / ${overview.dailyNewGoal} 词），没有到期复习；下一张 ${time(nextDue)} 到期。"
+            else -> "今日新学目标已完成（${overview.introducedToday} / ${overview.dailyNewGoal} 词），统一范围内已全部学过，且暂无到期复习。"
+        }
     }
 
     private fun setGoal(goal: Int) {

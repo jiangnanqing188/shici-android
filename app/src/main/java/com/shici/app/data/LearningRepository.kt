@@ -738,6 +738,17 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
     fun personalMembers(): List<String> = words().map { it.entry.key }
 
     /**
+     * Read-only study statistic: the entry keys that already have a persisted study state. It is used
+     * only to describe how many personal words are still unlearned for the visible plan; it is
+     * bounded by the number of introduced words and writes nothing. It is never a scheduling input:
+     * [studyView] remains the only place that orders, caps and deals cards.
+     */
+    fun studiedKeys(): Set<String> =
+        readableDatabase.rawQuery("SELECT entry_key FROM study_states", null).use { c ->
+            buildSet { while (c.moveToNext()) add(c.text("entry_key")) }
+        }
+
+    /**
      * Reads the current study round for [plan] and, when no card is pending for today and this book,
      * deals exactly one card (persisted with its immutable snapshot). Dealing is not a committed
      * user-data change, so it publishes nothing; only a real feedback commit publishes. Due words come
