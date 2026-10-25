@@ -26,10 +26,13 @@ import java.time.format.DateTimeFormatter
 /**
  * The real 背词 review surface. It draws from the repository's persisted study round and never keeps a
  * parallel in-memory ledger: a committed feedback is re-read, not patched. There is one unified
- * entrance: due reviews first, then new words from the personal query set (recent first) followed by
- * the fixed ky/cet6 books stably interleaved and deduplicated by entry key. The books are dealt even
- * when the personal set is empty, so the default 20 new words never require a lookup first; the
- * collapsed 学习规则 says so and keeps due reviews separate from that new-word goal. Membership is
+ * entrance: due reviews first, then new words mixed from the live personal query set (recent first)
+ * and a per-day stable sample of the fixed ky/cet6 books, deduplicated by entry key. With both
+ * streams available they alternate, starting from the personal stream on an even count of today's
+ * committed new words and from the books on an odd one, so a reload after each feedback does not
+ * always restart from the personal set; one stream alone fills the whole goal, so the default 20 new
+ * words never require a lookup first. The collapsed 学习规则 says so and keeps due reviews separate
+ * from that new-word goal. Membership is
  * built here from the validated index and the live personal set; entry snapshots go through the
  * application's unified resolver so a user-supplied supplement is what the card shows. All database
  * work runs on the application's single worker; the view is rebuilt on the main thread after each
@@ -79,8 +82,11 @@ class StudyScreen(
                 // admits the pending-card write only after that, so a destroy during the load still
                 // persists nothing. Reloading never clears an already persisted pending card: the
                 // repository returns it for the same day/scope before considering a new deal.
-                val plan = planFor()
-                val view = app.repository.studyView(plan.membership, System.currentTimeMillis(), zone, admission)
+                // One `now` builds both the plan's day sample and the study day bucket, so a load
+                // crossing midnight cannot plan for one day and count/deal for another.
+                val now = System.currentTimeMillis()
+                val plan = planFor(now)
+                val view = app.repository.studyView(plan.membership, now, zone, admission)
                 // Read-only and bounded: it only counts which personal words are still unlearned,
                 // so the visible plan can say whether the books must fill the new-word slots.
                 StudyLoad(
@@ -109,21 +115,29 @@ class StudyScreen(
     )
 
     /**
-     * The one unified plan: personal vocabulary in recent-query order first, then the two fixed
-     * source books interleaved in their original order, deduplicated by entry key. 个人生词 is a
-     * runtime set (possibly empty), 考研/六级 are the pinned index; neither is turned into a
-     * separate queue here. With no personal words the merged order is just the books, so the
-     * default 20 new words are dealt without any lookup. Learned keys are filtered by the
-     * repository (due states keep priority), and personal priority never bypasses a due review.
-     * Snapshots resolve through the application's unified resolver so the card shows the latest
+     * The one unified plan built for the same [now] used by the study view: unlearned personal
+     * vocabulary in recent-query order and the two fixed source books sampled by a stable
+     * `dayKey + key` hash, deduplicated by entry key and alternated. Today's committed new-word
+     * count (not a UI counter) decides which stream goes first, so feedback reloads keep rotating.
+     * 个人生词 is a runtime set (possibly empty), 考研/六级 are the pinned index; neither is turned
+     * into a separate queue here. With no personal words the books alone fill the default 20 new
+     * words without any lookup. Learned keys stay in the membership at the end but are never dealt
+     * as new; the repository still keeps due reviews ahead of every new word. Snapshots resolve
+     * through the application's unified resolver so the card shows the latest
      * original-or-user-supplement meaning instead of a stale word row.
      */
-    private fun planFor(): UnifiedPlan {
+    private fun planFor(now: Long): UnifiedPlan {
         val books = app.studyBooks.getOrThrow()
         val kaoyan = books.orderedMembers(StudyBook.KAOYAN) ?: error("学习词书缺少${StudyBook.KAOYAN.label}归属")
         val cet6 = books.orderedMembers(StudyBook.CET6) ?: error("学习词书缺少${StudyBook.CET6.label}归属")
         val personal = app.repository.personalMembers()
-        val keys = UnifiedStudyPool.merged(personal, kaoyan, cet6)
+        // Both reads are bounded, read-only and use the same day bucket as studyView. The committed
+        // count decides the next pool's parity; the studied set keeps already-learned words out of
+        // both new streams without touching any existing state.
+        val dayKey = StudyRules.dayKey(now, zone)
+        val studied = app.repository.studiedKeys()
+        val introducedToday = app.repository.introducedNewCount(now, zone)
+        val keys = UnifiedStudyPool.dailyMerged(personal, kaoyan, cet6, dayKey, studied, introducedToday)
         return UnifiedPlan(
             StudyMembership(StudyBook.ALL, keys) { app.resolveEntry(it) },
             StudyScopeSummary(personal.size, kaoyan.size, cet6.size, keys.size),
@@ -136,7 +150,7 @@ class StudyScreen(
         content.addView(context.text("背词", 26f, Paper.ink, true))
         content.addView(context.text(summaryLine(overview), 18f, Paper.ink))
         content.addView(context.text(
-            "个人生词优先，不足由考研/六级原书补足，合计 ${overview.dailyNewGoal} 个新学词/天。",
+            "原书抽词＋查过的词，每天合计 ${overview.dailyNewGoal} 个新词。",
             16f, Paper.secondary
         ))
         content.space(12)
@@ -169,12 +183,13 @@ class StudyScreen(
         return ui.helpDisclosure("学习规则") {
             addView(ui.text("固定间隔复习：第 1、3、7、14、30 天；只按你的真实反馈推进。", 16f, Paper.secondary))
             addView(ui.text("认识：进入下一阶段；模糊：阶段不变、明天再来；忘记：回到第一阶段，约 10 分钟后再出现。", 16f, Paper.secondary))
-            addView(ui.text("个人生词优先，与考研/六级共用同一个每日新学目标，不各算一份；按词条去重，同词只保留一份进度。", 16f, Paper.secondary))
+            addView(ui.text("个人已查词与考研/六级原书共用同一个每日新学目标，不各算一份；按词条去重，同词只保留一份进度。", 16f, Paper.secondary))
+            addView(ui.text("两池都有词时按今日已提交的新词数轮流抽取，个人词先抽但不独占名额；某池不足时由另一池补上。", 16f, Paper.secondary))
             addView(ui.text("范围：个人生词 ${overview.scope.personal} + 考研 ${overview.scope.kaoyan} + 六级 ${overview.scope.cet6}，去重后 ${overview.scope.unified} 词。", 16f, Paper.secondary))
             val personalStatus = when {
                 overview.scope.personal == 0 -> "个人生词为 0：直接发考研/六级原书新词卡，不需要先查词。"
-                overview.personalUnlearned == 0 -> "个人生词都已学过：新学名额由考研/六级原书按序补足。"
-                else -> "个人还有 ${overview.personalUnlearned} 个未学生词，优先占用新学名额；用完后由考研/六级原书按序补足。"
+                overview.personalUnlearned == 0 -> "个人生词都已学过：新学名额全部由考研/六级原书按当天抽词序补足。"
+                else -> "个人还有 ${overview.personalUnlearned} 个未学生词，与考研/六级原书轮换混合，不独占新学名额。"
             }
             addView(ui.text(personalStatus, 16f, Paper.green))
             addView(ui.text("每日新学目标范围 ${StudyRules.MIN_DAILY_NEW_GOAL}–${StudyRules.MAX_DAILY_NEW_GOAL}（默认 ${StudyRules.DEFAULT_DAILY_NEW_GOAL}）；调整不会重置今天已学的词。", 16f, Paper.secondary))

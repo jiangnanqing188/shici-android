@@ -739,9 +739,9 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
 
     /**
      * Read-only study statistic: the entry keys that already have a persisted study state. It is used
-     * only to describe how many personal words are still unlearned for the visible plan; it is
-     * bounded by the number of introduced words and writes nothing. It is never a scheduling input:
-     * [studyView] remains the only place that orders, caps and deals cards.
+     * to describe how many personal words are still unlearned for the visible plan and to keep those
+     * learned keys out of the plan's new-word streams; it is bounded by the number of introduced
+     * words and writes nothing. [studyView] remains the only place that caps and deals cards.
      */
     fun studiedKeys(): Set<String> =
         readableDatabase.rawQuery("SELECT entry_key FROM study_states", null).use { c ->
@@ -749,11 +749,23 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
         }
 
     /**
+     * Read-only count of new words really introduced in [now]'s local day bucket. It reuses the same
+     * [StudyRules.dayKey] bucket and the same `countIntroduced` statement that [studyView] and the
+     * feedback commit already use, so the plan's personal/original-book rotation parity is driven by
+     * committed `new_word` feedback rows, never by a UI-side counter. This writes no row, deals no
+     * card and publishes no change; existing study/backup/delete statements are untouched.
+     */
+    fun introducedNewCount(now: Long, zone: ZoneId): Int =
+        countIntroduced(readableDatabase, StudyRules.dayKey(now, zone))
+
+    /**
      * Reads the current study round for [plan] and, when no card is pending for today and this book,
      * deals exactly one card (persisted with its immutable snapshot). Dealing is not a committed
      * user-data change, so it publishes nothing; only a real feedback commit publishes. Due words come
-     * first (stable by due time then key), then new words in fixed book order, capped by the remaining
-     * daily new-word quota. A card only due in ten minutes is not dealt now and does not block new words.
+     * first (stable by due time then key), then new words in the order the caller's [plan] supplies,
+     * capped by the remaining daily new-word quota. The UI passes the daily mixed order, so this method
+     * itself never chooses between the personal and original-book streams. A card only due in ten
+     * minutes is not dealt now and does not block new words.
      */
     fun studyView(plan: StudyMembership, now: Long, zone: ZoneId,
                   admission: StudyAdmission? = null): StudyView {

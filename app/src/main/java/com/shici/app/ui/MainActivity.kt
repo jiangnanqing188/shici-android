@@ -114,6 +114,10 @@ class MainActivity : Activity() {
     // Vocabulary page filter/selection. They live in fields (not in rebuilt views) so an ordinary
     // snapshot refresh or a split-detail rebuild keeps the user's search, filter, checks and detail.
     private var onlyFavorites = false
+    // Display order for the vocabulary list. It lives in a field (not in the rebuilt strip) so a
+    // search/favorite change, a snapshot refresh or rotation keeps the user's chosen order. It only
+    // reorders the already-filtered snapshot; it never changes the export selection or any count.
+    private var vocabularySort = VocabularySort.RECENT_FIRST
     private val exportSelection = linkedSetOf<String>()
     // Export scope intent, kept together with [exportSelection] across refreshes, search/favorite
     // filters, navigation and rotation. `false` is the untouched default: no checkbox has ever been
@@ -123,6 +127,10 @@ class MainActivity : Activity() {
     // must never fall back to "all". Only the visible "use all current results" action resets it.
     private var exportSelectionExplicit = false
     private var favoriteFilterView: FavoriteFilterView? = null
+    private var vocabularySortView: VocabularySortView? = null
+    // The single live animated guide page. Only one may exist: a rebuild/re-entry pauses and closes
+    // the old one before a new screen is created, so no detached instance keeps animating.
+    private var guideScreen: UsageGuideScreen? = null
     // Translation page draft and the single owner of its ML Kit session. The draft survives page
     // switches and rotation; the translator itself is closed on leave/stop/destroy and is recreated
     // only when the page is entered again (which performs a local model check, never a download).
@@ -365,6 +373,10 @@ class MainActivity : Activity() {
             translationSelectionStart, translationInput.length
         )
         onlyFavorites = savedInstanceState?.getBoolean("favorites_only", false) ?: false
+        // An unknown/absent/old name falls back to the default instead of failing the restore.
+        vocabularySort = savedInstanceState?.getString("vocabulary_sort")
+            ?.let { name -> VocabularySort.entries.firstOrNull { it.name == name } }
+            ?: VocabularySort.RECENT_FIRST
         savedInstanceState?.getStringArrayList("export_selection")?.let { exportSelection.addAll(it) }
         // Old bundles carried no intent flag: a restored non-empty list was the historical explicit
         // allow-list, while a restored empty list meant the default "current filter" scope. New
@@ -477,6 +489,9 @@ class MainActivity : Activity() {
                 overlayPermissionStatus(), notificationPermissionStatus()
             )
         }
+        // Only the page that is currently showing may run its single demo animation. The screen was
+        // created by render() during onCreate (before onStart) or by a page switch while started.
+        if (page == MainPage.GUIDE) guideScreen?.onHostResume()
         refresh()
         loadDictionaryStatus()
     }
@@ -484,6 +499,9 @@ class MainActivity : Activity() {
         // Refuse every favorite mutation that was queued by a surface that is no longer in front.
         foreground = false
         interactionEpoch++
+        // Cancel the guide's single bounded animator; nothing keeps drawing in background. The
+        // instance stays for a later onStart resume, and is closed on leave/rebuild/destroy.
+        guideScreen?.onHostPause()
         // Retain the visible draft, then release the ML Kit owner. The next onStart rebuilds the page
         // with a fresh owner only on the local model check, never an automatic translation/download.
         captureTranslationDraft()
@@ -529,6 +547,8 @@ class MainActivity : Activity() {
         // Invalidate the study surface's cross-thread admission before the Activity is gone. Workers
         // that already reached their transaction may finish atomically; ones still reading refuse it.
         if (studyScreenDelegate.isInitialized()) studyScreen.onDestroy()
+        // Permanent, idempotent stop; the Activity drops its only reference to the old screen.
+        guideScreen?.close(); guideScreen = null
         restorePreviewDialog?.dismiss(); restorePreviewDialog = null
         activeDialog?.dismiss(); activeDialog = null
         super.onDestroy()
@@ -557,6 +577,7 @@ class MainActivity : Activity() {
         outState.putInt("translation_sel_start", translationSelectionStart)
         outState.putInt("translation_sel_end", translationSelectionEnd)
         outState.putBoolean("favorites_only", onlyFavorites)
+        outState.putString("vocabulary_sort", vocabularySort.name)
         outState.putStringArrayList("export_selection", ArrayList(exportSelection))
         // The intent is part of the selection identity: an explicit empty selection is 0 words, not
         // the default "all". Old readers without this key keep their historical interpretation.
@@ -727,6 +748,10 @@ class MainActivity : Activity() {
         backupExportButton = null; restoreButton = null; backupStatusView = null
         settingsScreen = null
         lookupInputView = null; personalStatusView = null; favoriteFilterView = null
+        vocabularySortView = null
+        // A rebuild never leaves the previous guide screen alive behind detached views. It is closed
+        // permanently; the GUIDE branch below creates the only new instance when it is still current.
+        guideScreen?.close(); guideScreen = null
         body.removeAllViews()
         renderNavState()
         when (page) {
@@ -833,6 +858,8 @@ class MainActivity : Activity() {
      * and no topic action queries, records, downloads or deletes anything.
      */
     private fun guidePage() {
+        // render() already closed the previous instance; this is the defensive single-owner path.
+        guideScreen?.close()
         val screen = UsageGuideScreen(
             context = this,
             firstRun = false,
@@ -841,8 +868,12 @@ class MainActivity : Activity() {
             onDismissFirstRun = { markGuideSeen() },
             onBack = { selectPage(MainPage.HOME) }
         )
+        guideScreen = screen
         // The component is already a ScrollView; do not wrap it in scrolled().
         body.addView(screen.view, LinearLayout.LayoutParams(-1, -1))
+        // Drive the single bounded demo only while this page is actually in front. onCreate's first
+        // render is before onStart, so onStart performs the resume for that path.
+        if (foreground) screen.onHostResume()
     }
 
     private fun vocabulary() {
@@ -868,6 +899,13 @@ class MainActivity : Activity() {
             }
         }
         content.addView(favoriteFilterView); content.space(8)
+        // Display order for exactly the same filtered snapshot the checkboxes/export use. The
+        // constructor does not notify; a tap only re-renders rows and the summary text.
+        vocabularySortView = VocabularySortView(this, vocabularySort) { value ->
+            vocabularySort = value
+            renderWords(preserveDetail = true)
+        }
+        content.addView(vocabularySortView); content.space(8)
         val selectionRow = row().apply { gravity = Gravity.CENTER_VERTICAL }
         selectionRow.addView(button("全选结果") { selectAllFilteredForExport() },
             LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(8) })
@@ -964,7 +1002,9 @@ class MainActivity : Activity() {
      * can never substitute another word's binding.
      */
     private fun renderWords(preserveDetail: Boolean = false, explicitSelection: LearnedWord? = null) {
-        val list = filteredWords()
+        // Same filtered membership as the export scope, only the display order changes. Export
+        // selection stays keyed by entry.key, so reordering never adds, drops or widens a check.
+        val list = VocabularyOrdering.apply(filteredWords(), vocabularySort)
         searchList?.removeAllViews()
         val summary = listSummary(list)
         wordListHeader = text(summary, 14f, Paper.secondary)
@@ -1014,7 +1054,7 @@ class MainActivity : Activity() {
                 "已勾选 ${exportSelection.size} 个（筛选内 $inFilter 个）"
             }
         }
-        return "$count · 最近查询优先 · $scope"
+        return "$count · 排序：${vocabularySort.label} · $scope"
     }
     private fun refreshListSummary() { wordListHeader?.text = listSummary(filteredWords()) }
     /**

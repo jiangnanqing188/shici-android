@@ -61,8 +61,22 @@ object UsageGuide {
 
     const val TITLE = "使用引导"
     const val INTRO =
-        "按下面的短步骤了解每一页做什么，以及哪些动作必须由你自己点。任何一步都可以跳过；" +
-            "这份引导可以随时从设置或首页重新打开。"
+        "下面每次只演示一个真实操作：看手指或笔尖怎么移动、什么时候抬笔、结果卡何时出现。" +
+            "每步配一句提示；任何一步都可以跳过，这份引导可以随时重新打开。"
+
+    // Demo controls. "跳过" and "完成" are the only actions that dismiss the first-run prompt;
+    // opening this page, switching scenes or replaying a step never writes guide_seen_v1.
+    const val DEMO_BADGE = "演示"
+    const val DEMO_NOTE = "以上为本地示意：不会真实查询、写库、申请权限或下载。"
+    const val STATIC_HINT = "系统已关闭动画：点按演示图可逐个查看关键阶段。"
+    const val PREV_LABEL = "上一步"
+    const val NEXT_LABEL = "下一步"
+    const val REPLAY_LABEL = "重播"
+    const val SKIP_LABEL = "跳过"
+    const val DONE_LABEL = "完成"
+    const val USE_LABEL_PREFIX = "去使用："
+    const val LONG_HELP_TITLE = "完整说明与边界"
+    const val LONG_HELP_DESCRIPTION = "逐页文字说明、权限边界和危险操作细节；默认收起，需要时再展开。"
     const val NO_PERMISSION_FALLBACK =
         "没有悬浮窗或屏幕捕获权限时，仍可打开「查词」页手动输入单词查询；手动查词不依赖投影。"
     const val NO_AUTOMATION =
@@ -161,12 +175,14 @@ object UsageGuide {
         ),
         GuideTopic(
             id = "study",
-            title = "5. 背词：统一范围、默认 20 个新词与到期复习",
-            summary = "到期复习优先；个人生词与考研/六级原书共用一个队列和一份进度。",
+            title = "5. 背词：统一范围、默认合计 20 个新词与到期复习",
+            summary = "到期复习优先；个人生词与考研/六级原书两池混合抽取，共用一个队列和一份进度。",
             steps = listOf(
-                "背词只有一个统一入口：先到期待复习，再学新词。新词先取个人生词（最近查询优先），再按考研/六级原书顺序稳定交错。",
-                "同一个词只保留一份进度，不需要切换词书；个人生词和原始词书不会形成两套复习。",
-                "每日新词目标默认 20，可在本页调整（范围 1–200）；“新词”只在第一次真实反馈后才算已引入。",
+                "背词只有一个统一入口：先到期待复习，再学新词。每日新词默认合计 20 个，可在本页调整（范围 1–200）。",
+                "两池都有词时，个人生词与当天原书抽样按约 1:1 交替加入同一队列，不再先把个人生词用完才轮到原书；某一池不足时由另一池补足。",
+                "原书词按当天稳定抽样顺序出现：同一天、同一进度重新进入结果一致，换一天会抽到不同样本。",
+                "没查过的原书词也能直接背，背词不以先查询为前提；查询收录的个人词只是其中一池。",
+                "同一个词只保留一份进度，不需要切换词书；个人词和原书不会形成两套复习。",
                 "每张卡只有「认识 / 模糊 / 忘记」三个真实反馈：认识按 1/3/7/14/30 天递增，模糊 1 天后回来，忘记 10 分钟后重新学。",
                 "释义来自原始词书（未逐条核对）或本机用户补充；不联网、不自动生成。",
                 "这是固定间隔复习，不是经过验证的记忆算法；进度只按你的真实反馈推进。"
