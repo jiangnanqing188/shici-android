@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.view.Gravity
 import android.view.View
 import android.widget.*
 
@@ -57,3 +58,43 @@ fun Context.pair(first: View, second: View, horizontal: Boolean, gap: Int = 16):
             else LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(gap) })
         addView(second, if (horizontal) LinearLayout.LayoutParams(0, -2, 1f) else LinearLayout.LayoutParams(-1, -2))
     }
+
+/**
+ * Collapsed, purely presentational help block.
+ *
+ * The returned vertical container shows a >=48dp toggle followed by [buildContent]'s static views,
+ * which start GONE. Tapping the toggle only flips visibility and the arrow/state description; it
+ * never starts capture, opens a permission page, queries, downloads or writes anything. The host is
+ * responsible for keeping inputs, primary actions, live status and required consent outside this
+ * helper. No fixed height is set, so long text wraps and the block grows with the font scale.
+ *
+ * [buildContent] runs synchronously during construction with the hidden body as receiver, so it may
+ * only add static views; it must not depend on an Activity or start asynchronous work.
+ */
+fun Context.helpDisclosure(title: String, buildContent: LinearLayout.() -> Unit): View {
+    val container = column()
+    val body = column().apply { visibility = View.GONE }
+    body.buildContent()
+
+    val toggle = Button(this).apply {
+        isAllCaps = false
+        textSize = 16f
+        minHeight = dp(48)
+        gravity = Gravity.START or Gravity.CENTER_VERTICAL
+        setTextColor(Paper.green)
+        background = shape(Paper.lightGreen, 8)
+        setPadding(dp(12), dp(8), dp(12), dp(8))
+        text = "$title ▾"
+        contentDescription = "$title，当前已收起，点按展开"
+        setOnClickListener {
+            val expand = body.visibility != View.VISIBLE
+            body.visibility = if (expand) View.VISIBLE else View.GONE
+            text = "$title ${if (expand) "▴" else "▾"}"
+            contentDescription = "$title，当前${if (expand) "已展开，点按收起" else "已收起，点按展开"}"
+        }
+    }
+
+    container.addView(toggle, LinearLayout.LayoutParams(-1, -2))
+    container.addView(body, LinearLayout.LayoutParams(-1, -2))
+    return container
+}

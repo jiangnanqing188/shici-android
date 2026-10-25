@@ -4,6 +4,7 @@ import android.app.Activity
 import android.os.Handler
 import android.os.Looper
 import android.view.Gravity
+import android.view.View
 import android.widget.Button
 import android.widget.LinearLayout
 import com.shici.app.ShiciApplication
@@ -28,7 +29,7 @@ import java.time.format.DateTimeFormatter
  * entrance: due reviews first, then new words from the personal query set (recent first) followed by
  * the fixed ky/cet6 books stably interleaved and deduplicated by entry key. The books are dealt even
  * when the personal set is empty, so the default 20 new words never require a lookup first; the
- * visible plan says so explicitly and separates due reviews from that new-word goal. Membership is
+ * collapsed 学习规则 says so and keeps due reviews separate from that new-word goal. Membership is
  * built here from the validated index and the live personal set; entry snapshots go through the
  * application's unified resolver so a user-supplied supplement is what the card shows. All database
  * work runs on the application's single worker; the view is rebuilt on the main thread after each
@@ -63,10 +64,7 @@ class StudyScreen(
 
     fun render(content: LinearLayout) {
         content.removeAllViews()
-        content.addView(context.text("背词复习 · 统一背诵", 26f, Paper.ink, true))
-        content.addView(context.text("固定间隔复习，非经过验证的记忆算法；只按你的真实反馈推进。", 16f, Paper.secondary))
-        content.addView(context.text("个人已查词优先；不足时由考研/六级原书按序补足，默认合计 20 个新学词，无需先查词。", 16f, Paper.secondary))
-        content.space(16)
+        content.addView(context.text("背词", 26f, Paper.ink, true))
         content.addView(context.text("正在读取学习进度…", 16f, Paper.secondary))
         load(content)
     }
@@ -97,6 +95,7 @@ class StudyScreen(
                     .onFailure {
                         content.removeAllViews()
                         content.addView(context.text("背词暂时不可用：${it.message}", 18f, Paper.error))
+                        content.addView(context.text("请返回上一页后重新进入背词再试。", 16f, Paper.secondary))
                     }
             }
         }
@@ -134,21 +133,54 @@ class StudyScreen(
 
     private fun bind(content: LinearLayout, view: StudyView, overview: StudyOverview) {
         content.removeAllViews()
-        content.addView(context.text("背词复习 · 统一背诵", 26f, Paper.ink, true))
-        content.addView(context.text("固定间隔复习，非经过验证的记忆算法；只按你的真实反馈推进。", 16f, Paper.secondary))
-        content.space(8)
-        content.addView(planBlock(overview, content))
+        content.addView(context.text("背词", 26f, Paper.ink, true))
+        content.addView(context.text(summaryLine(overview), 18f, Paper.ink))
+        content.addView(context.text(
+            "个人生词优先，不足由考研/六级原书补足，合计 ${overview.dailyNewGoal} 个新学词/天。",
+            16f, Paper.secondary
+        ))
         content.space(12)
-        content.addView(goalRow(view.settings.dailyNewGoal))
-        content.addView(context.text("每日新学目标范围 ${StudyRules.MIN_DAILY_NEW_GOAL}–${StudyRules.MAX_DAILY_NEW_GOAL}（默认 ${StudyRules.DEFAULT_DAILY_NEW_GOAL}）；调整不会重置今天已学的词。", 16f, Paper.secondary))
-        content.addView(context.text("释义来自原始词书（未逐条核对）或本机用户补充；不联网、不自动生成。", 16f, Paper.secondary))
-        content.divider()
         val card = view.card
         if (card == null) {
             content.addView(context.text(emptyMessage(overview), 18f, Paper.ink))
-            return
+            content.addView(context.button(overview.entryLabel, primary = true) { if (!busy) load(content) })
+        } else {
+            content.addView(cardBlock(card, view.credential))
         }
-        content.addView(cardBlock(card, view.credential))
+        content.space(12)
+        content.addView(goalRow(view.settings.dailyNewGoal))
+        content.addView(rulesDisclosure(overview))
+        content.space(8)
+        content.addView(context.badge("词义来源：原始词书 / 本机补充"))
+    }
+
+    /** A few persisted counts only; the long plan prose lives collapsed under 学习规则. */
+    private fun summaryLine(overview: StudyOverview): String {
+        val base = "今日已新学 ${overview.introducedToday}/${overview.dailyNewGoal} · 到期复习 ${overview.dueNow} · 本次可学 ${overview.cardsAvailableNow} 张"
+        return if (overview.dueNow == 0) overview.nextDueAt?.let { "$base · 下次到期 ${time(it)}" } ?: base else base
+    }
+
+    /**
+     * The full rules, goal bounds and scope counts on demand. It only builds static text; it has no
+     * business action and starts collapsed so the card, feedback buttons and goal row stay on top.
+     */
+    private fun rulesDisclosure(overview: StudyOverview): View {
+        val ui = context
+        return ui.helpDisclosure("学习规则") {
+            addView(ui.text("固定间隔复习：第 1、3、7、14、30 天；只按你的真实反馈推进。", 16f, Paper.secondary))
+            addView(ui.text("认识：进入下一阶段；模糊：阶段不变、明天再来；忘记：回到第一阶段，约 10 分钟后再出现。", 16f, Paper.secondary))
+            addView(ui.text("个人生词优先，与考研/六级共用同一个每日新学目标，不各算一份；按词条去重，同词只保留一份进度。", 16f, Paper.secondary))
+            addView(ui.text("范围：个人生词 ${overview.scope.personal} + 考研 ${overview.scope.kaoyan} + 六级 ${overview.scope.cet6}，去重后 ${overview.scope.unified} 词。", 16f, Paper.secondary))
+            val personalStatus = when {
+                overview.scope.personal == 0 -> "个人生词为 0：直接发考研/六级原书新词卡，不需要先查词。"
+                overview.personalUnlearned == 0 -> "个人生词都已学过：新学名额由考研/六级原书按序补足。"
+                else -> "个人还有 ${overview.personalUnlearned} 个未学生词，优先占用新学名额；用完后由考研/六级原书按序补足。"
+            }
+            addView(ui.text(personalStatus, 16f, Paper.green))
+            addView(ui.text("每日新学目标范围 ${StudyRules.MIN_DAILY_NEW_GOAL}–${StudyRules.MAX_DAILY_NEW_GOAL}（默认 ${StudyRules.DEFAULT_DAILY_NEW_GOAL}）；调整不会重置今天已学的词。", 16f, Paper.secondary))
+            addView(ui.text("开始/继续只读取并接着今天已保存的进度和待答卡；不清空待答卡、学习进度或每日目标。待答卡不计入已新学。", 16f, Paper.secondary))
+            addView(ui.text("今日已反馈 ${overview.todayAnswers} 次（涉及 ${overview.todayReviewed} 词）· 累计已学 ${overview.totalIntroduced} 词。", 16f, Paper.secondary))
+        }
     }
 
     private fun goalRow(goal: Int): LinearLayout = context.row().apply {
@@ -161,44 +193,6 @@ class StudyScreen(
         addView(context.button("+5", primary = false) { setGoal(goal + 5) })
     }
 
-    /**
-     * The visible "今日计划 / 开始或继续学习" entrance. Every number comes from the persisted round
-     * through [StudyOverview]; this block never writes, never counts a feedback as a word and never
-     * folds due reviews into the new-word goal. The button only re-reads the round, so a persisted
-     * pending card is resumed instead of being cleared or re-dealt.
-     */
-    private fun planBlock(overview: StudyOverview, content: LinearLayout): LinearLayout = context.column().apply {
-        setPadding(context.dp(16), context.dp(16), context.dp(16), context.dp(16))
-        background = context.shape(Paper.surface, 12, true)
-        addView(context.text("今日计划", 20f, Paper.ink, true))
-        addView(context.text("新学目标 ${overview.dailyNewGoal} 词/天（默认 ${StudyRules.DEFAULT_DAILY_NEW_GOAL}）。无需先查词：个人已查词优先；个人不足时按原书顺序直接从考研/六级补足，合计占 ${overview.dailyNewGoal} 个新学词。",
-            16f, Paper.secondary))
-        addView(context.text("统一范围：个人生词 ${overview.scope.personal} 词 + 考研 ${overview.scope.kaoyan} 词 + 六级 ${overview.scope.cet6} 词；按词条去重后 ${overview.scope.unified} 词，同词只保留一份进度。",
-            16f, Paper.secondary))
-        when {
-            overview.scope.personal == 0 ->
-                addView(context.text("个人生词为 0：现在会直接发考研/六级原书新词卡，不需要先查词。", 16f, Paper.green))
-            overview.personalUnlearned == 0 ->
-                addView(context.text("个人生词都已学过：新学名额由考研/六级原书按序补足。", 16f, Paper.green))
-            else ->
-                addView(context.text("个人还有 ${overview.personalUnlearned} 个未学生词，优先占用新学名额；用完后由考研/六级原书按序补足。", 16f, Paper.green))
-        }
-        addView(context.text("个人与词书共同占用同一个每日新学目标，不各算一份。", 16f, Paper.secondary))
-        addView(context.text("本次可学 ${overview.cardsAvailableNow} 张卡：新词 ${overview.newRemaining} 张 + 到期复习 ${overview.dueNow} 张（到期复习另列，不占新学目标，优先出现）。",
-            18f))
-        addView(context.text("今日已新学 ${overview.introducedToday} / ${overview.dailyNewGoal} 词 · 目标剩余 ${overview.goalRemaining} 词 · 当前还可新学 ${overview.newRemaining} 词（受目标与可用词库共同限制）。",
-            16f, Paper.secondary))
-        addView(context.text("今日已反馈 ${overview.todayAnswers} 次（涉及 ${overview.todayReviewed} 词）· 累计已学 ${overview.totalIntroduced} 词。",
-            16f, Paper.secondary))
-        if (!overview.startedToday && overview.pendingCard) {
-            addView(context.text("今天还没有提交反馈：当前卡只是待答，不计入已新学，也不算完成。", 16f, Paper.secondary))
-        }
-        overview.nextDueAt?.let { addView(context.text("下一张到期：${time(it)}", 16f, Paper.secondary)) }
-        addView(context.button(overview.entryLabel, primary = true) { if (!busy) load(content) })
-        addView(context.text("开始/继续只读取并接着今天已保存的进度和待答卡；不会清空待答卡、学习进度或每日目标。",
-            16f, Paper.secondary))
-    }
-
     private fun cardBlock(card: StudyCard, credential: Long): LinearLayout = context.column().apply {
         setPadding(context.dp(20), context.dp(20), context.dp(20), context.dp(20))
         background = context.shape(Paper.surface, 12, true)
@@ -208,7 +202,6 @@ class StudyScreen(
         if (!card.answerRevealed) {
             space(8)
             addView(context.button("显示答案", primary = true) { reveal(card.token, credential) })
-            addView(context.text("先自己回忆词义，再看答案，然后选择真实反馈。", 16f, Paper.secondary))
         } else {
             divider()
             addView(context.text(card.entry.meaning, 20f, Paper.ink))
@@ -216,7 +209,7 @@ class StudyScreen(
             // never implied to be the current one. A user supplement is labelled by its source instead
             // of being presented as original word-book content.
             val provenance = listOf(card.entry.source, card.entry.version).filter { it.isNotBlank() }
-            addView(context.text(if (provenance.isEmpty()) "释义来源 未标注" else "释义来源 ${provenance.joinToString(" · ")}",
+            addView(context.text(if (provenance.isEmpty()) "来源 未标注" else "来源 ${provenance.joinToString(" · ")}",
                 16f, Paper.secondary))
             if (card.note.isNotBlank()) {
                 space(8)
@@ -233,16 +226,15 @@ class StudyScreen(
                 row.addView(button, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = context.dp(8) })
             }
             addView(row)
-            addView(context.text("${FeedbackKind.KNOW.label()}：进入下一阶段；${FeedbackKind.FUZZY.label()}：阶段不变、明天再来；${FeedbackKind.FORGET.label()}：回到第一阶段、约 10 分钟后再出现。", 16f, Paper.secondary))
         }
     }
 
     private fun emptyMessage(overview: StudyOverview): String {
         val nextDue = overview.nextDueAt
         return when {
-            overview.dueNow > 0 -> "有 ${overview.dueNow} 个到期词，但暂时没有可显示的卡片；请刷新学习计划。"
-            overview.newRemaining > 0 -> "词库当前还有 ${overview.newRemaining} 个新词可学，但暂时没有可显示的卡片；请刷新学习计划。"
-            overview.goalRemaining > 0 -> "今日新学目标还剩 ${overview.goalRemaining} 词，但统一范围里已没有未学新词；没有到期复习。"
+            overview.dueNow > 0 -> "有 ${overview.dueNow} 个到期词，但暂时没有可显示的卡片；请点下方按钮重新读取。"
+            overview.newRemaining > 0 -> "词库当前还有 ${overview.newRemaining} 个新词可学，但暂时没有可显示的卡片；请点下方按钮重新读取。"
+            overview.goalRemaining > 0 -> "今日新学目标还剩 ${overview.goalRemaining} 词，但统一范围里已没有未学新词，也没有到期复习；可调低每日目标或稍后再看。"
             nextDue != null -> "今日新学目标已完成（${overview.introducedToday} / ${overview.dailyNewGoal} 词），没有到期复习；下一张 ${time(nextDue)} 到期。"
             else -> "今日新学目标已完成（${overview.introducedToday} / ${overview.dailyNewGoal} 词），统一范围内已全部学过，且暂无到期复习。"
         }

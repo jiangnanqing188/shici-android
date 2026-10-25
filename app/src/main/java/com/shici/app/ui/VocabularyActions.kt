@@ -29,20 +29,27 @@ import android.widget.TextView
  */
 object VocabularyActions {
 
-    /** Compact row label; the full meaning is carried by the content description and scope hint. */
+    /** Compact row label; the list-level hint carries the short scope summary. */
     const val LIST_LABEL = "移除…"
 
     /** Primary detail entry. The scope chooser explains the two scopes after the tap. */
     const val DETAIL_LABEL = "从生词本移除…"
 
     /**
-     * One visible sentence for the list/detail: which scopes exist and what full-history deletion
+     * Full scope text used by the detail entry: which scopes exist and what full-history deletion
      * really removes, without presenting full deletion as "only the newly added record".
      */
     const val SCOPE_HINT =
         "先选择范围：只撤销最近一次查询，或删除该词的全部学习记录（整词删除需再次确认）。" +
             "整词删除会移除全部查询（含已撤销）、笔记、掌握状态、复习记录与收藏；" +
             "个人补词、原始词库、其他生词与已导出的 PDF 不受影响。"
+
+    /**
+     * One short list-level sentence. The chooser after the tap still explains both scopes, so the
+     * list does not repeat the full SCOPE_HINT in every row.
+     */
+    const val LIST_SCOPE_HINT =
+        "移除前先选范围：只撤销最近一次查询，或整词删除（需再次确认）。"
 
     /**
      * Compact list-row button. The caller adds it to the row and supplies the exact existing flow in
@@ -58,13 +65,13 @@ object VocabularyActions {
             setTextColor(Paper.error)
             background = context.shape(Paper.lightGreen, 8)
             setPadding(context.dp(8), context.dp(4), context.dp(8), context.dp(4))
-            contentDescription = "从生词本移除 $headword 的学习记录。$SCOPE_HINT"
+            contentDescription = "从生词本移除 $headword 的学习记录，点按选择范围"
             setOnClickListener { onClick() }
         }
 
-    /** The scope explanation as a standalone view for the list header (or anywhere else). */
+    /** One short scope sentence for the list header; the full text stays in the detail entry. */
     fun listScopeHint(context: Context): TextView =
-        context.text(SCOPE_HINT, 13f, Paper.secondary)
+        context.text(LIST_SCOPE_HINT, 14f, Paper.secondary)
 
     /**
      * Detail-panel entry: the primary remove button followed by the scope explanation. The caller

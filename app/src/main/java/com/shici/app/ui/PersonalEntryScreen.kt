@@ -19,7 +19,8 @@ import android.widget.TextView
  * - 不访问 repository / app / worker，不读取、创建或更新删除 credential、提交 revision、租约或 owner；
  * - 不保存、不构造词条，也不做“规范词头”等业务校验；读取动作只把输入框里的原始字符串交给 [onRead]；
  * - 输入框内容原样回调 [onHeadwordChanged]，不 trim、不替换、不清空，草稿由调用方保存与恢复；
- * - 原始词库只读、只写本机个人补充、不计入查询/生词/复习，这些说明只作为正文文案呈现。
+ * - 原始词库只读、只写本机个人补充、不计入查询/生词/复习；页面上只留一句短提示，
+ *   完整边界收进默认折叠的“补词说明”，不影响输入、读取、状态与 editorHost 的原有接线。
  *
  * 汇总接线提示：`MainActivity.personalEntryPage()` 构造本组件，把 [statusView] 赋给原
  * `personalStatusView`，再把原 `personalSourceCard` / `personalRestoredDraftCard` /
@@ -51,23 +52,9 @@ class PersonalEntryScreen(
         val content = context.column()
         content.addView(context.text("添加/补词", 28f, Paper.ink, true))
         content.space(8)
-        content.addView(
-            context.text(
-                "先确认一个英文词头，读取当前原始或用户词义，再编辑本机个人词性/释义。",
-                16f, Paper.secondary
-            )
-        )
-        content.space(8)
-
-        // 三句边界说明必须逐条清楚呈现，避免用户把本页保存误解为查询或背词行为。
-        content.addView(context.column().apply {
-            setPadding(context.dp(16), context.dp(10), context.dp(16), context.dp(10))
-            background = context.shape(Paper.lightGreen, 10)
-            addView(context.text("原始词库只读", 15f, Paper.green, true))
-            addView(context.text("只存本机个人补充", 15f, Paper.green))
-            addView(context.text("不计入查询/生词/复习", 15f, Paper.green))
-        })
-        content.space(16)
+        // One short boundary line stays visible; the full wording is folded further down.
+        content.addView(context.text("保存个人词义，不加入生词本。", 16f, Paper.secondary))
+        content.space(12)
 
         val card = context.column().apply {
             setPadding(context.dp(24), context.dp(24), context.dp(24), context.dp(24))
@@ -105,8 +92,6 @@ class PersonalEntryScreen(
         headwordInput = input
         card.addView(input)
         card.space(8)
-        card.addView(context.text("提示：一次只需一个词头；读取只会展示当前词义，保存时只更新本机个人补充。", 14f, Paper.secondary))
-        card.space(8)
 
         card.addView(context.button("读取当前词义", true) {
             // 空输入给出准确提示，但不做“是否像英文单词”之类的假规范校验。
@@ -132,6 +117,31 @@ class PersonalEntryScreen(
         content.space(16)
         editorHost = context.column()
         content.addView(editorHost)
+
+        content.space(12)
+        // Full boundaries stay readable on demand; input, status and editorHost stay outside.
+        content.addView(
+            context.helpDisclosure("补词说明") {
+                addView(
+                    context.text(
+                        "原始词库只读，原库释义不会被改写；本页只保存本机个人补充。",
+                        15f, Paper.secondary
+                    )
+                )
+                addView(
+                    context.text(
+                        "保存个人词义不计入查询次数、生词或复习反馈。",
+                        15f, Paper.secondary
+                    )
+                )
+                addView(
+                    context.text(
+                        "先读取当前词义再编辑；保存时按读取的版本校验，若词义已被更新会拒绝写入，需要重新读取。",
+                        15f, Paper.secondary
+                    )
+                )
+            }
+        )
 
         view = ScrollView(context).apply {
             isFillViewport = true

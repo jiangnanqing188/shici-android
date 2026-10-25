@@ -587,3 +587,15 @@ GRADLE_USER_HOME="$PWD/.tools/gradle-home" \
 - APK 内容包含 OCR 模型和 ARM64 原生库；实际 APK 权限无网络权限。
 - 本机日志：`.tools/build-ui-verified.log`（本轮），`.tools/build-verified.log`（功能基线）；可移交的阶段说明：`docs/原型开发进度.md`。
 - 未在模拟器或 OPPO 上运行界面、捕获、OCR 与 PDF 渲染；不能据此宣称海文兼容或速度达标。
+
+## 界面文案精简与复制按钮准入修正（2026-10-25，内部体验候选 2.3.2 / versionCode 46，本节为当前状态）
+
+本轮只调整显示层：常用输入、主要操作和结果优先，教学/口径细节默认收进“按需展开”的静态说明，不改业务状态、权限申请、收录/删除/恢复流程、SDK 同意或数据语义。字号未低于原值，未用截断或横向滚动掩盖内容，Paper 浅色绿色体系保持不变。
+
+- layout：`ui/Ui.kt` 新增共用 `Context.helpDisclosure(title, buildContent)`（正文默认收起、按钮不小于 48dp、点按只切换显隐）；`ui/SettingsScreen.kt` 与 `ui/UsageGuideScreen.kt` 首屏精简，权限、备份、词库来源/隐私、引导步骤默认折叠。
+- lookup：`ui/LookupScreen.kt`、`ui/PersonalEntryScreen.kt` 输入、查询、保存与状态前置，查词/补词边界保留可见短句，说明折叠。
+- translation：`ui/TranslationScreen.kt` 状态改短句，缺模型同意卡仍在下载按钮上方完整可见，模型与隐私说明默认折叠；复制按钮改为显式引用并在 render 随模型就绪/当前状态/非空结果同步 enabled，关闭时同步禁用。
+- study：`ui/StudyScreen.kt` 计数与当前卡前置，间隔/去重/目标范围等学习规则默认折叠。
+- integrate：`ui/MainActivity.kt` 精简首页状态与功能卡、生词本导出范围、生词详情说明、统计口径、设置词库状态与版本显示；`ui/VocabularyActions.kt` 缩短列表级移除说明，逐词移除与原有范围选择/二次确认流程不变。
+
+五路（layout / lookup / translation / study 四路实现 + integrate 整合）已完整实现并写入当前源码。四路交付的实际模型均为普通 `commandcode-plan/deepseek/deepseek-v4.1-flash-1017`；study 交付曾自报 Fast，按实际路由记录为准。执行者已实际执行离线三编译（`assembleDebug`、`compileDebugUnitTestKotlin`、`assembleDebugAndroidTest`，只编译、不运行任何单元/仪器/功能测试）：exit 0，脚本计时 **32.77 秒**（Gradle `BUILD SUCCESSFUL in 32s`，67 tasks），source-01 主 APK SHA256 `bb7fd69a5bb16c347b12e27b23470ed6ca81c082b418bddba608cffedeab259d`；编译由本批执行者完成，不由验收者承担产品编译。首轮新的实际 `gpt-6.1-sol` / `high` 独立有界验收事前锁定 28 个唯一 ID，唯一 `run-01` 为 **27 PASS / 1 FAIL / 0 ERROR / 0 SKIP**（动态宿主 26 项 25/1，另 2 项 source-audit PASS）；唯一失败 `UI-SIMPLIFY-T01` 是 Missing 时结果卡已隐藏但复制按钮对象仍 `isEnabled=true`，未满足“未就绪复制禁用”的属性合同，没有可见误点、复制或数据泄漏证据。该失败已在本批按原断言修正（复制按钮显式引用、render 同步准入、close 同步禁用），**仍待新的独立受影响复验**，不宣称本批全部通过；原 27/1 报告与证据保持冻结，不改断言凑绿。未安装、未连接平板、未做原生 UI/SDK/真实模型/真实设备验收；原生平板与 SDK 层仍待验证。当前状态与验收进度以 `docs/原型验收清单.md`、`docs/原型开发进度.md` 及同批交付 `.tools/validation/20261025-ui-simplify/delivery-copy-fix.md` 的最新记录为准。

@@ -280,8 +280,10 @@ class MainActivity : Activity() {
         val closeEditor: () -> Unit
     ) { @Volatile var invalid = false }
     @Volatile private var manualMissingGuard: ManualMissingGuard? = null
-    private var dictionarySummary = "词库尚未校验；正在后台加载"
+    private var dictionarySummary = "词库正在后台校验…"
+    private var dictionaryDetail = "校验完成后显示词头与词形别名数量。"
     private var dictionaryStatusView: TextView? = null
+    private var dictionaryDetailView: TextView? = null
     private var activeDialog: AlertDialog? = null
     // One scoped-delete flow at a time. Every dialog keeps its own identity: a late dismiss can
     // settle only the flow it belongs to, and the admission is invalidated by page navigation,
@@ -390,9 +392,9 @@ class MainActivity : Activity() {
                 // A restored draft is never an automatic write identity: the old editor/lease is
                 // gone, so the page asks for a fresh user-triggered read before any editing.
                 personalRestoredDraft = draft
-                personalStatusText = "页面已重建。已保留草稿文字，但不会沿用离开前的写入身份；请重新读取当前词义后再确认。"
+                personalStatusText = "页面已重建，草稿已保留；请重新读取当前词义再确认。"
             } else if (personalHeadword.isNotBlank()) {
-                personalStatusText = "页面已重建。请重新读取当前词义后再继续；离开前的编辑身份已失效。"
+                personalStatusText = "页面已重建，请重新读取当前词义再继续。"
             }
         }
         consentGeneration = savedInstanceState?.getLong("consent", -1L) ?: -1L
@@ -457,8 +459,8 @@ class MainActivity : Activity() {
         if (page == MainPage.PERSONAL_ENTRY && personalNeedsResume) {
             personalNeedsResume = false
             personalStatusText = if (personalRestoredDraft != null)
-                "已保留草稿文字；离开时的编辑身份已关闭。请重新读取当前词义并再次确认。"
-            else "离开时的编辑身份已关闭。请重新读取当前词义后再继续。"
+                "草稿已保留；请重新读取当前词义再确认。"
+            else "请重新读取当前词义后再继续。"
             render()
         }
         // A stopped translation page was detached and its ML Kit owner closed. Rebuild it from the
@@ -683,16 +685,30 @@ class MainActivity : Activity() {
             val result = app.dictionary
             main.post {
                 if (isDestroyed) return@post
+                // The first screen shows one short status; the full counts stay available in the
+                // collapsed "词库校验详情" next to it. A failure stays fully visible, never hidden.
                 dictionarySummary = result.fold(
+                    { "原始词库已校验可用" },
+                    { "词库不可用：${it.message}；不会生成释义或新增查询记录" })
+                dictionaryDetail = result.fold(
                     { "已校验 ${it.entryCount} 个原始词头 · ${it.aliasCount} 个词形别名（仅格式与完整性校验）" },
                     { "词库不可用：${it.message}；不会生成释义或新增查询记录" })
                 dictionaryStatusView?.text = dictionarySummary
+                dictionaryDetailView?.text = dictionaryDetail
             }
         }
     }
 
-    private fun dictionaryStatus() = text(dictionarySummary, 16f, Paper.secondary)
-        .also { dictionaryStatusView = it }
+    private fun dictionaryStatus(): View {
+        val container = column()
+        dictionaryStatusView = text(dictionarySummary, 16f, Paper.secondary)
+        container.addView(dictionaryStatusView)
+        container.addView(helpDisclosure("词库校验详情") {
+            dictionaryDetailView = text(dictionaryDetail, 15f, Paper.secondary)
+            addView(dictionaryDetailView)
+        })
+        return container
+    }
 
     private fun render() {
         // Compatibility bridge for the historical reflection host and any old caller that still
@@ -706,7 +722,8 @@ class MainActivity : Activity() {
         if (translationScreen != null) { captureTranslationDraft(); closeTranslationOwner() }
         floatingSwitch = null; floatingText = null; stopCaptureButton = null; searchList = null; detailPanel = null
         wordListHeader = null
-        exportButton = null; inlineDetail = null; dictionaryStatusView = null
+        exportButton = null; inlineDetail = null
+        dictionaryStatusView = null; dictionaryDetailView = null
         backupExportButton = null; restoreButton = null; backupStatusView = null
         settingsScreen = null
         lookupInputView = null; personalStatusView = null; favoriteFilterView = null
@@ -761,23 +778,28 @@ class MainActivity : Activity() {
         session.addView(heading)
         floatingText = text(CaptureStatus.state.message, 16f, Paper.secondary)
         session.addView(floatingText)
-        session.addView(text("开启后，点悬浮「词」，直接在题目页面上划一笔查词", 16f, Paper.secondary))
-        session.addView(text("不需要悬浮权限时，也可以到「查词」页手动输入。", 16f, Paper.secondary))
+        // One visible sentence on the first screen; the extra wording stays available on demand.
+        session.addView(text("开启后在题目页划一笔即可查词；也可到「查词」页手动输入。", 16f, Paper.secondary))
+        session.addView(helpDisclosure("悬浮查词说明") {
+            addView(text("开启后，点悬浮「词」，直接在题目页面上划一笔查词。", 15f, Paper.secondary))
+            addView(text("不需要悬浮权限时，也可以到「查词」页手动输入。", 15f, Paper.secondary))
+        })
         content.addView(session); content.space(24)
         content.addView(text("主要功能", 22f, bold = true)); content.space(8)
-        content.addView(entryCard("查词", "日常输入查询；缺词可新增词义，已有词可补充个人释义。") { selectPage(MainPage.LOOKUP) })
+        content.addView(entryCard("查词", "输入或划词查询；缺词可新增词义。") { selectPage(MainPage.LOOKUP) })
         content.space(8)
-        content.addView(entryCard("离线 AI 翻译（可选组件）", "初装不下载模型；由你明确确认后仅 Wi-Fi 下载，组件就绪才可编辑和翻译。用 Google ML Kit 本机整句翻译，不查词、不收录、不上传原文；其他功能不依赖它。") { selectPage(MainPage.TRANSLATION) })
+        // Optional-component privacy details live on the translation page and in Settings, not here.
+        content.addView(entryCard("离线 AI 翻译（可选组件）", "可选组件，确认后才下载模型；其他功能不依赖它。") { selectPage(MainPage.TRANSLATION) })
         content.space(8)
-        content.addView(entryCard("添加/补词", "只维护本机个人词性/释义，不产生查询次数、生词或复习记录。") { selectPage(MainPage.PERSONAL_ENTRY) })
+        content.addView(entryCard("添加/补词", "只维护本机个人词义，不产生查询或复习记录。") { selectPage(MainPage.PERSONAL_ENTRY) })
         content.space(8)
-        content.addView(entryCard("生词本", "查看和管理已经真实查询收录的个人生词。") { selectPage(MainPage.VOCABULARY) })
+        content.addView(entryCard("生词本", "查看和管理已收录的生词。") { selectPage(MainPage.VOCABULARY) })
         content.space(8)
-        content.addView(entryCard("背词", "继续原来的统一学习队列与复习反馈。") { selectPage(MainPage.STUDY) })
+        content.addView(entryCard("背词", "按统一队列学习和复习。") { selectPage(MainPage.STUDY) })
         content.space(8)
-        content.addView(entryCard("统计", "查看真实查询与复习进度聚合。") { selectPage(MainPage.STATISTICS) })
+        content.addView(entryCard("统计", "查看真实查询与复习进度。") { selectPage(MainPage.STATISTICS) })
         content.space()
-        content.addView(text("打开悬浮查词 → 点「词」→ 划过文字 → 抬笔即查", 16f, Paper.secondary))
+        content.addView(text("打开悬浮查词 → 点「词」→ 划一笔 → 抬笔即查", 16f, Paper.secondary))
         statusListener(CaptureStatus.state)
     }
     private fun entryCard(title: String, description: String, action: () -> Unit): View = column().apply {
@@ -847,17 +869,22 @@ class MainActivity : Activity() {
         }
         content.addView(favoriteFilterView); content.space(8)
         val selectionRow = row().apply { gravity = Gravity.CENTER_VERTICAL }
-        selectionRow.addView(button("全选当前结果") { selectAllFilteredForExport() },
+        selectionRow.addView(button("全选结果") { selectAllFilteredForExport() },
             LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(8) })
-        selectionRow.addView(button("清空勾选") { clearExportSelection() },
+        selectionRow.addView(button("清空") { clearExportSelection() },
             LinearLayout.LayoutParams(0, -2, 1f))
         content.addView(selectionRow); content.space(8)
         // The only explicit way back to the default scope. Clearing the checks is a deliberate zero
-        // and never doubles as "all", so this separate action must stay visible to the user.
-        content.addView(button("使用当前结果全部（不勾选）") { useAllFilteredForExport() },
+        // and never doubles as "all", so this separate action must stay visible to the user. The
+        // label says it only restores the export scope, never any learning data.
+        content.addView(button("恢复全部") { useAllFilteredForExport() },
             LinearLayout.LayoutParams(-1, -2))
         content.space(8)
-        content.addView(text("勾选只决定 PDF 导出范围，不改词库、查询次数或学习进度。默认（尚未勾选/清空）导出当前筛选全部；一旦勾选、取消或清空，就按你的勾选集合导出，清空即 0 个，不会自动变回全部；点“使用当前结果全部（不勾选）”才回到默认全量。全选只包含当前搜索/仅收藏筛出的词，日期范围仍在导出选项中取交集。", 13f, Paper.secondary))
+        content.addView(text("清空勾选后导出 0 个；点「恢复全部」可重置（只恢复导出范围，不改任何数据）。", 15f, Paper.secondary))
+        content.addView(helpDisclosure("导出范围说明") {
+            addView(text("这里的「恢复全部」就是下文的“使用当前结果全部（不勾选）”。", 15f, Paper.secondary))
+            addView(text("勾选只决定 PDF 导出范围，不改词库、查询次数或学习进度。默认（尚未勾选/清空）导出当前筛选全部；一旦勾选、取消或清空，就按你的勾选集合导出，清空即 0 个，不会自动变回全部；点“使用当前结果全部（不勾选）”才回到默认全量。全选只包含当前搜索/仅收藏筛出的词，日期范围仍在导出选项中取交集。", 15f, Paper.secondary))
+        })
         content.space(8)
         // One visible explanation for the whole list: the per-row "移除…" opens the original
         // scope chooser (exact undo vs. whole-word delete requiring a second confirmation).
@@ -977,14 +1004,14 @@ class MainActivity : Activity() {
             if (search.isNotBlank()) add("搜索“${search.trim()}”")
             if (onlyFavorites) add("仅收藏")
         }
-        val count = if (filters.isEmpty()) "${list.size} 个词"
-        else "筛选结果 ${list.size} 个词（${filters.joinToString(" · ")}）"
+        val count = if (filters.isEmpty()) "共 ${list.size} 个词"
+        else "筛选 ${list.size} 个词（${filters.joinToString(" · ")}）"
         val scope = when {
-            !exportSelectionExplicit -> "导出范围：当前筛选全部（${list.size} 个）"
-            exportSelection.isEmpty() -> "已清空勾选：导出 0 个（不会回退为全部）"
+            !exportSelectionExplicit -> "导出当前筛选全部（${list.size} 个）"
+            exportSelection.isEmpty() -> "已清空勾选：导出 0 个"
             else -> {
                 val inFilter = list.count { it.entry.key in exportSelection }
-                "已勾选 ${exportSelection.size} 个（当前筛选内 $inFilter 个；与搜索/仅收藏/日期取交集）"
+                "已勾选 ${exportSelection.size} 个（筛选内 $inFilter 个）"
             }
         }
         return "$count · 最近查询优先 · $scope"
@@ -1219,7 +1246,7 @@ class MainActivity : Activity() {
             addView(text("已恢复未保存草稿", 20f, bold = true))
             addView(text("草稿词性：${draft.pos.ifBlank { "（空）" }}", 16f))
             addView(text("草稿释义：${draft.meaning.ifBlank { "（空）" }}", 16f))
-            addView(text("本页不会沿用离开前的写入身份，也不会静默覆盖当前词义。请重新读取当前词义并确认后再编辑。", 15f, Paper.warning))
+            addView(text("离开前的写入身份已失效；草稿不会静默覆盖，请重新读取当前词义并确认后再编辑。", 15f, Paper.warning))
         }
         card.addView(button("重新读取当前词义并继续", true) {
             readPersonalHeadword(draft.headword, draft)
@@ -1238,7 +1265,7 @@ class MainActivity : Activity() {
             addView(text("草稿需要再次确认", 20f, bold = true))
             addView(text("草稿词性：${confirm.draft.pos.ifBlank { "（空）" }}", 16f))
             addView(text("草稿释义：${confirm.draft.meaning.ifBlank { "（空）" }}", 16f))
-            addView(text("该词的本机词义在本页离开后已经更新。草稿不会自动覆盖新内容；若仍打开草稿，保存时会按离开时的词义版本校验，冲突会拒绝写入。", 15f, Paper.warning))
+            addView(text("该词本机词义在离开后已更新。草稿不会自动覆盖；保存时按离开时版本校验，冲突会拒绝写入。", 15f, Paper.warning))
         }
         card.addView(button("查看当前词义并编辑", true) {
             personalSource = confirm.source
@@ -1276,7 +1303,8 @@ class MainActivity : Activity() {
         if (original != null) {
             card.addView(text("原词库释义（只读）", 16f, bold = true))
             card.addView(text("${original.partOfSpeech} ${original.meaning}".trim(), 16f))
-            card.addView(text(PersonalDictionary.provenance(original), 13f, Paper.warning))
+            // Short source badge; verbatim provenance stays in Settings and lookup details.
+            card.addView(text(PersonalDictionary.label(original), 13f, Paper.warning))
         } else {
             card.addView(text("原始词库未收录这个词；保存只在本机新增用户词条。", 15f, Paper.warning))
         }
@@ -1412,7 +1440,7 @@ class MainActivity : Activity() {
                 personalDraft = null
                 personalEditorDraft = null
                 personalDraftConfirm = PersonalDraftConfirm(source, forDraft)
-                personalStatusText = "已重新读取当前词义；发现本机词义在离开后已更新，草稿需要再次确认，不会自动覆盖。"
+                personalStatusText = "词义已更新，草稿需再次确认；不会自动覆盖。"
                 render()
                 return
             }
@@ -1672,8 +1700,10 @@ class MainActivity : Activity() {
         content.divider()
         val form = text("原词形：${word.lastForm}", 16f, Paper.secondary)
         content.addView(form)
+        // Long provenance text is created here (the binding updates it in place) but shown inside the
+        // collapsed detail explanation below, next to the other reference text.
         val source = text(PersonalDictionary.provenance(word.source, word.version), 16f, Paper.secondary)
-        content.addView(source); content.space(16)
+        content.space(16)
         val count = text("${word.queryCount} 次", 28f, bold = true)
         val queries = column().apply {
             addView(text("查询次数", 16f, Paper.secondary)); addView(count)
@@ -1685,7 +1715,6 @@ class MainActivity : Activity() {
         }
         val mastery = column().apply {
             addView(text("掌握状态", 16f, Paper.secondary)); addView(mastered)
-            addView(text("保存后生效；已掌握的词不计入待复习。", 16f, Paper.secondary))
         }
         content.addView(pair(queries, mastery, inlineAt(detailWidth - 48)))
         content.space(12)
@@ -1700,11 +1729,16 @@ class MainActivity : Activity() {
         val save = button("保存笔记与状态", true) {}
         val undo = button("撤销最近一次查询") {}
         content.addView(pair(save, undo, inlineAt(detailWidth - 48), 8)); content.space(8)
-        content.addView(text("撤销只影响最近一次成功查询；之前的查询与已保存的笔记保留。", 16f, Paper.secondary))
-        content.space(8)
         val star = button(if (word.favorite) "★ 已收藏（点击取消）" else "☆ 收藏") {}
         content.addView(star); content.space(8)
-        content.addView(text("星标只是个人收藏标记；取消星标不会删除任何学习记录，也不改掌握状态、查询次数或复习进度。", 16f, Paper.secondary))
+        // Reference text only; the controls themselves stay visible and unchanged. All original
+        // safety/scope wording is preserved verbatim inside the disclosure.
+        content.addView(helpDisclosure("来源、统计与收藏说明") {
+            addView(source)
+            addView(text("保存后生效；已掌握的词不计入待复习。", 16f, Paper.secondary))
+            addView(text("撤销只影响最近一次成功查询；之前的查询与已保存的笔记保留。", 16f, Paper.secondary))
+            addView(text("星标只是个人收藏标记；取消星标不会删除任何学习记录，也不改掌握状态、查询次数或复习进度。", 16f, Paper.secondary))
+        })
         content.space(8)
         // removeSection.removeButton is the binding's delete control, so the existing
         // busy/confirming/stale/invalidated gating still freezes the visible remove entry.
@@ -2257,8 +2291,8 @@ class MainActivity : Activity() {
         val inline = inlineAt(contentWidthDp)
         val header = if (inline) row().apply { gravity = Gravity.CENTER_VERTICAL } else column()
         val heading = column().apply {
-            addView(text("每一次查词，都算数", if (wide) 30f else 28f, bold = true))
-            addView(text("只记录你的真实查询。", 16f, Paper.secondary))
+            addView(text("统计", if (wide) 30f else 28f, bold = true))
+            addView(text("只记录真实查询与复习进度。", 16f, Paper.secondary))
         }
         header.addView(heading, if (inline) LinearLayout.LayoutParams(0, -2, 1f) else LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(12) })
         header.addView(button("刷新统计", true) { refresh(force = true) }, LinearLayout.LayoutParams(if (inline) -2 else -1, -2))
@@ -2266,19 +2300,17 @@ class MainActivity : Activity() {
         val queries = panel().apply {
             addView(statisticMetrics(listOf("今日查询" to stats.todayQueries, "今日新增" to stats.todayNew,
                 "累计查询" to stats.totalQueries), inlineAt(contentWidthDp - 48)))
-            divider(); addView(text("按设备当前时区统计；仅计入未撤销的成功查询。", 16f, Paper.secondary))
         }
         content.addView(queries); content.space(16)
         val sectionWidth = if (splitContent) (contentWidthDp - 24) / 2 else contentWidthDp
         val mastery = panel().apply {
             addView(text("复习进度", 20f, bold = true)); space(12)
             addView(statisticMetrics(listOf("待复习单词" to stats.learning, "已掌握单词" to stats.mastered), inlineAt(sectionWidth - 48)))
-            divider(); addView(text("待复习：尚未标记为已掌握的单词。\n已掌握：你在生词详情中标记并保存的单词。", 16f, Paper.secondary))
         }
         val frequent = panel().apply {
             addView(text("最常查询的词", 20f, bold = true))
-            addView(text("按真实查询次数排序，不代表考试频率。", 16f, Paper.secondary)); space(16)
             if (words.isEmpty()) {
+                space(16)
                 addView(text("暂无查询记录", 18f, bold = true).apply { gravity = Gravity.CENTER })
                 addView(text("开始阅读并查词后，这里会显示你常查的单词。", 16f, Paper.secondary).apply { gravity = Gravity.CENTER })
                 space(16)
@@ -2288,13 +2320,21 @@ class MainActivity : Activity() {
             }
         }
         content.addView(pair(mastery, frequent, splitContent, 24))
+        content.space(16)
+        // The counting method is unchanged; only its explanation is collapsed here.
+        content.addView(helpDisclosure("统计口径说明") {
+            addView(text("按设备当前时区统计；仅计入未撤销的成功查询。", 16f, Paper.secondary))
+            addView(text("待复习：尚未标记为已掌握的单词。\n已掌握：你在生词详情中标记并保存的单词。", 16f, Paper.secondary))
+            addView(text("按真实查询次数排序，不代表考试频率。", 16f, Paper.secondary))
+        })
     }
     private fun settings() {
         val screen = SettingsScreen(
             context = this,
             overlayStatus = overlayPermissionStatus(),
             notificationStatus = notificationPermissionStatus(),
-            versionText = "内部版本 ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})",
+            // Short, honest display: an internal experience build, not an official release.
+            versionText = "体验版 ${BuildConfig.VERSION_NAME}（${BuildConfig.VERSION_CODE}）",
             provenanceText = RawKajwebDictionary.provenance(
                 RawKajwebDictionary.SOURCE, RawKajwebDictionary.VERSION
             ),
@@ -2803,13 +2843,13 @@ class MainActivity : Activity() {
         val content = column().apply {
             space(8); divider()
             addView(text("补充/编辑词义 · 仅本机", 19f, bold = true))
-            addView(text("只编辑用户词性/释义；原词库只读，不会被覆盖，也不计入查询或学习。", 13f, Paper.secondary))
+            addView(text("只保存本机个人词义；不改原词库，不计查询或学习。", 13f, Paper.secondary))
         }
         content.addView(text(headword, 18f, bold = true))
         if (showOriginal) original?.let {
             content.addView(text("原词库释义（只读）", 15f, bold = true))
             content.addView(text("${it.partOfSpeech} ${it.meaning}".trim(), 15f))
-            content.addView(text(PersonalDictionary.provenance(it), 12f, Paper.warning))
+            content.addView(text(PersonalDictionary.label(it), 12f, Paper.warning))
         }
         val posInput = inputField("词性（可留空），如 n. / v.", singleLine = true).apply {
             setText(initialPos ?: currentUser?.partOfSpeech ?: "")

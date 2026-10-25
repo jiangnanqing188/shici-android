@@ -53,7 +53,8 @@ import com.shici.app.translation.TranslationSession
  *   open-source LLM;
  * - input is never silently truncated: more than [TranslationSession.MAX_SOURCE_CHARS] UTF-16
  *   characters is refused with an explicit message and the text is preserved;
- * - copy happens only on an explicit "复制译文" tap.
+ * - copy happens only on an explicit "复制译文" tap, and only while a current non-blank result is
+ *   shown under the same Ready/admission gate as editing and translating; [close] retires it.
  *
  * All methods must be called on the main thread.
  */
@@ -85,6 +86,7 @@ class TranslationScreen(
     private val input: EditText
     private val counter: TextView
     private val status: TextView
+    private lateinit var statusDetail: TextView
     private val consentCard: LinearLayout
     private val translateButton: Button
     private val clearButton: Button
@@ -92,6 +94,7 @@ class TranslationScreen(
     private val cancelButton: Button
     private val resultCard: LinearLayout
     private val resultView: TextView
+    private val copyButton: Button
 
     private var closing = false
 
@@ -105,82 +108,47 @@ class TranslationScreen(
 
         val content = context.column()
 
-        content.addView(context.text("离线 AI 翻译", 28f, bold = true))
-        content.addView(context.text("可选组件 · 英译中 · 在设备本机处理", 16f, Paper.secondary))
-        content.space(8)
-        content.addView(
-            context.text(
-                "这是可选组件：初装不下载任何模型。未下载时，本页只显示说明与下载入口，不开放编辑、翻译或复制；" +
-                    "日常查词、补词、生词本、PDF 与背词学习都不依赖它。",
-                16f,
-                Paper.secondary
-            )
-        )
-        content.space(16)
+        content.addView(context.text("离线翻译", 28f, bold = true))
+        content.addView(context.text("Google ML Kit · 英译中", 16f, Paper.secondary))
+        content.space(12)
 
-        // The component/model card comes first so an un-downloaded page leads with the explicit
-        // download gate instead of translation controls.
-        val modelCard = context.column().apply {
-            setPadding(context.dp(20), context.dp(20), context.dp(20), context.dp(20))
-            background = context.shape(Paper.surface, border = true)
-        }
-        modelCard.addView(context.text("组件状态与模型", 16f, bold = true))
+        // One short line for the current state. Long explanations live in the collapsed
+        // "模型与隐私说明" below; errors keep their cause and next step here.
         status = context.text("", 15f, Paper.secondary)
-        modelCard.addView(status)
-        modelCard.addView(
-            context.text(
-                "真实后端：Google ML Kit 英译中，在设备本机推理；不是新接入的开源大模型。模型约 30 MB 只是估计值，" +
-                    "实际下载大小与进度以系统下载为准，本页不显示伪造的百分比。",
-                14f,
-                Paper.secondary
-            )
-        )
-        modelCard.space(4)
-
-        // Visible only while the local model is Missing/declined. Download starts exclusively from
-        // this explicit user confirmation; nothing on this page downloads by itself.
-        consentCard = context.column()
-        consentCard.addView(
-            context.text(
-                "尚未下载英译中离线模型。只有你点下面的按钮后才会调用 Google ML Kit 下载，且要求 Wi-Fi；" +
-                    "不会上传你输入的句子，也不会自动改用移动数据或在线翻译。",
-                14f,
-                Paper.secondary
-            )
-        )
-        consentCard.addView(context.button("下载并启用（仅 Wi-Fi）", true) { session.downloadModel() })
-        consentCard.addView(context.button("暂不下载") { session.declineDownload() })
-        consentCard.addView(context.button("返回，暂不使用") { requestClose() })
-        modelCard.addView(consentCard)
+        content.addView(status)
 
         // A retry is a new translation request for the text that is visible right now, not a
         // replay of a hidden older submission. The session re-validates blank/oversize/model
         // state before submitting and binds the result to this snapshot.
         retryButton = context.button("重试") { session.retry(input.text.toString()) }
         retryButton.visibility = View.GONE
-        modelCard.addView(retryButton)
+        content.addView(retryButton)
 
         cancelButton = context.button("取消本次翻译") { session.cancelTranslation() }
         cancelButton.visibility = View.GONE
-        modelCard.addView(cancelButton)
+        content.addView(cancelButton)
+        content.space(8)
 
-        modelCard.addView(
-            context.text(
-                "可以离开本页或关闭窗口，但这不等于取消系统下载：系统下载可能继续，再次进入只会重新检查本地状态，" +
-                    "不会未经确认重新下载。下载成功只代表模型已可用，真实译文质量与设备兼容性仍需单独验证。",
-                13f,
-                Paper.secondary
-            )
+        // Visible only while the local model is Missing/declined. The essential consent points
+        // stay above the download button; only the long-form privacy text is collapsed later.
+        // Download starts exclusively from this explicit user confirmation.
+        consentCard = context.column().apply {
+            setPadding(context.dp(20), context.dp(20), context.dp(20), context.dp(20))
+            background = context.shape(Paper.surface, border = true)
+        }
+        consentCard.addView(context.text("需要先下载翻译模型", 16f, bold = true))
+        consentCard.addView(context.text("可选组件，不影响查词与背词学习。", 14f, Paper.secondary))
+        consentCard.addView(
+            context.text("仅 Wi-Fi 下载，模型约 30 MB（估计值，实际以系统下载为准）。", 14f, Paper.secondary)
         )
-        modelCard.addView(
-            context.text(
-                "设备需支持 Google Play 服务；ML Kit SDK 可能为更新模型、诊断和统计使用情况与 Google 通信并发送" +
-                    "性能/使用指标，因此本应用并非“完全不联网”；本应用不上传原文或译文。",
-                13f,
-                Paper.secondary
-            )
+        consentCard.addView(context.text("设备需支持 Google Play 服务。", 14f, Paper.secondary))
+        consentCard.addView(
+            context.text("SDK 会与 Google 通信并发送使用指标；原文只在本机处理，不上传。", 14f, Paper.secondary)
         )
-        content.addView(modelCard)
+        consentCard.addView(context.button("下载并启用（仅 Wi-Fi）", true) { session.downloadModel() })
+        consentCard.addView(context.button("暂不下载") { session.declineDownload() })
+        consentCard.addView(context.button("返回，暂不使用") { requestClose() })
+        content.addView(consentCard)
         content.space(16)
 
         val inputCard = context.column().apply {
@@ -188,13 +156,7 @@ class TranslationScreen(
             background = context.shape(Paper.surface, border = true)
         }
         inputCard.addView(context.text("英文原文", 16f, bold = true))
-        inputCard.addView(
-            context.text(
-                "模型未启用时原文只读展示，草稿与选择位置仍会保留；模型就绪后才开放编辑、翻译和复制。",
-                13f,
-                Paper.secondary
-            )
-        )
+        inputCard.addView(context.text("模型未启用时只读，草稿与选择仍会保留。", 14f, Paper.secondary))
         input = context.inputField("例如 The evidence was inconclusive.", singleLine = false).apply {
             minLines = 5
             gravity = android.view.Gravity.TOP
@@ -223,8 +185,8 @@ class TranslationScreen(
         inputCard.addView(clearButton)
         inputCard.addView(
             context.text(
-                "上限 ${TranslationSession.MAX_SOURCE_CHARS} 个 UTF-16 字符（约等于常见英文句中字符数）。超出时会明确提示，不会截断后翻译。",
-                13f,
+                "最多 ${TranslationSession.MAX_SOURCE_CHARS} 个字符；超出会明确提示，不会截断。",
+                14f,
                 Paper.secondary
             )
         )
@@ -241,36 +203,63 @@ class TranslationScreen(
         resultCard.addView(resultView)
         resultCard.addView(
             context.text(
-                "对应你上一次提交翻译时的原文；如果改动了上方原文，请按“翻译整句/重新翻译”以当前原文重新提交。",
-                13f,
+                "对应上次提交的原文；修改上方原文后，请重新翻译。",
+                14f,
                 Paper.secondary
             )
         )
         resultCard.addView(
-            context.text("Google Translate 自动翻译（ML Kit 离线）· 仅供参考", 13f, Paper.warning)
+            context.text("Google Translate 自动翻译（ML Kit 离线）· 仅供参考", 14f, Paper.warning)
         )
-        resultCard.addView(context.button("复制译文") { copyResult() })
+        // The copy action follows the same admission as the source/translate/clear controls: it is
+        // only enabled for a current non-blank result while the local model and phase allow it.
+        copyButton = context.button("复制译文") { copyResult() }
+        resultCard.addView(copyButton)
         content.addView(resultCard)
         content.space(16)
 
-        val privacyCard = context.column().apply {
-            setPadding(context.dp(20), context.dp(20), context.dp(20), context.dp(20))
-            background = context.shape(Paper.surface, border = true)
-        }
-        privacyCard.addView(context.text("关于离线 AI 翻译组件与隐私", 16f, bold = true))
-        privacyCard.addView(context.text(PRIVACY_TEXT, 13f, Paper.secondary))
-        privacyCard.addView(
-            context.text(
-                "下面的链接只在你自己点击时用浏览器打开，App 不会自动访问网页。",
-                13f,
-                Paper.secondary
+        // Long-form backend/privacy facts are collapsed by default. The shared helper owns the
+        // >=48dp toggle, the initially GONE body and the no-fixed-height wrapping; the body is
+        // static text/links with no business action.
+        statusDetail = context.text("", 14f, Paper.secondary)
+        content.addView(context.helpDisclosure("模型与隐私说明") {
+            addView(
+                context.text(
+                    "可选组件，不影响查词、补词、生词本、PDF 与背词学习。初装不下载任何模型。",
+                    14f,
+                    Paper.secondary
+                )
             )
-        )
-        privacyCard.addView(link("ML Kit 翻译官方说明", "https://developers.google.com/ml-kit/language/translation/android"))
-        privacyCard.addView(link("ML Kit 服务条款", "https://developers.google.com/ml-kit/terms"))
-        privacyCard.addView(link("翻译模型附加条款", "https://developers.google.com/ml-kit/language/translation/translation-terms"))
-        privacyCard.addView(link("Google 翻译署名要求", "https://docs.cloud.google.com/translate/attribution"))
-        content.addView(privacyCard)
+            addView(
+                context.text(
+                    "真实后端：Google ML Kit 英译中，在设备本机推理；不是新接入的开源大模型。" +
+                        "模型约 30 MB 只是估计值，实际下载大小与进度以系统下载为准，本页不显示伪造的百分比。",
+                    14f,
+                    Paper.secondary
+                )
+            )
+            addView(context.text(PRIVACY_TEXT, 14f, Paper.secondary))
+            addView(
+                context.text(
+                    "可以离开本页或关闭窗口，但这不等于取消系统下载：系统下载可能继续，再次进入只会重新检查本地状态，" +
+                        "不会未经确认重新下载。下载成功只代表模型已可用，真实译文质量与设备兼容性仍需单独验证。",
+                    14f,
+                    Paper.secondary
+                )
+            )
+            addView(statusDetail)
+            addView(
+                context.text(
+                    "下面的链接只在你自己点击时用浏览器打开，App 不会自动访问网页。",
+                    14f,
+                    Paper.secondary
+                )
+            )
+            addView(link("ML Kit 翻译官方说明", "https://developers.google.com/ml-kit/language/translation/android"))
+            addView(link("ML Kit 服务条款", "https://developers.google.com/ml-kit/terms"))
+            addView(link("翻译模型附加条款", "https://developers.google.com/ml-kit/language/translation/translation-terms"))
+            addView(link("Google 翻译署名要求", "https://docs.cloud.google.com/translate/attribution"))
+        })
         content.space(8)
 
         // Secondary action for a multi-word capture, never a prerequisite: the sentence result is
@@ -370,6 +359,9 @@ class TranslationScreen(
     fun close() {
         if (closing) return
         closing = true
+        // render() stops painting after close, so retire the copy action here as well: a closed
+        // page must not leave the button usable even if the host still holds the view briefly.
+        copyButton.isEnabled = false
         session.close()
     }
 
@@ -382,7 +374,8 @@ class TranslationScreen(
     private fun render(state: TranslationSession.State) {
         if (closing) return
         val phase = state.phase
-        status.text = state.message
+        status.text = shortStatus(state)
+        statusDetail.text = "本页最近一次状态的完整说明：${state.message}"
         status.setTextColor(
             when (phase) {
                 TranslationSession.Phase.ERROR -> Paper.error
@@ -421,7 +414,7 @@ class TranslationScreen(
         translateButton.isEnabled = componentEnabled
         clearButton.isEnabled = componentEnabled
         translateButton.text = when {
-            !state.modelReady -> "翻译整句（需先下载并启用）"
+            !state.modelReady -> "翻译整句（需先启用）"
             phase == TranslationSession.Phase.DONE -> "重新翻译"
             else -> "翻译整句"
         }
@@ -433,7 +426,36 @@ class TranslationScreen(
         val hasResult = state.result.isNotBlank()
         resultCard.visibility = if (hasResult) View.VISIBLE else View.GONE
         resultView.text = state.result
+        // Copy is admitted only for the current non-blank result under the same component gate:
+        // Checking, Missing, Downloading, Translating, a cancel without a result and Closed never
+        // enable it. The result card is hidden without a result, but its copy child must also be
+        // explicitly disabled rather than relying on the hidden ancestor alone.
+        copyButton.isEnabled = componentEnabled && hasResult
     }
+
+    /**
+     * Short first-screen status for the current phase. The session's full message (which may be a
+     * long paragraph) stays available in the collapsed disclosure. Errors are the exception: their
+     * cause and next step must remain visible, so the session message is shown as-is.
+     */
+    private fun shortStatus(state: TranslationSession.State): String =
+        when (state.phase) {
+            TranslationSession.Phase.CHECKING_MODEL -> "正在检查本机翻译模型…"
+            TranslationSession.Phase.NEEDS_MODEL ->
+                if (state.message.startsWith("已暂不下载")) {
+                    "未启用 · 已暂不下载，可稍后再启用"
+                } else {
+                    "未启用 · 需先下载并启用模型"
+                }
+            TranslationSession.Phase.DOWNLOADING ->
+                "正在下载模型（或等待 Wi-Fi）… 可离开本页，系统下载可能继续。"
+            TranslationSession.Phase.READY -> "模型已就绪，可以翻译。"
+            TranslationSession.Phase.TRANSLATING -> "翻译中… 本机处理，不上传原文。"
+            TranslationSession.Phase.DONE -> "翻译完成 · 机器翻译仅供参考"
+            TranslationSession.Phase.CANCELLED -> "已取消 · 原文保留，可重新翻译。"
+            TranslationSession.Phase.ERROR -> state.message
+            TranslationSession.Phase.CLOSED -> "已关闭"
+        }
 
     private fun updateCounter() {
         val length = input.text.length
@@ -444,6 +466,7 @@ class TranslationScreen(
     }
 
     private fun copyResult() {
+        if (closing || !copyButton.isEnabled) return
         val text = resultView.text.toString()
         if (text.isBlank()) return
         val clipboard = context.getSystemService(ClipboardManager::class.java)

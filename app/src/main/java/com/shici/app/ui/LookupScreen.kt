@@ -49,15 +49,9 @@ class LookupScreen(
         val content = context.column()
         content.addView(context.text("查词", 28f, bold = true))
         content.space(8)
-        content.addView(
-            context.text(
-                "输入一个英文单词或词形。无需悬浮窗或屏幕捕获权限；成功查询按现有规则形成真实的本地记录。",
-                16f,
-                Paper.secondary
-            )
-        )
-        content.space(16)
 
+        // Order is deliberate: title, input, the two main actions, then only the two short boundary
+        // lines a user needs before acting. Everything explanatory is folded below.
         val card = context.column().apply {
             setPadding(context.dp(24), context.dp(24), context.dp(24), context.dp(24))
             background = context.shape(Paper.surface, border = true)
@@ -100,23 +94,53 @@ class LookupScreen(
             input.setText("")
             input.setSelection(0)
         })
-        card.addView(context.button("添加/补词（只维护词义，不收录）") { onOpenPersonalEntry() })
         card.space(4)
-        card.addView(
-            context.text(
-                "未知词或未收录词形不生成释义、不新增记录。可从结果卡在本机新增词义，或对已有词补充个人词性和释义；保存词义本身不产生查询次数、生词或复习反馈，只有明确的“查询并收录”才收录。",
-                15f,
-                Paper.secondary
-            )
-        )
+        // Kept visible next to the primary action: a query is a real recording action.
+        card.addView(context.text("查询会收录到生词本。", 15f, Paper.secondary))
         content.addView(card)
-        content.space(16)
+        content.space(12)
+
+        val supplement = context.column().apply {
+            setPadding(context.dp(24), context.dp(24), context.dp(24), context.dp(24))
+            background = context.shape(Paper.surface, border = true)
+        }
+        supplement.addView(context.button("添加/补词") { onOpenPersonalEntry() })
+        supplement.addView(context.text("仅保存词义，不加入生词本。", 15f, Paper.secondary))
+        content.addView(supplement)
+        content.space(12)
+
+        // Full unknown-word / inflection / provenance / recording rules stay available but folded.
         content.addView(
-            context.text(
-                "查词结果中的“补充/编辑词义”仍可原地使用；需要完整页面时，结果卡也提供“在补词页编辑/新增”。",
-                15f,
-                Paper.secondary
-            )
+            context.helpDisclosure("查词说明") {
+                addView(
+                    context.text(
+                        "未知词或未收录词形不生成释义，也不新增记录。词形按本机词库已有词条解释；没有对应词条时按未知词处理。",
+                        15f,
+                        Paper.secondary
+                    )
+                )
+                addView(
+                    context.text(
+                        "需要补充词义时，可从结果卡在本机新增词义，或到“添加/补词”页补充个人词性和释义；保存词义不产生查询次数、生词或复习反馈，只有明确的“查询”才收录。",
+                        15f,
+                        Paper.secondary
+                    )
+                )
+                addView(
+                    context.text(
+                        "查词结果中的“补充/编辑词义”仍可原地使用；需要完整页面时，结果卡也提供“在补词页编辑/新增”。",
+                        15f,
+                        Paper.secondary
+                    )
+                )
+                addView(
+                    context.text(
+                        "查词无需悬浮窗或屏幕捕获权限；只在点击“查询”或键盘搜索时发生。",
+                        15f,
+                        Paper.secondary
+                    )
+                )
+            }
         )
 
         view = ScrollView(context).apply {
