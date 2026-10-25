@@ -25,6 +25,7 @@ import com.shici.app.core.*
 import com.shici.app.data.RevokeOutcome
 import com.shici.app.ui.*
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -92,8 +93,9 @@ class CaptureService : Service() {
     private var panel: View? = null
     // One explicit translation page at most. It is a normal overlay window owned by this service
     // (never a Dialog), and closeTranslationScreen() retires both the window and its ML Kit
-    // session so a late callback can neither paint nor reopen anything.
-    private var translationScreen: TranslationScreen? = null
+    // session so a late callback can neither paint nor reopen anything. Volatile because the
+    // inline word save admission may be evaluated on the repository worker.
+    @Volatile private var translationScreen: TranslationScreen? = null
     private var translationWindow: View? = null
     // Identity of the card that currently owns the floating panel. Every panel removal advances it,
     // so a click queued by an already-replaced failure card can neither close a newer card nor
@@ -174,6 +176,36 @@ class CaptureService : Service() {
         val closeEditors: () -> Unit
     ) { @Volatile var invalid = false }
     @Volatile private var missingGuard: MissingGuard? = null
+    // One explicit tap inside the open translation page. It is deliberately not the OCR page
+    // admission: the translation page has already retired that page guard. This guard carries the
+    // fresh deletion credential captured at the tap, the host's QueryGate token and the exact
+    // translation-screen/request identity. It never refreshes the credential on a late callback.
+    private class InlineWordGuard(
+        val requestId: Long,
+        val screen: TranslationScreen,
+        val credential: Long,
+        val source: String,
+        val token: Long
+    ) {
+        // One accepted tap owns one stable query-event identity. Every delivery of that tap's
+        // success closure must reuse it; a duplicate delivery never creates a second event.
+        val eventId: String = UUID.randomUUID().toString()
+        @Volatile var key: String? = null
+        // The committed revision the displayed meaning was read at. The repository compares it at
+        // its own pre-transaction and pre-commit admissions so a change between render and write
+        // cannot be recorded as a fresh success.
+        @Volatile var revision: Long = -1L
+        @Volatile var invalid = false
+        @Volatile var saved = false
+        private val saveAdmitted = AtomicBoolean()
+        // Claims the single save admission for this tap. A repeated success delivery, including one
+        // that arrives before the first save has run, gets false instead of enqueueing another write.
+        fun admitSave(): Boolean = saveAdmitted.compareAndSet(false, true)
+        // True once this tap owns a save. Later deliveries of the same success closure are inert,
+        // including after the commit has published the revision this request itself produced.
+        fun saveAlreadyAdmitted(): Boolean = saveAdmitted.get()
+    }
+    @Volatile private var inlineWordGuard: InlineWordGuard? = null
     private val deletionListener: (Long) -> Unit = {
         val guard = definitionGuard
         if (guard != null && !guard.invalid && app.repository.deletions.isStale(guard.key, guard.credential)) {
@@ -182,6 +214,11 @@ class CaptureService : Service() {
         val missing = missingGuard
         if (missing != null && !missing.invalid && app.repository.deletions.isStale(missing.key, missing.credential)) {
             main.post { if (missingGuard === missing) invalidateMissing(missing) }
+        }
+        val inline = inlineWordGuard
+        if (inline != null && !inline.invalid &&
+            app.repository.deletions.isStale(inline.key ?: "", inline.credential)) {
+            main.post { if (inlineWordGuard === inline) invalidateInlineWord(inline) }
         }
     }
 
@@ -1383,9 +1420,15 @@ class CaptureService : Service() {
         val screen = TranslationScreen(
             this, raw,
             autoTranslate = autoTranslate,
-            onSelectionRequested = returnToSelection
+            onSelectionRequested = returnToSelection,
+            inlineWordLookup = true
         )
         screen.onCloseRequested = { closeTranslationScreen(returnToBubble = true) }
+        // Only the two explicit callbacks below bridge this page to the local dictionary. Neither
+        // touches the ML Kit session, so word lookup works while the model is checking/missing/
+        // downloading, and the page's auto-translate consent and Ready gates stay unchanged.
+        screen.onWordRequested = { tap -> startInlineWordLookup(screen, tap) }
+        screen.onWordRequestRetired = { requestId -> retireInlineWord(screen, requestId) }
         val view = screen.view
         val width = minOf(dp(520), (screenWidth - dp(24)).coerceAtLeast(dp(240)))
         val maxHeight = (screenHeight * 3 / 4).coerceAtLeast(dp(280))
@@ -1428,6 +1471,9 @@ class CaptureService : Service() {
         val screen = translationScreen
         val view = translationWindow
         if (screen == null && view == null) return
+        // Any inline lookup not yet admitted is retired before the window disappears; an already
+        // committed record is left in place and is never presented as rolled back by this page.
+        retireInlineWord()
         translationScreen = null
         translationWindow = null
         screen?.close()
@@ -1436,6 +1482,248 @@ class CaptureService : Service() {
         endPageGuard()
         perf.stage("translation", "closed")
         if (returnToBubble && sessionIsActive() && bubble == null) showBubble()
+    }
+
+    /**
+     * One explicit user tap on an original-text word inside the still-open translation page.
+     *
+     * This is a fresh local query, not a replay of the OCR lookup and not a translation request:
+     * it captures a fresh deletion credential exactly once, takes a new QueryGate token and reads
+     * the same unified original+personal resolution used by every other lookup. The full visible
+     * source is stored as this query's explicit context. Nothing here downloads a model, calls the
+     * translation session, writes SQLite directly or creates a second window.
+     */
+    private fun startInlineWordLookup(screen: TranslationScreen, tap: TranslationScreen.WordTap) {
+        if (stopped || !sessionIsActive() || translationScreen !== screen) {
+            screen.showWordMessage(tap.requestId,
+                "查词服务已停止或会话已失效；本次未查询、未收录。", retryable = false)
+            return
+        }
+        // A later fragment retires the previous in-flight request instead of reusing its credential
+        // or letting its late callback overwrite the newer word. Its already committed record, if
+        // any, is not claimed as revoked.
+        inlineWordGuard?.let { previous ->
+            if (previous.requestId != tap.requestId) {
+                previous.invalid = true
+                if (inlineWordGuard === previous) inlineWordGuard = null
+            }
+        }
+        val token = gate.next()
+        val guard = InlineWordGuard(
+            tap.requestId, screen, app.repository.deletions.capture(), tap.source, token
+        )
+        inlineWordGuard = guard
+        app.worker.execute {
+            if (!inlineWordIsCurrent(guard)) return@execute
+            val read = runCatching {
+                // Same stable-read discipline as the floating lookup: the public entry's committed
+                // revision is compared immediately around the actual dictionary+user read.
+                val before = app.repository.changes.version
+                val result = app.lookupWord(tap.word)
+                val user = (result as? LookupResult.Match)?.let { app.repository.userEntry(it.form) }
+                val after = app.repository.changes.version
+                LookupRead(result, user, after, before == after)
+            }
+            main.post {
+                if (!inlineWordIsCurrent(guard)) return@post
+                // A duplicate delivery of this tap's success closure is inert once the single save
+                // was admitted. In particular, after that save commits and publishes its own new
+                // revision, the duplicate must not mistake it for an external change, hide the
+                // recorded meaning or claim the request was not recorded.
+                if (guard.saveAlreadyAdmitted()) return@post
+                val readValue = read.getOrElse { failure ->
+                    dropInlineWord(guard)
+                    screen.showWordMessage(tap.requestId,
+                        "本地词库不可用：${failure.message}。本次未查询、未收录。可再点词重试。",
+                        retryable = true)
+                    return@post
+                }
+                if (!readValue.isCurrent(app.repository.changes.version)) {
+                    dropInlineWord(guard)
+                    screen.showWordMessage(tap.requestId,
+                        "查询已失效（词条或本机补充已更新），本次未查询、未收录。请重新点词。",
+                        retryable = true)
+                    return@post
+                }
+                when (val result = readValue.result) {
+                    LookupResult.Invalid -> {
+                        dropInlineWord(guard)
+                        screen.showWordMessage(tap.requestId,
+                            "这不是可查询的英文词头；本次未查询、未收录。",
+                            retryable = false)
+                    }
+                    is LookupResult.Missing -> {
+                        val stale = app.repository.deletions.isStale(result.form, guard.credential)
+                        dropInlineWord(guard)
+                        if (stale) {
+                            screen.showWordMessage(tap.requestId,
+                                "查询已失效（词条已删除或数据已恢复），本次未查询、未收录。",
+                                retryable = true)
+                        } else {
+                            screen.showWordMessage(tap.requestId,
+                                "「${result.form}」未命中本地词库（不是识别失败）；" +
+                                    "本次未新增查询记录，也未收录。可点其他英文词。",
+                                retryable = false)
+                        }
+                    }
+                    is LookupResult.Match -> {
+                        val entry = result.entries.single()
+                        if (app.repository.deletions.isStale(entry.key, guard.credential)) {
+                            dropInlineWord(guard)
+                            screen.showWordMessage(tap.requestId,
+                                "查询已失效（词条已删除或数据已恢复），本次未查询、未收录。",
+                                retryable = true)
+                            return@post
+                        }
+                        // Publish the entry key before the save so the deletion observer can bind a
+                        // later delete/restore to this exact displayed word. Never recapture. The
+                        // immutable read revision is bound to this request for the save admission.
+                        guard.key = entry.key
+                        guard.revision = readValue.revision
+                        screen.showWordFound(TranslationScreen.WordDisplay(
+                            requestId = tap.requestId,
+                            queried = result.form,
+                            headword = entry.headword,
+                            partOfSpeech = entry.partOfSpeech,
+                            meaning = entry.meaning,
+                            sourceNote = PersonalDictionary.label(entry) + "\n" +
+                                PersonalDictionary.provenance(entry)
+                        ))
+                        // Only the first success delivery of this guard may enqueue the write. The
+                        // event identity is created once per accepted tap, so a hostile duplicate
+                        // closure cannot add a second event even if it runs before the first save.
+                        if (guard.admitSave()) {
+                            saveInlineWord(guard, QueryEvent(
+                                guard.eventId, entry.key, guard.source, result.form,
+                                System.currentTimeMillis()
+                            ), entry)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /** Whether a main-thread callback or the repository's pre-transaction admission still owns this tap. */
+    private fun inlineWordIsCurrent(guard: InlineWordGuard): Boolean {
+        if (stopped || !sessionIsActive()) return false
+        if (translationScreen !== guard.screen) return false
+        if (inlineWordGuard !== guard || guard.invalid) return false
+        if (!gate.accepts(guard.token)) return false
+        // A restore is stale for every key; a deletion is stale only for this query's own word.
+        // The check intentionally uses the original credential and never refreshes it.
+        return !app.repository.deletions.isStale(guard.key ?: "", guard.credential)
+    }
+
+    /** Retires any inline request when the page/window is closing; no UI message is needed. */
+    private fun retireInlineWord() {
+        val guard = inlineWordGuard ?: return
+        guard.invalid = true
+        inlineWordGuard = null
+        gate.next()
+    }
+
+    /** Retires only the exact request the page itself reported as edited/replaced. */
+    private fun retireInlineWord(screen: TranslationScreen, requestId: Long) {
+        val guard = inlineWordGuard ?: return
+        if (guard.screen !== screen || guard.requestId != requestId) return
+        guard.invalid = true
+        inlineWordGuard = null
+        gate.next()
+    }
+
+    /** Marks one non-current request inert without touching a newer guard's token. */
+    private fun dropInlineWord(guard: InlineWordGuard) {
+        guard.invalid = true
+        if (inlineWordGuard !== guard) return
+        inlineWordGuard = null
+        gate.next()
+    }
+
+    /**
+     * An external delete/restore retired the displayed word. A save already admitted/committed is
+     * not claimed as rolled back, but the page must stop presenting the old result as fresh.
+     */
+    private fun invalidateInlineWord(guard: InlineWordGuard) {
+        if (guard.invalid) return
+        guard.invalid = true
+        if (inlineWordGuard === guard) {
+            inlineWordGuard = null
+            gate.next()
+        }
+        if (translationScreen === guard.screen) {
+            guard.screen.showWordMessage(
+                guard.requestId,
+                if (guard.saved) {
+                    "该词已在之后被删除或数据已恢复；本次已提交记录不由此页重写或声称撤销。"
+                } else {
+                    "查询已失效（词条已删除或数据已恢复），本次未收录。"
+                },
+                retryable = true
+            )
+        }
+    }
+
+    /**
+     * Commits one real query event for the meaning the user just tapped. The [event] identity was
+     * created once per accepted tap and is admitted exactly once; no automatic retry loop exists.
+     * A failure is shown as "本次未收录" and the next explicit tap creates a new request (and
+     * event), while an already admitted commit is never described as cancelled by a later page
+     * change.
+     */
+    private fun saveInlineWord(guard: InlineWordGuard, event: QueryEvent, entry: DictionaryEntry) {
+        app.worker.execute {
+            val result = runCatching {
+                app.repository.record(event, entry, null, guard.credential) {
+                    // This closure runs at the repository's existing pre-transaction admission and
+                    // again immediately before commit. Requiring the revision the meaning was read
+                    // at closes the render-to-write window; a successful commit publishes its new
+                    // revision only after endTransaction, so the request never rejects its own write.
+                    guard.revision == app.repository.changes.version && inlineWordIsCurrent(guard)
+                }
+            }
+            main.post {
+                if (guard.invalid || inlineWordGuard !== guard ||
+                    translationScreen !== guard.screen || !gate.accepts(guard.token)) return@post
+                val failure = result.exceptionOrNull()
+                val saved = result.getOrNull() == true
+                when {
+                    failure != null -> {
+                        dropInlineWord(guard)
+                        guard.screen.showWordStatus(guard.requestId,
+                            "保存失败：${failure.message}；本次未收录。可再点该词重新查询。",
+                            error = true, retryable = true)
+                    }
+                    saved -> {
+                        guard.saved = true
+                        guard.screen.showWordStatus(guard.requestId,
+                            "已收录 · 本次为真实查询，可在生词本中查看", error = false)
+                    }
+                    else -> {
+                        // canCommit refused before the transaction or the repository found the
+                        // word/restore stale: nothing was written and there is no automatic retry.
+                        // A revision that moved after the stable read makes the already rendered
+                        // meaning stale as well: hide it and say this request was not recorded
+                        // instead of leaving a fresh-looking definition or claiming success.
+                        val revisionChanged = guard.revision != app.repository.changes.version
+                        val stale = app.repository.deletions.isStale(entry.key, guard.credential)
+                        dropInlineWord(guard)
+                        when {
+                            stale -> guard.screen.showWordMessage(guard.requestId,
+                                "查询已失效（词条已删除或数据已恢复），本次未收录。",
+                                retryable = true)
+                            revisionChanged -> guard.screen.showWordMessage(guard.requestId,
+                                "查询已失效（词条或本机补充已更新），本次未收录。请重新点词。",
+                                retryable = true)
+                            else -> guard.screen.showWordStatus(guard.requestId,
+                                "本次未收录（词条已删除、数据已恢复或页面已失效）。" +
+                                    "可再点该词重新查询。",
+                                error = true, retryable = true)
+                        }
+                    }
+                }
+            }
+        }
     }
 
     private fun showTextCorrection(raw: String) {

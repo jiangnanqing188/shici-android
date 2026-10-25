@@ -4,11 +4,17 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.graphics.Color
 import android.graphics.Paint
 import android.net.Uri
 import android.text.Editable
 import android.text.InputType
+import android.text.SpannableString
+import android.text.Spanned
+import android.text.TextPaint
 import android.text.TextWatcher
+import android.text.method.LinkMovementMethod
+import android.text.style.ClickableSpan
 import android.view.KeyEvent
 import android.view.View
 import android.view.inputmethod.InputMethodManager
@@ -19,6 +25,8 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import com.shici.app.core.SentenceWord
+import com.shici.app.core.SentenceWords
 import com.shici.app.translation.OfflineTranslation
 import com.shici.app.translation.TranslationSession
 
@@ -55,6 +63,11 @@ import com.shici.app.translation.TranslationSession
  *   characters is refused with an explicit message and the text is preserved;
  * - copy happens only on an explicit "复制译文" tap, and only while a current non-blank result is
  *   shown under the same Ready/admission gate as editing and translating; [close] retires it.
+ * - an optional, host-supplied inline word section lets the user tap one English fragment of the
+ *   exact visible source and ask the host to look it up in the local dictionary. The section is
+ *   independent of the ML Kit model state: it stays usable while the model is checking, missing or
+ *   downloading, and it never calls the translation session, downloads anything or starts a second
+ *   window/dialog. A tap does not close the page or change the source/caret/translation result.
  *
  * All methods must be called on the main thread.
  */
@@ -69,13 +82,54 @@ class TranslationScreen(
      */
     private val autoTranslate: Boolean = false,
     /** Optional secondary action for a multi-word capture: return to per-word selection. */
-    private val onSelectionRequested: (() -> Unit)? = null
+    private val onSelectionRequested: (() -> Unit)? = null,
+    /**
+     * Adds the CaptureService-only inline "点英文词查释义" section. Default false keeps every
+     * existing Activity construction source-compatible and exposes no new lookup entry there.
+     */
+    private val inlineWordLookup: Boolean = false
 ) {
     /** Plain snapshot of the editor, used by the host to survive navigation/rotation. */
     data class Draft(val text: String, val selectionStart: Int, val selectionEnd: Int)
 
+    /**
+     * One explicit tap on one fragment of [source]. [requestId] is invalidated by source edits,
+     * another tap, collapse-independent page retirement and [close]; a host callback carrying an
+     * older id must not display a result or commit a save.
+     */
+    data class WordTap(
+        val requestId: Long,
+        val word: String,
+        val start: Int,
+        val end: Int,
+        val source: String
+    )
+
+    /** A resolved first dictionary meaning plus the exact source/notice strings to keep visible. */
+    data class WordDisplay(
+        val requestId: Long,
+        val queried: String,
+        val headword: String,
+        val partOfSpeech: String,
+        val meaning: String,
+        val sourceNote: String
+    )
+
     /** Optional host hook for the Back key and the "返回/关闭" button. */
     var onCloseRequested: (() -> Unit)? = null
+
+    /**
+     * Supplied by the CaptureService host. Only an explicit word tap calls it; rendering,
+     * construction, restore, translation and collapsing never do.
+     */
+    var onWordRequested: ((WordTap) -> Unit)? = null
+
+    /**
+     * Called when the page retires the request id still in flight (source edit, another word tap,
+     * or close). The host must reject that request's late lookup/save; this callback never creates
+     * a query and never displays anything.
+     */
+    var onWordRequestRetired: ((Long) -> Unit)? = null
 
     private val context: Context = context
     private val root: ScreenRoot
@@ -95,6 +149,22 @@ class TranslationScreen(
     private val resultCard: LinearLayout
     private val resultView: TextView
     private val copyButton: Button
+
+    // Inline word section state. All of it is main-thread only; the host owns the real query,
+    // deletion credential, save admission and lifecycle checks.
+    private lateinit var wordToggle: Button
+    private lateinit var wordBody: LinearLayout
+    private lateinit var wordTokens: TextView
+    private lateinit var wordStatus: TextView
+    private lateinit var wordMeaning: TextView
+    private lateinit var wordSource: TextView
+    private var wordSourceGeneration = 0L
+    private var wordRequestId = 0L
+    private var wordActive: SentenceWord? = null
+    private var wordDisplayed: SentenceWord? = null
+    private var wordBusy = false
+    private var wordDelivered = false
+    private var wordRejectedId = -1L
 
     private var closing = false
 
@@ -128,6 +198,49 @@ class TranslationScreen(
         cancelButton.visibility = View.GONE
         content.addView(cancelButton)
         content.space(8)
+
+        // The inline word section is deliberately above the model-consent card and the source
+        // editor: it is a local-dictionary capability, so it stays obviously reachable while the
+        // ML Kit model is checking, missing or downloading. It never starts the translation session.
+        if (inlineWordLookup) {
+            val wordCard = context.column().apply {
+                setPadding(context.dp(16), context.dp(16), context.dp(16), context.dp(16))
+                background = context.shape(Paper.surface, 12, true)
+            }
+            // One short, obvious control. Expanding shows the same source as clickable spans in a
+            // single compact paragraph; collapsing hides only this sub-area and leaves the source,
+            // caret, translation state and result untouched.
+            wordToggle = context.button("点英文词查释义") { toggleWordArea() }
+            wordCard.addView(wordToggle)
+            wordBody = context.column().apply { visibility = View.GONE }
+            wordBody.addView(
+                context.text(
+                    "在下面原文词上直接点一下；只查本机词库，不重新翻译，不关闭译句。",
+                    13f,
+                    Paper.secondary
+                )
+            )
+            wordTokens = TextView(context).apply {
+                textSize = 15f
+                setTextColor(Paper.ink)
+                setPadding(0, context.dp(6), 0, context.dp(6))
+                setLineSpacing(0f, 1.15f)
+                movementMethod = LinkMovementMethod.getInstance()
+                highlightColor = Color.TRANSPARENT
+                isClickable = true
+                isFocusable = false
+            }
+            wordBody.addView(wordTokens)
+            wordStatus = context.text("", 14f, Paper.secondary)
+            wordBody.addView(wordStatus)
+            wordMeaning = context.text("", 18f).apply { visibility = View.GONE }
+            wordBody.addView(wordMeaning)
+            wordSource = context.text("", 13f, Paper.warning).apply { visibility = View.GONE }
+            wordBody.addView(wordSource)
+            wordCard.addView(wordBody)
+            content.addView(wordCard)
+            content.space(16)
+        }
 
         // Visible only while the local model is Missing/declined. The essential consent points
         // stay above the download button; only the long-form privacy text is collapsed later.
@@ -302,9 +415,14 @@ class TranslationScreen(
                 // A visible edit discards the capture-entry intent; a later Ready callback must not
                 // translate the hidden older OCR snapshot over the user's current text.
                 session.cancelAutoIntent()
+                // The inline section is bound to the exact text it displayed. An edit invalidates
+                // every old fragment/result and retires any in-flight host request; the translation
+                // session, visible draft and any already-shown translation result stay as they are.
+                onWordSourceChanged()
             }
         })
         updateCounter()
+        if (inlineWordLookup) rebuildWordTokens()
         // Opening the page performs only the local model query. Only the explicit capture-entry
         // auto intent above may translate, and only after Ready. Nothing here downloads.
         session.start()
@@ -318,6 +436,174 @@ class TranslationScreen(
             val imm = context.getSystemService(InputMethodManager::class.java)
             imm?.showSoftInput(input, InputMethodManager.SHOW_IMPLICIT)
         }
+    }
+
+    /**
+     * Shows one successfully resolved meaning for the still-current tap. [WordDisplay.requestId]
+     * must be the id most recently handed to [onWordRequested]; a duplicate delivery for the same
+     * id only repaints text and never starts another lookup or save. This method never edits the
+     * source, moves the caret, changes the translation session or writes data.
+     */
+    fun showWordFound(display: WordDisplay) {
+        if (closing || !inlineWordLookup) return
+        if (display.requestId != wordRequestId) return
+        // A message/stale outcome already settled this id; a duplicate late definition must not
+        // repaint a successful meaning over it.
+        if (display.requestId == wordRejectedId) return
+        // Duplicate callback delivery for one tap is inert; the host owns the single save attempt.
+        if (wordDelivered) return
+        wordDelivered = true
+        wordBusy = false
+        wordDisplayed = wordActive
+        wordStatus.text = "查询成功 · 保存中…"
+        wordStatus.setTextColor(Paper.secondary)
+        wordMeaning.text = buildString {
+            append(display.headword)
+            if (display.partOfSpeech.isNotBlank()) append(" · ").append(display.partOfSpeech)
+            if (display.meaning.isNotBlank()) append('\n').append(display.meaning)
+        }
+        wordMeaning.visibility = View.VISIBLE
+        wordSource.text = buildString {
+            if (display.queried.isNotBlank() && display.queried != display.headword) {
+                append("点选词形：").append(display.queried).append('\n')
+            }
+            append(display.sourceNote)
+        }
+        wordSource.visibility = if (display.sourceNote.isBlank()) View.GONE else View.VISIBLE
+    }
+
+    /**
+     * Updates the compact status line under the meaning (for example "保存中…"/"已收录"/保存失败).
+     * [retryable] explicitly frees the same word to be tapped again as a new request; it is used
+     * only when the host reports that this request was not recorded. A stale request id is ignored.
+     */
+    fun showWordStatus(requestId: Long, message: String, error: Boolean = false,
+                       retryable: Boolean = false) {
+        if (closing || !inlineWordLookup || requestId != wordRequestId) return
+        wordBusy = false
+        if (retryable) {
+            wordDisplayed = null
+            // This id ended without a recorded result; a duplicate definition delivery is inert.
+            wordRejectedId = requestId
+        }
+        wordStatus.text = message
+        wordStatus.setTextColor(if (error) Paper.error else Paper.green)
+    }
+
+    /**
+     * Shows a no-definition outcome (missing/invalid/stale/dictionary failure). No meaning is
+     * fabricated and no empty definition is shown. A retryable message lets the same fragment be
+     * tapped again; a non-retryable one remains the current displayed outcome until another word
+     * or an edit is chosen.
+     */
+    fun showWordMessage(requestId: Long, message: String, error: Boolean = true,
+                        retryable: Boolean = false) {
+        if (closing || !inlineWordLookup || requestId != wordRequestId) return
+        wordBusy = false
+        wordDelivered = false
+        wordRejectedId = requestId
+        wordDisplayed = if (retryable) null else wordActive
+        wordMeaning.visibility = View.GONE
+        wordSource.visibility = View.GONE
+        wordStatus.text = message
+        wordStatus.setTextColor(if (error) Paper.error else Paper.warning)
+    }
+
+    private fun toggleWordArea() {
+        if (closing || !inlineWordLookup) return
+        val expand = wordBody.visibility != View.VISIBLE
+        wordBody.visibility = if (expand) View.VISIBLE else View.GONE
+        wordToggle.text = if (expand) "收起词义" else "点英文词查释义"
+        wordToggle.contentDescription = if (expand) {
+            "收起句内词义，不关闭译句"
+        } else {
+            "点英文词查释义，在本页查本机词库"
+        }
+    }
+
+    private fun rebuildWordTokens() {
+        if (!inlineWordLookup || closing) return
+        val source = input.text.toString()
+        val generation = ++wordSourceGeneration
+        val spans = SpannableString(source)
+        SentenceWords.scan(source).forEach { word ->
+            spans.setSpan(object : ClickableSpan() {
+                override fun onClick(widget: View) {
+                    onWordClicked(word, source, generation)
+                }
+
+                override fun updateDrawState(ds: TextPaint) {
+                    super.updateDrawState(ds)
+                    ds.color = Paper.green
+                    ds.isUnderlineText = true
+                }
+            }, word.start, word.end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        }
+        wordTokens.text = spans
+    }
+
+    private fun onWordClicked(word: SentenceWord, source: String, generation: Long) {
+        if (closing || !inlineWordLookup) return
+        // A span built for an older edit is never convertible into a query for the current text.
+        if (generation != wordSourceGeneration) return
+        val current = input.text.toString()
+        if (current != source || word.start < 0 || word.end > current.length ||
+            word.start >= word.end || current.substring(word.start, word.end) != word.text) return
+        val same = wordActive?.let {
+            it.start == word.start && it.end == word.end && it.text == word.text
+        } == true
+        // One tap in flight, or a currently displayed result for this same fragment, is a no-op.
+        // Switching to another word (or an explicit retryable failure) makes a later tap new.
+        if (same && (wordBusy || wordDisplayed != null)) return
+        if (wordBusy || wordDisplayed != null) onWordRequestRetired?.invoke(wordRequestId)
+        wordRequestId++
+        wordActive = word
+        wordDisplayed = null
+        wordDelivered = false
+        wordBusy = true
+        wordStatus.text = "正在查「${word.text}」…"
+        wordStatus.setTextColor(Paper.secondary)
+        wordMeaning.visibility = View.GONE
+        wordSource.visibility = View.GONE
+        val request = onWordRequested
+        if (request == null) {
+            wordBusy = false
+            wordStatus.text = "当前页面未启用句内查词；本次未查询、未收录。"
+            wordStatus.setTextColor(Paper.warning)
+            return
+        }
+        request(WordTap(wordRequestId, word.text, word.start, word.end, source))
+    }
+
+    private fun onWordSourceChanged() {
+        if (!inlineWordLookup) return
+        val retired = wordRequestId
+        val hadWork = wordBusy || wordActive != null || wordDisplayed != null
+        wordRequestId++
+        wordBusy = false
+        wordActive = null
+        wordDisplayed = null
+        wordDelivered = false
+        if (hadWork) onWordRequestRetired?.invoke(retired)
+        rebuildWordTokens()
+        wordMeaning.visibility = View.GONE
+        wordSource.visibility = View.GONE
+        wordStatus.text = if (hadWork) {
+            "原文已更改；请重新点词。已收录的查询不会因改文撤销。"
+        } else {
+            ""
+        }
+        if (hadWork) wordStatus.setTextColor(Paper.warning)
+    }
+
+    private fun retireWordRequest() {
+        if (!inlineWordLookup) return
+        val retired = wordRequestId
+        val hadWork = wordBusy || wordActive != null || wordDisplayed != null
+        wordBusy = false
+        wordActive = null
+        wordDisplayed = null
+        if (hadWork) onWordRequestRetired?.invoke(retired)
     }
 
     /**
@@ -359,6 +645,9 @@ class TranslationScreen(
     fun close() {
         if (closing) return
         closing = true
+        // A closed page can never let an inline lookup display or commit. The host also retires
+        // this request on window removal; this callback covers a direct screen close as well.
+        retireWordRequest()
         // render() stops painting after close, so retire the copy action here as well: a closed
         // page must not leave the button usable even if the host still holds the view briefly.
         copyButton.isEnabled = false
