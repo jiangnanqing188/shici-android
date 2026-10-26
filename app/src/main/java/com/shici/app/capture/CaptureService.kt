@@ -13,7 +13,10 @@ import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.*
 import android.provider.Settings
+import android.text.InputType
 import android.view.*
+import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputMethodManager
 import android.widget.*
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
@@ -52,19 +55,23 @@ class CaptureService : Service() {
         const val EXTRA_DATA = "data"
         const val EXTRA_GENERATION = "generation"
         /**
-         * Stable request for the user-tapped "手动查词" exit from a capture failure card.
+         * Compatibility request for the app's own lookup page.
          *
-         * The intent is explicit to MainActivity and carries no frame, OCR result, deletion
-         * credential or query admission. Only the card's click sends it; MainActivity only
-         * navigates to LOOKUP and may prefill [EXTRA_MANUAL_LOOKUP_TEXT]. It must not submit a
-         * query, record an event or replay any old operation on its own.
-         *
-         * MainActivity is already exported and this intent names it explicitly, so no manifest
-         * entry, intent-filter or new permission is introduced.
+         * The capture failure/no-English cards no longer send this intent: their visible
+         * "手动查词" action now opens the service-owned in-page input box, which queries the same
+         * local dictionary without leaving the current page. The action/extra names are kept
+         * unchanged because MainActivity still consumes any request that names them, and removing
+         * them would break that existing entry point. The intent carries no frame, OCR result,
+         * deletion credential or query admission; MainActivity only navigates and may prefill the
+         * draft, never submitting a query by itself.
          */
         const val ACTION_MANUAL_LOOKUP = "com.shici.app.action.MANUAL_LOOKUP"
         const val EXTRA_MANUAL_LOOKUP = "com.shici.app.extra.MANUAL_LOOKUP"
         const val EXTRA_MANUAL_LOOKUP_TEXT = "com.shici.app.extra.MANUAL_LOOKUP_TEXT"
+        // Two visible actions in one compact capsule: "词" starts a stroke, "输入" opens the
+        // in-page input box. The width is shared with the page-exclusion mask below.
+        private const val BUBBLE_WIDTH_DP = 112
+        private const val BUBBLE_HEIGHT_DP = 56
         private const val CHANNEL = "capture"
         private const val ENTRY_FRAME_TIMEOUT_MS = 2_500L
         private const val VERIFY_FRAME_TIMEOUT_MS = 1_500L
@@ -91,6 +98,19 @@ class CaptureService : Service() {
     private var recognizer: TextRecognizer? = null
     private var bubble: View? = null
     private var panel: View? = null
+    /**
+     * One service-owned, top-aligned in-page input box. Opening it retires the old card/live/frame/
+     * page-guard world; it never reads a screenshot, waits for OCR or depends on a page guard.
+     * A valid submit captures a fresh deletion credential and enters the existing local lookup
+     * path, which owns its own gate token and query event. The session identity plus one-shot
+     * admission keeps queued clicks, IME/button races and late callbacks from a closed box inert.
+     */
+    private class ManualInputSession {
+        val submitted = AtomicBoolean()
+        @Volatile var closed = false
+    }
+    private var manualInput: View? = null
+    private var manualInputSession: ManualInputSession? = null
     // One explicit translation page at most. It is a normal overlay window owned by this service
     // (never a Dialog), and closeTranslationScreen() retires both the window and its ML Kit
     // session so a late callback can neither paint nor reopen anything. Volatile because the
@@ -546,7 +566,7 @@ class CaptureService : Service() {
     /** Screen rectangles covered by this application's own card; page changes elsewhere still count. */
     private fun pageOverlayExclusions(): List<PixelBox> {
         val bubbleBox = bubble?.let {
-            PixelBox(bubbleX, bubbleY, bubbleX + dp(56), bubbleY + dp(56))
+            PixelBox(bubbleX, bubbleY, bubbleX + dp(BUBBLE_WIDTH_DP), bubbleY + dp(BUBBLE_HEIGHT_DP))
         }
         return if (bubbleBox == null) pageOverlayBoxes else pageOverlayBoxes + bubbleBox
     }
@@ -1080,21 +1100,24 @@ class CaptureService : Service() {
         if (stopped) return false
         if (bubble != null) return true
         val view = BubbleView(this)
-        val params = WindowManager.LayoutParams(dp(56), dp(56), WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+        val params = WindowManager.LayoutParams(dp(BUBBLE_WIDTH_DP), dp(BUBBLE_HEIGHT_DP),
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE, PixelFormat.TRANSLUCENT).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = bubbleX.coerceIn(0, (screenWidth - dp(56)).coerceAtLeast(0))
-            y = bubbleY.coerceIn(0, (screenHeight - dp(56)).coerceAtLeast(0))
+            x = bubbleX.coerceIn(0, (screenWidth - dp(BUBBLE_WIDTH_DP)).coerceAtLeast(0))
+            y = bubbleY.coerceIn(0, (screenHeight - dp(BUBBLE_HEIGHT_DP)).coerceAtLeast(0))
         }
         var originalX = 0; var originalY = 0
         view.onDragStart = { originalX = params.x; originalY = params.y }
         view.onDrag = { dx, dy ->
-            params.x = (originalX + dx.toInt()).coerceIn(0, (screenWidth - dp(56)).coerceAtLeast(0))
-            params.y = (originalY + dy.toInt()).coerceIn(0, (screenHeight - dp(56)).coerceAtLeast(0))
+            params.x = (originalX + dx.toInt()).coerceIn(0, (screenWidth - dp(BUBBLE_WIDTH_DP)).coerceAtLeast(0))
+            params.y = (originalY + dy.toInt()).coerceIn(0, (screenHeight - dp(BUBBLE_HEIGHT_DP)).coerceAtLeast(0))
             bubbleX = params.x; bubbleY = params.y
             if (bubble === view) windows.updateViewLayout(view, params)
         }
+        // Left half keeps the original one-stroke action; the visible right half opens the input.
         view.setOnClickListener { beginLiveSelection() }
+        view.onInput = { openManualInput("") }
         return try { windows.addView(view, params); bubble = view; true }
         catch (e: Exception) { fail("悬浮窗不可用：${e.message}"); false }
     }
@@ -1160,8 +1183,10 @@ class CaptureService : Service() {
     private fun definitionCardStale(guard: DefinitionGuard): Boolean =
         guard.invalid || app.repository.deletions.isStale(guard.key, guard.credential)
     private fun dismissPanel() {
-        // Closing any card also retires an open translation page and its late-callback owner.
+        // Closing any card also retires an open translation page, the manual input box and their
+        // late-callback owners.
         closeTranslationScreen()
+        closeManualInput()
         // Closing the page card ends every editor it owned, even before its view detaches.
         closeSupplementEditors()
         perf.end("closed", "dismiss")
@@ -1367,12 +1392,12 @@ class CaptureService : Service() {
         content.addView(button("重新划选") { beginLiveSelection() }); content.space(8)
         content.addView(button("纠正选中文字") { showTextCorrection(raw) }); content.space(8)
         content.addView(button("翻译整句（离线英译中）") { openTranslation(raw) }); content.space(8)
-        val manual = button("手动查词（打开查词页）") {}
+        val manual = button("${RecognitionFeedback.MANUAL_INPUT_LABEL}（本页输入）") {}
         content.addView(manual); content.space(8)
         content.addView(button("取消") { dismissPanel(); showBubble() })
         addPanel(scroll(content))
         val owner = panelOwner
-        manual.setOnClickListener { openManualLookup(owner, raw) }
+        manual.setOnClickListener { openManualInput(owner, raw) }
     }
     /**
      * Opens the explicit offline translation page for [raw].
@@ -1824,45 +1849,210 @@ class CaptureService : Service() {
         // later card. "返回做题" remains available unchanged.
         val retry = button("重试取词（重新划词）") {}
         content.addView(retry); content.space(8)
-        // Deliberate, user-tapped exit to the app's own lookup page. It carries only an optional
-        // prefill; it never submits a query, records an event or replays this failed attempt.
-        val manual = button("手动查词（打开查词页）") {}
+        // Deliberate, user-tapped manual lookup on the current page. It may prefill this attempt's
+        // raw text but never submits a query by itself, and it does not open MainActivity.
+        val manual = button("${RecognitionFeedback.MANUAL_INPUT_LABEL}（本页输入）") {}
         content.addView(manual); content.space(8)
         content.addView(button("返回做题") { dismissPanel(); showBubble() })
         addPanel(scroll(content))
         val owner = panelOwner
         retry.setOnClickListener { retryLiveSelection(owner) }
-        manual.setOnClickListener { openManualLookup(owner, raw) }
+        manual.setOnClickListener { openManualInput(owner, raw) }
     }
 
     /**
-     * Explicit user tap from a failure card into the app's daily-lookup page.
+     * Explicit tap on a failure/no-English card's manual action.
      *
-     * Only this tap navigates. [owner] must still be the mounted card's identity, so a click queued
-     * by an already-replaced, dismissed or stopped card is a no-op. The intent carries no frame,
-     * OCR result, deletion credential or query admission: [raw] is only an optional prefilled
-     * draft and an empty raw sends no text at all. No query is submitted, no record/count is
-     * written and no old capture operation is replayed. MainActivity only navigates to LOOKUP and
-     * may prefill the draft; it must not query by itself.
+     * [owner] must still be the mounted card's identity, so a click queued by an already-replaced,
+     * dismissed or stopped card is a no-op. The card's failure world is retired first; only an
+     * optional prefill survives, and opening the box never submits a query by itself.
      */
-    private fun openManualLookup(owner: Long, raw: String) {
+    private fun openManualInput(owner: Long, raw: String) {
         if (owner != panelOwner || panel == null) return
-        // Retire this failed card's world (live layer, pending frame, guard, editors) before
-        // leaving; the app is opened from this fresh user click, never from a capture callback.
+        openManualInput(raw)
+    }
+
+    /**
+     * Opens the compact, service-owned input box on the current page.
+     *
+     * This path deliberately has no dependency on a screenshot, OCR result, page guard, model
+     * readiness or MainActivity. Opening/editing only prefills a draft; nothing is queried until
+     * an explicit valid submit. The window is top-aligned and resizes for the IME so the keyboard
+     * cannot cover the field or its query action.
+     */
+    private fun openManualInput(prefill: String) {
+        if (stopped || !sessionIsActive()) {
+            toast("查词服务已停止或会话已失效，无法打开输入框；请重新开启全屏查词")
+            return
+        }
+        // Opening the input starts a new manual world: retire this card's live layer, pending
+        // one-shot frame, page guard, editors and any open translation page.
         dismissPanel()
-        if (sessionIsActive() && bubble == null) showBubble()
-        val request = Intent(this, MainActivity::class.java).apply {
-            action = ACTION_MANUAL_LOOKUP
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or
-                Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
-            putExtra(EXTRA_MANUAL_LOOKUP, true)
-            if (raw.isNotBlank()) putExtra(EXTRA_MANUAL_LOOKUP_TEXT, raw)
+        if (stopped || !sessionIsActive()) return
+        removeBubble()
+        val session = ManualInputSession()
+        manualInputSession = session
+        val status = text("", 14f, Paper.secondary)
+        val input = inputField("输入一个英文单词", singleLine = true).apply {
+            inputType = InputType.TYPE_CLASS_TEXT
+            imeOptions = EditorInfo.IME_ACTION_SEARCH
+            setText(prefill)
+            setSelection(text.length)
+            setOnEditorActionListener { _, actionId, event ->
+                val imeSearch = actionId == EditorInfo.IME_ACTION_SEARCH
+                val enter = event != null && event.keyCode == KeyEvent.KEYCODE_ENTER &&
+                    event.action == KeyEvent.ACTION_DOWN
+                if (imeSearch || enter) {
+                    submitManualInput(session, this, status)
+                    true
+                } else false
+            }
+        }
+        val query = button("查询", true) { submitManualInput(session, input, status) }
+        // Wired after the window exists below, so close/Back can prove they still belong to this
+        // exact box before touching any service state.
+        val close = button("关闭") {}
+        val content = card("手动查词")
+        content.addView(text("仅查本机离线词库，不打开主界面；打开或编辑不会自动查询。", 13f, Paper.secondary))
+        val entry = row()
+        // Field and query action share the top row, so both stay above the keyboard.
+        entry.addView(input, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        entry.addView(query, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT).apply { marginStart = dp(8) })
+        content.addView(entry)
+        content.addView(status)
+        content.addView(close)
+        val view = scroll(content)
+        // Close/Back capture the box they were created for. A callback delivered after this box
+        // was replaced by a newer one (or already closed) is a complete no-op: it cannot close the
+        // newer box or resurrect the bubble. The current box's own close/Back still works.
+        close.setOnClickListener { if (closeManualInput(session, view)) showBubble() }
+        val width = minOf(dp(440), (screenWidth - dp(24)).coerceAtLeast(dp(200)))
+        val maxHeight = (screenHeight / 2).coerceAtLeast(dp(200))
+        view.measure(View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
+            View.MeasureSpec.makeMeasureSpec(maxHeight, View.MeasureSpec.AT_MOST))
+        val height = view.measuredHeight.coerceIn(1, maxHeight)
+        val params = WindowManager.LayoutParams(width, height,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT).apply {
+            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            // Top position plus ADJUST_RESIZE: the input and query row never sit under the IME.
+            y = dp(72)
+            softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
+        }
+        view.isFocusableInTouchMode = true
+        view.setOnKeyListener { _, key, event ->
+            if (key == KeyEvent.KEYCODE_BACK && event.action == KeyEvent.ACTION_UP) {
+                if (closeManualInput(session, view)) showBubble()
+                true
+            } else false
         }
         try {
-            startActivity(request)
+            windows.addView(view, params)
+            manualInput = view
+            view.requestFocus()
+            view.post {
+                if (manualInput === view && manualInputSession === session && !session.closed) {
+                    input.requestFocus()
+                    (getSystemService(InputMethodManager::class.java))
+                        ?.showSoftInput(input, InputMethodManager.SHOW_IMPLICIT)
+                }
+            }
         } catch (e: Exception) {
-            toast("无法打开查词页：${e.message}；本次没有查询或收录")
+            session.closed = true
+            if (manualInputSession === session) manualInputSession = null
+            manualInput = null
+            runCatching { windows.removeViewImmediate(view) }
+            toast("无法打开输入框：${e.message}；本次没有查询或收录")
+            if (sessionIsActive() && bubble == null) showBubble()
         }
+    }
+
+    /**
+     * One explicit submit from the open input box.
+     *
+     * Blank/non-English text writes nothing. A valid submit claims the session's single admission,
+     * captures a fresh deletion credential for this explicit query (never the service's old live
+     * credential), closes the box and enters the existing local lookup chain with its own gate
+     * token and query event. A second queued click or the IME action racing the button sees either
+     * a closed session or a failed CAS, so at most one event/card is produced.
+     */
+    private fun submitManualInput(session: ManualInputSession, input: EditText, status: TextView) {
+        if (stopped || !sessionIsActive() || session.closed || manualInputSession !== session) return
+        val raw = input.text?.toString()?.trim().orEmpty()
+        val form = RawKajwebDictionary.normalize(raw)
+        if (form == null || !RecognitionFeedback.hasLatinLetter(form)) {
+            status.text = "请输入一个有效英文词头；空内容或无效输入不会查询或新增记录"
+            status.setTextColor(Paper.error)
+            return
+        }
+        if (!session.submitted.compareAndSet(false, true)) return
+        // Fresh credential for this explicit manual query; never reuse the capture credential.
+        val credential = app.repository.deletions.capture()
+        // The box has done its job. Its result card is owned by the normal lookup path.
+        closeManualInput()
+        showManualPending(form)
+        lookup(form, raw, credentialOverride = credential, manual = true)
+    }
+
+    /** Bounded visible feedback between a manual submit and the dictionary result card. */
+    private fun showManualPending(form: String) {
+        if (stopped || !sessionIsActive()) return
+        val content = card("查询中")
+        content.addView(text("正在查询本机离线词库：「$form」…", 16f, Paper.secondary))
+        // Closing advances the gate and makes the in-flight worker result inert. An already
+        // committed record is not described as revoked.
+        val cancel = button("取消") {}
+        content.addView(cancel)
+        val view = scroll(content)
+        addPanel(view)
+        // Bind cancellation to the panel actually mounted for this pending query. Once a newer
+        // input box or result card replaces it, the retired callback is a complete no-op: it cannot
+        // close the newer panel, show the bubble or advance the new gate (which would drop a valid
+        // save). The current pending card's own cancel stays effective and still rejects its late
+        // lookup. Deliberately not bound to the lookup gate token: lookup.next() advances it on
+        // every new query, which would make the current cancel inert.
+        val owner = panelOwner
+        cancel.setOnClickListener {
+            if (owner != panelOwner || panel !== view || stopped || !sessionIsActive()) {
+                return@setOnClickListener
+            }
+            dismissPanel(); showBubble()
+        }
+    }
+
+    /**
+     * Removes the input window and makes every click/IME callback from it inert. It intentionally
+     * does not advance the gate: a submit closes the box immediately before starting its lookup,
+     * so advancing here would cancel that new query. No data is written by closing.
+     */
+    private fun closeManualInput() {
+        val view = manualInput
+        val session = manualInputSession
+        manualInput = null
+        manualInputSession = null
+        session?.closed = true
+        if (view != null) {
+            runCatching {
+                (getSystemService(InputMethodManager::class.java))
+                    ?.hideSoftInputFromWindow(view.windowToken, 0)
+            }
+            runCatching { windows.removeViewImmediate(view) }
+        }
+    }
+
+    /**
+     * Closes the input box only while [session] is still the open one and [view] its mounted
+     * window. Close/Back callbacks from a retired box must be a complete no-op, so this returns
+     * false without touching service state or showing the bubble. The current box's own close
+     * still goes through (true); [closeManualInput] itself stays unchanged for submit/dismiss.
+     */
+    private fun closeManualInput(session: ManualInputSession, view: View): Boolean {
+        if (manualInputSession !== session || manualInput !== view || session.closed) return false
+        closeManualInput()
+        return true
     }
 
     /**

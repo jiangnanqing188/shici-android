@@ -45,6 +45,10 @@ object RecognitionFeedback {
      */
     const val RECOGNIZING = "正在本地识别笔迹附近的文字…"
 
+    /** Shared label/next-step for the service-owned in-page input box, never the app's home page. */
+    const val MANUAL_INPUT_LABEL = "手动查词"
+    const val MANUAL_INPUT_HINT = "也可点「手动查词」在当前页面的输入框中查词。"
+
     /**
      * True when [text] contains at least one ASCII Latin letter. It only separates "OCR found text
      * but no English word" from "OCR found no text"; it never decides dictionary membership and
@@ -57,42 +61,42 @@ object RecognitionFeedback {
         RecognitionFailure.NO_FRAME_ENTRY_BLACK -> RecognitionNotice(
             failure,
             "未拿到新画面：只收到黑帧（页面可能尚未就绪、锁屏或禁止截图）。本次未识别文字、未查询、未收录；不会复用旧截图或绕过保护。",
-            "请确认页面已点亮且允许截图后，点「重试取词」重新划词；也可点「手动查词」到查词页输入。"
+            "请确认页面已点亮且允许截图后，点「重试取词」重新划词；$MANUAL_INPUT_HINT"
         )
         RecognitionFailure.NO_FRAME_ENTRY -> RecognitionNotice(
             failure,
             "未拿到新画面：没有收到新的有效屏幕画面（安全页面可能禁止截图）。本次未识别文字、未查询、未收录；不会复用旧截图。",
-            "请回到允许截图的普通页面后点「重试取词」；也可点「手动查词」到查词页输入。"
+            "请回到允许截图的普通页面后点「重试取词」；$MANUAL_INPUT_HINT"
         )
         RecognitionFailure.NO_FRAME_VERIFY_BLACK -> RecognitionNotice(
             failure,
             "抬笔后没有拿到新画面：只收到黑帧。本次未查询、未收录，也没有写入生词本。",
-            "请点亮页面后重新划词；也可点「手动查词」到查词页输入。"
+            "请点亮页面后重新划词；$MANUAL_INPUT_HINT"
         )
         RecognitionFailure.NO_FRAME_VERIFY -> RecognitionNotice(
             failure,
             "抬笔后没有拿到新画面：未收到新的有效画面。本次未查询、未收录，也没有写入生词本。",
-            "请回到允许截图的普通页面后重新划词；也可点「手动查词」到查词页输入。"
+            "请回到允许截图的普通页面后重新划词；$MANUAL_INPUT_HINT"
         )
         RecognitionFailure.PAGE_CHANGED -> RecognitionNotice(
             failure,
             "抬笔后的画面与起点页面不一致（划选期间页面已改变）。本次未查询、未收录。",
-            "请等页面稳定后重新划词；也可点「手动查词」到查词页输入。"
+            "请等页面稳定后重新划词；$MANUAL_INPUT_HINT"
         )
         RecognitionFailure.OCR_UNAVAILABLE -> RecognitionNotice(
             failure,
             "本地文字识别异常（OCR 未返回结果，不是词库未命中）。本次未查询、未收录。",
-            "请点「重试取词」重新划词；也可点「手动查词」到查词页输入。"
+            "请点「重试取词」重新划词；$MANUAL_INPUT_HINT"
         )
         RecognitionFailure.OCR_EMPTY -> RecognitionNotice(
             failure,
             "没有识别到笔迹附近的文字（OCR 结果为空，不是词库未命中）。本次未查询、未收录。",
-            "请沿完整英文单词重划一笔；也可点「手动查词」到查词页输入。"
+            "请沿完整英文单词重划一笔；$MANUAL_INPUT_HINT"
         )
         RecognitionFailure.NO_ENGLISH_WORD -> RecognitionNotice(
             failure,
             "已识别到文字，但选区里没有可查询的英文单词（不是词库缺词）。本次未查询、未收录。",
-            "请沿完整英文单词重划一笔；也可点「手动查词」到查词页输入，或纠正选中文字。"
+            "请沿完整英文单词重划一笔；也可点「手动查词」在当前页面的输入框中查词，或纠正选中文字。"
         )
     }
 }

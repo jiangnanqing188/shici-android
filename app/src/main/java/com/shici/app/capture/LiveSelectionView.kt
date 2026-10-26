@@ -187,10 +187,11 @@ class LiveSelectionView(
     private fun appendEvent(event: MotionEvent) {
         val index = event.findPointerIndex(pointerId)
         if (index < 0) { cancelCurrentStroke(); return }
-        if (event.actionMasked == MotionEvent.ACTION_MOVE) {
-            for (history in 0 until event.historySize) {
-                appendPoint(event.getHistoricalX(index, history), event.getHistoricalY(index, history))
-            }
+        // Coalesced history belongs to any event, not only ACTION_MOVE. A fast two-sample stroke
+        // can carry its whole back-and-forth path in the lift event's history; dropping it would
+        // turn a real word stroke into a straight jump between the first and last point.
+        for (history in 0 until event.historySize) {
+            appendPoint(event.getHistoricalX(index, history), event.getHistoricalY(index, history))
         }
         appendPoint(event.getX(index), event.getY(index))
     }
@@ -239,6 +240,13 @@ class LiveSelectionView(
                     onCancel("检测到多指操作，本次未查询")
                     return true
                 }
+                // A lift without an active stroke belongs to a cancelled attempt (for example
+                // ACTION_CANCEL followed by the system's final UP). It must not turn into a
+                // spurious "too short" notice or a new query.
+                if (currentPoints == null) {
+                    invalidate()
+                    return true
+                }
                 appendEvent(event)
                 val points = currentPoints?.toList() ?: emptyList()
                 cancelCurrentStroke()
@@ -250,6 +258,8 @@ class LiveSelectionView(
                 onStroke(HighlighterStroke(points.map(::toScreen)))
             }
             MotionEvent.ACTION_CANCEL -> {
+                interrupted = false
+                cancelPressed = false
                 cancelCurrentStroke()
                 invalidate()
                 onCancel("取词手势已中断，本次未查询")
