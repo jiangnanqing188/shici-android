@@ -1,5 +1,24 @@
 # 项目协作规则
 
+## 2026-10-26 13:02 当前：香港H2官网已上线，本批有限验收闭环
+
+- 原指定Claude Code→Magpie3425→commandcode-plan完整交付安装防护两轮及CSS单点修正，实际普通`deepseek/deepseek-v4.1-flash-1017`。首部署准确source-03/7文件bundle，后只应用已审charset配置；四公开静态与下载null始终保持。执行端只语法检查，未承担功能验收。
+- 官方Netcatty实际于2026-10-26 11:43安装固定nginx/nginx-common 1.24.0-2ubuntu7.18，32.083秒/exit0，0升级/0删除；两次抑制包启动后，四文件/配置/nginx-t就绪才首次公开。站点现为H2公网IP/HTTP80；仅四静态，目录755/文件644、唯一启用链接。无域名/HTTPS，H1/H5/防火墙未改。
+- 独立实际gpt-6.1-sol/high：部署前R2原7PASS/1ERROR保留、PRE04精确补证新1PASS闭合准入；首次真实POST为9PASS/1FAIL，唯一CSS响应头未显式UTF8，内容未见乱码。指定链修正后，静态CSSREV01为1PASS，父候选与生产nginx-t成功，仅reload nginx；新post-css-r1唯一run-01 **6PASS/0FAIL/0ERROR/0SKIP**。原失败/错误不倒填、不累计为旧全集通过。
+- 新复验覆盖五URL GET/HEAD完整10响应200、正确MIME+显式UTF8、准确正文/hash/大小及HEAD空体，三私有路径404、POST/OPTIONS405；远程只读核原443进程身份和unit/config/binary三hash保持。父直接核该测试者全部7真实turn_context均Sol/high，完整结束关闭。本任务Netcatty新会话已官方关闭，已部署服务保留运行。
+- `nginx-t`的duplicate MIME type text/html为非阻断warning，真实exit0，不为消警告扩修。安装回执completed/exit0/outputTruncated=false，但声明字符数与正文长度不同，不声称逐字节完整终端流。结论仅当前线路HTTP/IP及给定远程证据，不含浏览器观感/交互、国内各网、HTTPS、动态故障回退、重启或长期可用性。
+- 同指定链README-only最终收尾完整success/is_error=false/end_turn/exit0、0Bash；仅website README事实更新，不改其余7源、不重建重测。12:54新鲜CPA五小时22%/26%、周57%/57%、stale=false，仅用于该完整文案收尾，保15%门禁；不切号/重置/改路由/扩下一批。
+- Android165/2.4.1/48、平板2.3.2/46、原80测试、四草稿内容与原index、815B用户原件保持。publicRelease/repositoryUrl仍null，APK/模型/源码/词库/学习数据未公开；具体IP只私有与用户交付。唯一方案17.19.4、工作记录20261026-1；本批准确3产品+5治理本地提交，不推送，不重复安装或部署。
+
+## 2026-10-26 12:13 当前：香港H2官网已安装启动，真实HTTP有限验收中
+
+- 原指定Claude Code→Magpie3425→commandcode-plan两轮修正均完整交回，实际普通Flash-1017。第二轮只install.sh/website README，1次bash-n通过；source-03准确8源、bundle-r2准确7文件，Android165、四草稿内容及原index、815B用户原件与四静态/下载null保护保持。
+- 独立实际gpt-6.1-sol/high：原R2固定8项7PASS/1ERROR保留；准确needrestart钩子/包装/源码/配置5份精确hash补证后，原PRE04另新域1PASS，闭合部署准入而不倒填/累计旧通过。三回退根因已作有界静态确认，不代表动态故障回退已验。旧初轮6/2及R1 6/1/1均保持。
+- 父经官方Netcatty在H2 root私有700目录上传准确7文件（600），逐hash核后执行已审source-03。2026-10-26 11:43（本地）实际32.083秒/exit0，nginx与nginx-common固定1.24.0-2ubuntu7.18，0升级/0删除；先两次condition抑制启动，四文件/配置/nginx-t就绪后首次start，服务active+enabled。没有购买域名、改防火墙或碰H1/H5。
+- 12:11新鲜Netcatty只读：公网目录恰四文件/644、目录755、唯一启用链接、nginx-t通过、80监听；443仍原pid/starttime及unit/config/二进制hash，临时抑制/policy均无残留。**服务器已启动不等于公网验收完成**。
+- 12:12新鲜CPA40%/45%、周60%/60%、stale=false，保15%门禁。同一独立测试者未恢复/换档，父直接核全部5真实上下文均Sol/high后GO-POST，最多10项真实HTTP与远程只读证据验收中；未出最终结果。只有HTTP/IP临时站，无域名/HTTPS；下载、APK/模型/源码库/词库/学习数据未公开，安卓和平板不动。
+- 私有20261025-h2-website-deploy保留全部来源、失败、补证、上传和安装回执，具体主机/IP/配置来源不进Git/官网。唯一方案17.19.4、工作记录20261026-1。验收完成后再准确产品＋治理本地提交，不推送、不自动扩下一批。
+
 ## 2026-10-25 22:33停止点：香港网站部署前审查6/8，两防护缺口未修，尚未上线
 
 - 用户已明确在香港H2部署，暂不买域名，先IP直连HTTP80；这项授权保留。指定Claude Code→Magpie→commandcode-plan完整交付，实际普通Flash-1017、success/is_error=false/end_turn/exit0，只新增website/deploy/nginx.conf/install.sh并改website/README；bash-n通过，另三次只读shell检查如实记录，无执行AI功能测试/远程操作。四静态文件/下载配置保持null，准确8源与7文件bundle私有冻结。
