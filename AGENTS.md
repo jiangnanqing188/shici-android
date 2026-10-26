@@ -1,5 +1,12 @@
 # 项目协作规则
 
+## 2026-10-26 14:41 Logo接入授权已收：因额度数据过时，尚未派发
+
+- 用户确认最新墨绿米白“托起a词卡＋右侧四指合拢＋两笔动势”Logo，并授权放入官网及软件图标。唯一批准图私有冻结于20261026-logo-integration/approved-logo.png；设计不得重画，现还没有应用到产品或线上。
+- 当前codex/android-mvp/40a9e74，Android2.4.1/48、平板2.3.2/46。原四草稿内容及index已机械核保持；官网仍上一批四静态HTTP80。拟用内嵌Logo/favicon保持四文件边界，不改nginx/首安装脚本；Android新增launcher资源，保原通知smallIcon共用的ic_shici.xml，业务/权限/版本不动。不含平板安装授权。
+- 当前额度只读多次返回stale=true/refreshing=true；最后14:38原回执显示两路五小时97%、周99%，来源14:30但接口仍明确标记过时，不能冒称已核新鲜门禁。未派Claude/Sol、未运行构建/功能测试、未连服务器或改产品。不切号/重置/改路由，不自动等刷新重启任务。
+- 唯一方案17.19.4续记Logo子批，私有dispatch-prepared.md为完整待发任务，baseline含239原来源/草稿index/用户原件。新鲜门禁通过，或用户明确确认按该读数放行后，才同原DSF整批接入+语法→新实际Sol/high统一有限验收→Netcatty仅两静态更新+受影响真实HTTP。未执行不能称已替换/已上线。
+
 ## 2026-10-26 13:02 当前：香港H2官网已上线，本批有限验收闭环
 
 - 原指定Claude Code→Magpie3425→commandcode-plan完整交付安装防护两轮及CSS单点修正，实际普通`deepseek/deepseek-v4.1-flash-1017`。首部署准确source-03/7文件bundle，后只应用已审charset配置；四公开静态与下载null始终保持。执行端只语法检查，未承担功能验收。
