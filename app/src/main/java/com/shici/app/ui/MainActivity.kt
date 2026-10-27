@@ -56,6 +56,9 @@ class MainActivity : Activity() {
         private const val OVERLAY_PERMISSION = 10
         private const val CAPTURE_PERMISSION = 11
         private const val NOTIFICATION_PERMISSION = 12
+        // Row-menu item ids for the vocabulary list (see showVocabularyRowMenu).
+        private const val MENU_FAVORITE = 1
+        private const val MENU_REMOVE = 2
     }
 
     /**
@@ -73,7 +76,8 @@ class MainActivity : Activity() {
         // TRANSLATION so saved state, tests and legacy entry points keep their identity.
         TRANSLATION("离线 AI 翻译", -1),
         VOCABULARY("生词本", 1),
-        STUDY("背词", 4),
+        // Visible label only: the stable route/persistence id stays STUDY and legacyTab stays 4.
+        STUDY("复习", 4),
         STATISTICS("统计", 2),
         PERSONAL_ENTRY("添加/补词", -1),
         SETTINGS("设置", 3),
@@ -126,8 +130,15 @@ class MainActivity : Activity() {
     // `true` and [exportSelection] is the explicit allow-list: an empty set is an explicit zero and
     // must never fall back to "all". Only the visible "use all current results" action resets it.
     private var exportSelectionExplicit = false
-    private var favoriteFilterView: FavoriteFilterView? = null
-    private var vocabularySortView: VocabularySortView? = null
+    // Compact vocabulary filter/sort/manage toolbar and the collapsible export-selection panel.
+    // [vocabularyManaging] only decides whether the export controls and row checkboxes are shown; it
+    // never edits the selection intent, the search/favorite filter or any learning data.
+    private var vocabularyToolbar: VocabularyToolbar? = null
+    private var selectionPanel: LinearLayout? = null
+    // Scroll container that holds the toolbar, the manage panel and the rows (the left column in
+    // split layout). Used only to bring the panel into view when managing starts.
+    private var vocabularyScroll: ScrollView? = null
+    private var vocabularyManaging = false
     // The single live animated guide page. Only one may exist: a rebuild/re-entry pauses and closes
     // the old one before a new screen is created, so no detached instance keeps animating.
     private var guideScreen: UsageGuideScreen? = null
@@ -245,6 +256,7 @@ class MainActivity : Activity() {
     private var syncSwitch = false
     private var searchList: LinearLayout? = null
     private var wordListHeader: TextView? = null
+    private var vocabularyCountView: TextView? = null
     private var detailPanel: LinearLayout? = null
     private val manualGate = QueryGate()
     // One cross-thread admission lease per open supplement editor. A lease is closed by its own
@@ -377,6 +389,7 @@ class MainActivity : Activity() {
         vocabularySort = savedInstanceState?.getString("vocabulary_sort")
             ?.let { name -> VocabularySort.entries.firstOrNull { it.name == name } }
             ?: VocabularySort.RECENT_FIRST
+        vocabularyManaging = savedInstanceState?.getBoolean("vocabulary_managing", false) ?: false
         savedInstanceState?.getStringArrayList("export_selection")?.let { exportSelection.addAll(it) }
         // Old bundles carried no intent flag: a restored non-empty list was the historical explicit
         // allow-list, while a restored empty list meant the default "current filter" scope. New
@@ -578,6 +591,9 @@ class MainActivity : Activity() {
         outState.putInt("translation_sel_end", translationSelectionEnd)
         outState.putBoolean("favorites_only", onlyFavorites)
         outState.putString("vocabulary_sort", vocabularySort.name)
+        // Local display state only: whether the export-selection panel is open. The selection and
+        // its explicit-zero intent are saved separately and are never derived from this flag.
+        outState.putBoolean("vocabulary_managing", vocabularyManaging)
         outState.putStringArrayList("export_selection", ArrayList(exportSelection))
         // The intent is part of the selection identity: an explicit empty selection is 0 words, not
         // the default "all". Old readers without this key keep their historical interpretation.
@@ -742,13 +758,13 @@ class MainActivity : Activity() {
         // translation page itself (rebuilt immediately below), this is the page-leave path.
         if (translationScreen != null) { captureTranslationDraft(); closeTranslationOwner() }
         floatingSwitch = null; floatingText = null; stopCaptureButton = null; searchList = null; detailPanel = null
-        wordListHeader = null
+        wordListHeader = null; vocabularyCountView = null
         exportButton = null; inlineDetail = null
         dictionaryStatusView = null; dictionaryDetailView = null
         backupExportButton = null; restoreButton = null; backupStatusView = null
         settingsScreen = null
-        lookupInputView = null; personalStatusView = null; favoriteFilterView = null
-        vocabularySortView = null
+        lookupInputView = null; personalStatusView = null
+        vocabularyToolbar = null; selectionPanel = null; vocabularyScroll = null
         // A rebuild never leaves the previous guide screen alive behind detached views. It is closed
         // permanently; the GUIDE branch below creates the only new instance when it is still current.
         guideScreen?.close(); guideScreen = null
@@ -820,7 +836,7 @@ class MainActivity : Activity() {
         content.space(8)
         content.addView(entryCard("生词本", "查看和管理已收录的生词。") { selectPage(MainPage.VOCABULARY) })
         content.space(8)
-        content.addView(entryCard("背词", "按统一队列学习和复习。") { selectPage(MainPage.STUDY) })
+        content.addView(entryCard("复习", "看英文词，从四个中文释义中选一个。") { selectPage(MainPage.STUDY) })
         content.space(8)
         content.addView(entryCard("统计", "查看真实查询与复习进度。") { selectPage(MainPage.STATISTICS) })
         content.space()
@@ -877,65 +893,74 @@ class MainActivity : Activity() {
     }
 
     private fun vocabulary() {
-        val content = if (splitContent) body else scrolled()
-        val inline = inlineAt(contentWidthDp)
-        val header = (if (inline) row() else column()).apply { gravity = Gravity.CENTER_VERTICAL }
+        // First screen: title + count, one search line, a compact filter/sort/manage strip, then the
+        // word list. Everything export-related — row checkboxes, select all, clear, restore *and*
+        // the "导出 PDF" action — lives only in the explicit "管理与导出" panel, so the reading screen
+        // stays a reading screen and the export scope is always read next to the action that uses
+        // it. The title line and the search line stay fixed; the strip, panel and list share one
+        // scroll, so a narrow screen or a large font scrolls instead of cramming.
+        //
+        // The panel is built eagerly and only hidden while not managing, so the page always owns a
+        // live [exportButton]. Existing device flows that look the button up right after the
+        // vocabulary page renders (they traverse the view tree rather than requiring visibility)
+        // still find the same enabled/disabled state.
+        val header = row().apply { gravity = Gravity.CENTER_VERTICAL }
         header.addView(text("生词本", 28f, bold = true),
-            if (inline) LinearLayout.LayoutParams(0, -2, 1f) else LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
-        exportButton = button("导出 PDF", true) { export() }
-        updateExportButton()
-        header.addView(exportButton, LinearLayout.LayoutParams(if (inline) -2 else -1, -2))
-        content.addView(header); content.space(16)
-        val input = inputField("搜索单词、释义或笔记", true).apply { setText(search) }
-        content.addView(input); content.space(16)
-        // Product filter for the same snapshot the list/export read. The widget itself never touches
-        // the repository; it only selects which rows this page shows. Star/unstar never deletes data.
-        favoriteFilterView = FavoriteFilterView(this).apply {
-            setOnlyFavorites(this@MainActivity.onlyFavorites, notify = false)
-            onFilterChanged = { value ->
-                this@MainActivity.onlyFavorites = value
-                renderWords(preserveDetail = true)
-                updateExportButton()
-            }
+            LinearLayout.LayoutParams(-2, -2).apply { marginEnd = dp(12) })
+        val countView = text(vocabularyCountText(), 15f, Paper.secondary).apply {
+            gravity = Gravity.CENTER_VERTICAL
         }
-        content.addView(favoriteFilterView); content.space(8)
-        // Display order for exactly the same filtered snapshot the checkboxes/export use. The
-        // constructor does not notify; a tap only re-renders rows and the summary text.
-        vocabularySortView = VocabularySortView(this, vocabularySort) { value ->
+        vocabularyCountView = countView
+        header.addView(countView, LinearLayout.LayoutParams(0, -2, 1f))
+
+        // Filter, display order and the single entry to the export-selection panel. The toolbar only
+        // mirrors the host state; it never touches the search text, the export selection or data.
+        val toolbar = VocabularyToolbar(this)
+        toolbar.setState(onlyFavorites, vocabularySort, vocabularyManaging)
+        toolbar.onFilterChanged = { value ->
+            onlyFavorites = value
+            renderWords(preserveDetail = true)
+            updateExportButton()
+        }
+        toolbar.onSortChanged = { value ->
             vocabularySort = value
             renderWords(preserveDetail = true)
         }
-        content.addView(vocabularySortView); content.space(8)
-        val selectionRow = row().apply { gravity = Gravity.CENTER_VERTICAL }
-        selectionRow.addView(button("全选结果") { selectAllFilteredForExport() },
-            LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(8) })
-        selectionRow.addView(button("清空") { clearExportSelection() },
-            LinearLayout.LayoutParams(0, -2, 1f))
-        content.addView(selectionRow); content.space(8)
-        // The only explicit way back to the default scope. Clearing the checks is a deliberate zero
-        // and never doubles as "all", so this separate action must stay visible to the user. The
-        // label says it only restores the export scope, never any learning data.
-        content.addView(button("恢复全部") { useAllFilteredForExport() },
-            LinearLayout.LayoutParams(-1, -2))
-        content.space(8)
-        content.addView(text("清空勾选后导出 0 个；点「恢复全部」可重置（只恢复导出范围，不改任何数据）。", 15f, Paper.secondary))
-        content.addView(helpDisclosure("导出范围说明") {
-            addView(text("这里的「恢复全部」就是下文的“使用当前结果全部（不勾选）”。", 15f, Paper.secondary))
-            addView(text("勾选只决定 PDF 导出范围，不改词库、查询次数或学习进度。默认（尚未勾选/清空）导出当前筛选全部；一旦勾选、取消或清空，就按你的勾选集合导出，清空即 0 个，不会自动变回全部；点“使用当前结果全部（不勾选）”才回到默认全量。全选只包含当前搜索/仅收藏筛出的词，日期范围仍在导出选项中取交集。", 15f, Paper.secondary))
-        })
-        content.space(8)
-        // One visible explanation for the whole list: the per-row "移除…" opens the original
-        // scope chooser (exact undo vs. whole-word delete requiring a second confirmation).
-        content.addView(VocabularyActions.listScopeHint(this))
-        content.space(8)
-        searchList = column()
+        toolbar.onManageToggled = { value -> setVocabularyManaging(value) }
+        vocabularyToolbar = toolbar
+        // Secondary panel, hidden by default. It starts with exactly the frozen intent kept in
+        // [exportSelection]/[exportSelectionExplicit]; opening or closing it changes neither.
+        val selectionCard = vocabularySelectionPanel()
+        selectionCard.visibility = if (vocabularyManaging) View.VISIBLE else View.GONE
+        selectionPanel = selectionCard
+        val input = inputField("搜索单词、释义或笔记", true).apply { setText(search) }
+        // Fixed top: the title/count line, then the one search line — those are the key operations,
+        // so they never scroll away at any width or font scale. Everything below — the
+        // filter/sort/manage strip, the manage panel and the word list — shares one scroll, so a
+        // narrow screen or a large font simply scrolls that content instead of pretending it fits.
+        val rowList = column()
+        searchList = rowList
+        val scrolledList = column()
+        scrolledList.addView(toolbar)
+        scrolledList.space(8)
+        scrolledList.addView(selectionCard, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
+        scrolledList.addView(rowList)
+        body.addView(header); body.space(8)
+        body.addView(input); body.space(8)
+        val listScroll = ScrollView(this).apply { isFillViewport = true; addView(scrolledList) }
+        vocabularyScroll = listScroll
         if (splitContent) {
             val container = row()
-            container.addView(ScrollView(this).apply { addView(searchList) }, LinearLayout.LayoutParams(0, -1, 0.44f))
-            detailPanel = column().apply { setPadding(dp(24), 0, 0, 0) }
-            container.addView(ScrollView(this).apply { addView(detailPanel) }, LinearLayout.LayoutParams(0, -1, 0.56f))
-            content.addView(container, LinearLayout.LayoutParams(-1, 0, 1f))
-        } else content.addView(searchList)
+            // Only the two columns scroll, below the fixed title/search lines.
+            container.addView(listScroll, LinearLayout.LayoutParams(0, -1, 0.44f))
+            val detail = column().apply { setPadding(dp(24), 0, 0, 0) }
+            detailPanel = detail
+            container.addView(ScrollView(this).apply { addView(detail) },
+                LinearLayout.LayoutParams(0, -1, 0.56f))
+            body.addView(container, LinearLayout.LayoutParams(-1, 0, 1f))
+        } else {
+            body.addView(listScroll, LinearLayout.LayoutParams(-1, 0, 1f))
+        }
         input.addTextChangedListener(object : TextWatcher {
             override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
             override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
@@ -946,6 +971,75 @@ class MainActivity : Activity() {
         })
         renderWords()
     }
+    /**
+     * The export-selection panel behind the toolbar's "管理与导出". The buttons keep their original
+     * actions and wording: "全选结果" is the current filtered snapshot, "清空" is an explicit zero
+     * (never "all"), and only "恢复全部" returns to the default current-result scope. The panel only
+     * shows controls; it never edits the selection while being opened or closed.
+     */
+    private fun vocabularySelectionPanel(): LinearLayout {
+        val card = panel().apply { setPadding(dp(16), dp(12), dp(16), dp(12)) }
+        val selectAll = button("全选结果") { selectAllFilteredForExport() }.apply { textSize = 14f }
+        val clear = button("清空") { clearExportSelection() }.apply { textSize = 14f }
+        // The only explicit way back to the default scope. Clearing the checks is a deliberate zero
+        // and never doubles as "all", so this separate action stays visible while managing.
+        val restore = button("恢复全部") { useAllFilteredForExport() }.apply { textSize = 14f }
+        // Three equal buttons while the width really fits them at the current font scale; otherwise
+        // they stack instead of squeezing the labels or letting one action disappear.
+        val minRowWidth = (300 * resources.configuration.fontScale).toInt()
+        if (contentWidthDp >= minRowWidth) {
+            val selectionRow = row().apply { gravity = Gravity.CENTER_VERTICAL }
+            selectionRow.addView(selectAll, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(6) })
+            selectionRow.addView(clear, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(6) })
+            selectionRow.addView(restore, LinearLayout.LayoutParams(0, -2, 1f))
+            card.addView(selectionRow)
+        } else {
+            card.addView(selectAll, LinearLayout.LayoutParams(-1, -2))
+            card.space(4)
+            card.addView(clear, LinearLayout.LayoutParams(-1, -2))
+            card.space(4)
+            card.addView(restore, LinearLayout.LayoutParams(-1, -2))
+        }
+        card.space(4)
+        card.addView(text("默认导出当前筛选全部（勾选框已按此显示）；取消勾选后按勾选导出；清空即 0 个。", 13f, Paper.secondary))
+        // The single primary action of this panel, next to the scope it will use. It is created
+        // eagerly (the panel itself is only hidden), so the page always owns one live export
+        // button whose enabled state follows [exportScopeCount].
+        val exportAction = button("导出 PDF", true) { export() }
+        exportButton = exportAction
+        card.space(8)
+        card.addView(exportAction, LinearLayout.LayoutParams(-1, -2))
+        updateExportButton()
+        card.addView(helpDisclosure("导出范围说明") {
+            addView(text("「恢复全部」把导出范围恢复为默认：当前搜索/仅收藏筛出的全部词，不必逐个勾选。", 14f, Paper.secondary))
+            addView(text("勾选只决定 PDF 导出范围，不改词库、查询次数或学习进度。默认（尚未改动勾选）导出当前筛选全部；一旦勾选、取消或清空，就按你的勾选集合导出，清空即 0 个，不会自动变回全部；点“恢复全部”才回到默认全量。全选只包含当前搜索/仅收藏筛出的词，日期范围仍在导出选项中取交集。", 14f, Paper.secondary))
+        })
+        return card
+    }
+    /**
+     * Display-only switch between the reading list and the export-selection state. It never edits
+     * [exportSelection], [exportSelectionExplicit], the search text, the favorite filter or the sort,
+     * so a hidden/reopened panel always keeps an explicit zero and an allow-list exactly as chosen.
+     */
+    private fun setVocabularyManaging(value: Boolean) {
+        if (value == vocabularyManaging) return
+        vocabularyManaging = value
+        selectionPanel?.visibility = if (value) View.VISIBLE else View.GONE
+        vocabularyToolbar?.setState(onlyFavorites, vocabularySort, value)
+        renderWords(preserveDetail = true)
+        updateExportButton()
+        // The panel sits directly under the toolbar at the top of the scrolling area. If the list
+        // was scrolled down, opening it would otherwise look like nothing happened, so bring that
+        // top region back into view. Closing never scrolls and never edits the selection.
+        if (value) vocabularyScroll?.post { vocabularyScroll?.smoothScrollTo(0, 0) }
+    }
+    /**
+     * Title-line count from the same snapshot the list shows. An empty book leaves it blank: the
+     * list itself already says "还没有生词", so the title does not repeat it.
+     */
+    private fun vocabularyCountText(): String =
+        if (words.isEmpty()) ""
+        else "共 ${words.size} 个词 · 待复习 ${words.count { !it.mastered }} 个"
     private fun filteredWords() = words.filter { word ->
         (!onlyFavorites || word.favorite) && (search.isBlank() ||
             listOf(word.entry.headword, word.entry.meaning, word.lastForm, word.note)
@@ -1005,11 +1099,24 @@ class MainActivity : Activity() {
         // Same filtered membership as the export scope, only the display order changes. Export
         // selection stays keyed by entry.key, so reordering never adds, drops or widens a check.
         val list = VocabularyOrdering.apply(filteredWords(), vocabularySort)
+        vocabularyCountView?.text = vocabularyCountText()
         searchList?.removeAllViews()
         val summary = listSummary(list)
-        wordListHeader = text(summary, 14f, Paper.secondary)
+        wordListHeader = text(summary, 14f, Paper.secondary).apply {
+            // The resting state (no filter, default export scope) needs no extra line.
+            visibility = if (summary.isBlank()) View.GONE else View.VISIBLE
+        }
         searchList?.addView(wordListHeader)
-        if (list.isEmpty()) searchList?.addView(text(if (words.isEmpty()) "还没有生词。成功查询后会自动收录。" else "没有匹配的生词。", 18f))
+        // No per-row or per-list delete explanation: the row menu's "移除…" opens the existing
+        // scope chooser, which states both scopes (undo-last vs. whole word) in full at the moment
+        // of choice, followed by the second dangerous confirmation for the whole-word scope.
+        if (list.isEmpty()) searchList?.addView(
+            text(
+                if (words.isEmpty()) "还没有生词。成功查询后会自动收录。"
+                else "没有匹配的生词。试试清空搜索或切回「全部」。",
+                18f
+            ).apply { setPadding(0, dp(16), 0, dp(8)) }
+        )
         list.forEach { word ->
             searchList?.addView(vocabularyRow(word) {
                 openVocabularySnapshot(word.entry.key)
@@ -1039,61 +1146,135 @@ class MainActivity : Activity() {
             }
         }
     }
+    /**
+     * One short status line for the list. Empty when the list is in the plain resting state (no
+     * search/favorite filter and the default "all current results" export scope), because the title
+     * already states the count. Any explicit selection — above all an explicit zero — is always
+     * spelled out so it can never be mistaken for "all". The sort stays on the toolbar chip.
+     */
     private fun listSummary(list: List<LearnedWord>): String {
         val filters = buildList {
             if (search.isNotBlank()) add("搜索“${search.trim()}”")
             if (onlyFavorites) add("仅收藏")
         }
-        val count = if (filters.isEmpty()) "共 ${list.size} 个词"
+        val count = if (filters.isEmpty()) null
         else "筛选 ${list.size} 个词（${filters.joinToString(" · ")}）"
+        // Default scope is the calm resting state and stays implicit; while the manage panel is open
+        // it is spelled out so "everything currently shown" is never guessed. Any explicit
+        // allow-list — above all an explicit zero — is always spelled out.
         val scope = when {
-            !exportSelectionExplicit -> "导出当前筛选全部（${list.size} 个）"
+            !exportSelectionExplicit ->
+                if (vocabularyManaging && list.isNotEmpty()) "导出当前筛选全部（${list.size} 个）" else ""
             exportSelection.isEmpty() -> "已清空勾选：导出 0 个"
             else -> {
                 val inFilter = list.count { it.entry.key in exportSelection }
                 "已勾选 ${exportSelection.size} 个（筛选内 $inFilter 个）"
             }
         }
-        return "$count · 排序：${vocabularySort.label} · $scope"
+        return listOfNotNull(count, scope.takeIf { it.isNotBlank() }).joinToString(" · ")
     }
-    private fun refreshListSummary() { wordListHeader?.text = listSummary(filteredWords()) }
+    private fun refreshListSummary() {
+        val summary = listSummary(filteredWords())
+        wordListHeader?.apply {
+            text = summary
+            visibility = if (summary.isBlank()) View.GONE else View.VISIBLE
+        }
+        vocabularyCountView?.text = vocabularyCountText()
+    }
     /**
-     * One vocabulary row: an export checkbox, the original clickable word content and a star. The
-     * checkbox only edits the in-memory export allow-list (never the database); the star sends one
-     * frozen key/target/credential to the real repository through the existing worker.
+     * One compact vocabulary row: the word, a one-line meaning, a light query/time line and the
+     * favorite state; the whole row opens the detail. In the explicit "管理与导出" state a leading
+     * checkbox edits only the in-memory export allow-list (never the database). Every destructive or
+     * favorite action stays in the row menu, which only invokes the existing exact-key flows
+     * ([toggleListFavorite] and [openListRemoval] → scope chooser + second confirmation).
      */
     private fun vocabularyRow(word: LearnedWord, action: () -> Unit): View {
-        val container = row().apply { gravity = Gravity.CENTER_VERTICAL; minimumHeight = dp(72) }
-        val check = CheckBox(this).apply {
-            isChecked = word.entry.key in exportSelection
-            contentDescription = "勾选导出 ${word.entry.headword}"
-            setOnCheckedChangeListener { _, checked ->
-                // Any real checkbox edit switches the page into the explicit allow-list intent, so
-                // unchecking the last row keeps an explicit 0 instead of reverting to "all".
-                exportSelectionExplicit = true
-                if (checked) exportSelection += word.entry.key else exportSelection -= word.entry.key
-                refreshListSummary()
-                updateExportButton()
+        val container = row().apply { gravity = Gravity.CENTER_VERTICAL; minimumHeight = dp(64) }
+        if (vocabularyManaging) {
+            val check = CheckBox(this).apply {
+                // The default scope is "all current results", so under that intent every visible
+                // row really is in scope and is shown checked. Nothing is written by rendering it.
+                isChecked = !exportSelectionExplicit || word.entry.key in exportSelection
+                contentDescription = "勾选导出 ${word.entry.headword}"
+                setOnCheckedChangeListener { _, checked ->
+                    // The first real edit materialises the visible default scope before applying
+                    // the change, so unchecking one row means "all of this filter except it" instead
+                    // of collapsing into an accidental zero. From then on the set is the explicit
+                    // allow-list: unchecking the last row stays an explicit 0, never "all".
+                    if (!exportSelectionExplicit) {
+                        exportSelection.clear()
+                        exportSelection.addAll(filteredWords().map { it.entry.key })
+                        exportSelectionExplicit = true
+                    }
+                    if (checked) exportSelection += word.entry.key else exportSelection -= word.entry.key
+                    refreshListSummary()
+                    updateExportButton()
+                }
             }
+            container.addView(check)
         }
-        container.addView(check)
-        container.addView(wordRow(word, action), LinearLayout.LayoutParams(0, -2, 1f))
-        val star = button(if (word.favorite) "★" else "☆") { toggleListFavorite(word) }.apply {
-            textSize = 22f
-            minWidth = dp(48)
-            contentDescription =
-                if (word.favorite) "取消收藏 ${word.entry.headword}" else "收藏 ${word.entry.headword}"
-            setTextColor(if (word.favorite) Paper.warning else Paper.green)
+        // Light, glanceable metadata only: how often and how recently it was looked up, plus a star
+        // when it is favorited. An unstarred word says nothing rather than adding a second marker;
+        // mastery, full timestamps and provenance stay in the detail.
+        val meta = buildList {
+            add("${word.queryCount} 次")
+            add(compactTime(word.lastAt))
+            if (word.favorite) add("★ 已收藏")
+        }.joinToString(" · ")
+        val body = column().apply {
+            setPadding(dp(4), dp(8), dp(4), dp(8)); isClickable = true; isFocusable = true
+            addView(text(word.entry.headword, 21f, bold = true).apply {
+                typeface = Typeface.create("serif", Typeface.BOLD)
+            })
+            addView(text("${word.entry.partOfSpeech} ${word.entry.meaning}", 15f, Paper.secondary).apply {
+                maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END
+            })
+            addView(text(meta, 13f, if (word.favorite) Paper.warning else Paper.secondary))
+            setOnClickListener { action() }
+            contentDescription = "${word.entry.headword}，${word.entry.partOfSpeech} ${word.entry.meaning}，" +
+                "$meta，${if (word.favorite) "已收藏" else "未收藏"}，点按查看详情"
         }
-        container.addView(star)
-        // Obvious per-word removal entry. It only invokes the existing scope chooser; both scopes
-        // keep their own confirmation and the whole-word delete still needs a second confirmation.
-        container.addView(
-            VocabularyActions.listRemoveButton(this, word.entry.headword) {
-                openListRemoval(word.entry.key)
-            }
-        )
+        container.addView(body, LinearLayout.LayoutParams(0, -2, 1f))
+        // One 48dp overflow entry per row; removal and favorite stay discoverable without a row of
+        // large buttons or a repeated explanation.
+        val more = Button(this).apply {
+            text = "⋮"
+            textSize = 20f
+            isAllCaps = false
+            minWidth = dp(48); minHeight = dp(48)
+            setTextColor(Paper.secondary)
+            background = shape(Paper.lightGreen, 8)
+            contentDescription = "更多操作 ${word.entry.headword}"
+            setOnClickListener { showVocabularyRowMenu(this, word) }
+        }
+        container.addView(more)
         return container
+    }
+    /** Row menu: only the existing exact flows, chosen per row; it never deletes or edits by itself. */
+    private fun showVocabularyRowMenu(anchor: View, word: LearnedWord) {
+        if (page != MainPage.VOCABULARY || !foreground || isFinishing || isDestroyed) return
+        val menu = PopupMenu(this, anchor)
+        menu.menu.add(0, MENU_FAVORITE, 0, if (word.favorite) "取消收藏" else "收藏")
+        menu.menu.add(0, MENU_REMOVE, 1, VocabularyActions.LIST_LABEL)
+        menu.setOnMenuItemClickListener { item ->
+            when (item.itemId) {
+                MENU_FAVORITE -> toggleListFavorite(word)
+                MENU_REMOVE -> openListRemoval(word.entry.key)
+            }
+            true
+        }
+        menu.show()
+    }
+    /** Short, honest age label for the list row; the detail keeps the full timestamps. */
+    private fun compactTime(time: Long): String {
+        val zone = ZoneId.systemDefault()
+        val day = LearningRules.localDate(time, zone)
+        val today = LearningRules.localDate(System.currentTimeMillis(), zone)
+        return when {
+            day == today -> "今天"
+            day == today.minusDays(1) -> "昨天"
+            else -> day.format(DateTimeFormatter.ofPattern("MM-dd"))
+        }
     }
     /** Opens the detail for exactly [key] from the current list snapshot, never a later selection. */
     private fun openVocabularySnapshot(key: String) {
@@ -3013,7 +3194,7 @@ class MainActivity : Activity() {
         if (exportSelectionExplicit && exportScopeCount() == 0) {
             toast(
                 if (exportSelection.isEmpty())
-                    "已清空勾选（0 个）：请先勾选，或点“使用当前结果全部（不勾选）”"
+                    "已清空勾选（0 个）：请先勾选，或点“恢复全部”回到当前筛选全部"
                 else "当前勾选与筛选没有交集：请调整勾选或筛选"
             )
             updateExportButton(); return
@@ -3306,10 +3487,10 @@ class MainActivity : Activity() {
             content.addView(text("收藏星标：${backup.favoriteCount} 个当前列表可见词条（隐藏词上的星标仍会随备份写回）", 18f))
         }
         if (backup.legacyNoStudyData) {
-            content.addView(text("这是旧版格式（v1）备份：只含生词与查询记录，不含背词进度和个人补充词库。", 16f, Paper.warning, true))
-            content.addView(text("恢复后背词进度为空、个人补充词库为空，所选范围与每日目标恢复为默认值。", 16f, Paper.warning))
+            content.addView(text("这是旧版格式（v1）备份：只含生词与查询记录，不含复习进度和个人补充词库。", 16f, Paper.warning, true))
+            content.addView(text("恢复后复习进度为空、个人补充词库为空，所选范围与每日目标恢复为默认值。", 16f, Paper.warning))
         } else {
-            content.addView(text("背词进度：已学 ${backup.stateCount} 词 · 反馈 ${backup.reviewCount} 条${if (backup.data.session != null) " · 含 1 张未答卡" else ""}", 18f))
+            content.addView(text("复习进度：已学 ${backup.stateCount} 词 · 反馈 ${backup.reviewCount} 条${if (backup.data.session != null) " · 含 1 张未答卡" else ""}", 18f))
             if (backup.noPersonalDictionary) {
                 content.addView(text("这是 v2 备份：不含个人补充词库。恢复会清空当前本机补充词条，不会与备份隐式合并。", 16f, Paper.warning, true))
             } else {

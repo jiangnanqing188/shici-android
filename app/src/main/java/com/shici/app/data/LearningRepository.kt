@@ -884,6 +884,17 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
      * feedback row, and pending-card removal all commit in one transaction; only then does a single
      * change publish. A stale credential (word deleted, or a full restore committed, after the card was
      * dealt) is rejected before any write.
+     *
+     * [canCommit] is the caller's world gate and [admission] is the owner's cross-thread gate. Both are
+     * taken together at the true linearization point: after every read that shapes the verdict (the
+     * pending card, feedback lookup, settings, personal members, study state and durable sequence) and
+     * immediately before the first business write, inside the commit transaction. The earlier
+     * `canCommit` call stays only as a cheap rejection after the first reads; it is not the barrier.
+     * A committed change that lands during the later long reads (for example a supplement save that
+     * rewrites a distractor meaning while this card is still pending) refuses at the final point with
+     * no row written, no pending card cleared and no change published. An invalidation that happens
+     * first likewise refuses there; an admission that happens first lets this atomic commit finish
+     * even if the owner is destroyed afterwards.
      */
     fun commitStudyFeedback(token: String, feedback: FeedbackKind, now: Long, zone: ZoneId,
                             deletionCredential: Long = deletions.capture(),
@@ -903,13 +914,10 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
             return if (existing.feedback == feedback) StudyCommitOutcome.IDEMPOTENT else StudyCommitOutcome.CONFLICT
         }
         if (pending == null || pending.token != token) return StudyCommitOutcome.REJECTED
+        // Cheap early rejection only: the final `canCommit` is re-taken inside the transaction after
+        // every read that shapes the verdict. This first check cannot close the read-to-write window.
         if (!canCommit()) return StudyCommitOutcome.REJECTED
         if (!admitsFeedback(db, pending, now, zone)) return StudyCommitOutcome.REJECTED
-        // The real admission, taken only now — after every long read (pending card, feedback lookup,
-        // settings, personal-member load). An owner invalidated before this point must not write;
-        // once this returns true a later destroy can no longer cancel the already-admitted transaction,
-        // which is allowed to finish atomically.
-        if (!admit(admission)) return StudyCommitOutcome.REJECTED
 
         var committed = false
         db.beginTransaction()
@@ -926,30 +934,40 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
                 // The durable commit sequence is taken inside the transaction, so it is the true order of
                 // real commits even when two feedbacks share the same wall-clock millisecond.
                 val seq = nextReviewSeq(db)
-                if (newWord) {
-                    // The pending card may display a merged supplement; persist only the original or
-                    // user-only snapshot. The user row stays the single source and is merged on read.
-                    val stored = PersonalDictionary.storedEntry(current.entry)
-                    db.insertWithOnConflict("words", null, ContentValues().apply {
-                        put("entry_key", current.entryKey); put("headword", stored.headword)
-                        put("pos", stored.partOfSpeech); put("meaning", stored.meaning)
-                        put("source", stored.source); put("version", stored.version)
-                    }, SQLiteDatabase.CONFLICT_IGNORE)
+                // Final admission: after every read that decides this verdict (pending card, study
+                // state, durable sequence) and immediately before the first business write. The early
+                // `canCommit` above is only a fast rejection; a committed change can land during the
+                // reads in between (for example a supplement save rewriting a distractor while this
+                // card is still pending). Refusing here writes no row, does not mark the transaction
+                // successful, publishes nothing and leaves the pending card untouched. `admit` is
+                // linearized at this same point: invalidation first refuses, admission first lets the
+                // atomic commit finish even if the owner is destroyed afterwards.
+                if (canCommit() && admit(admission)) {
+                    if (newWord) {
+                        // The pending card may display a merged supplement; persist only the original or
+                        // user-only snapshot. The user row stays the single source and is merged on read.
+                        val stored = PersonalDictionary.storedEntry(current.entry)
+                        db.insertWithOnConflict("words", null, ContentValues().apply {
+                            put("entry_key", current.entryKey); put("headword", stored.headword)
+                            put("pos", stored.partOfSpeech); put("meaning", stored.meaning)
+                            put("source", stored.source); put("version", stored.version)
+                        }, SQLiteDatabase.CONFLICT_IGNORE)
+                    }
+                    db.insertWithOnConflict("study_states", null, ContentValues().apply {
+                        put("entry_key", current.entryKey); put("book", current.book.id); put("stage", stageAfter)
+                        put("due_at", dueAfter); put("introduced_at", state?.introducedAt ?: now)
+                        put("last_review_at", now); put("last_review_seq", seq)
+                    }, SQLiteDatabase.CONFLICT_REPLACE)
+                    db.insertOrThrow("study_reviews", null, ContentValues().apply {
+                        put("token", token); put("entry_key", current.entryKey); put("feedback", feedback.id)
+                        put("stage_before", stageBefore); put("stage_after", stageAfter); put("due_after", dueAfter)
+                        put("reviewed_at", now); put("day_key", StudyRules.dayKey(now, zone))
+                        put("zone_id", zone.id); put("new_word", if (newWord) 1 else 0); put("seq", seq)
+                    })
+                    db.delete("study_session", "id=0", null)
+                    db.setTransactionSuccessful()
+                    committed = true
                 }
-                db.insertWithOnConflict("study_states", null, ContentValues().apply {
-                    put("entry_key", current.entryKey); put("book", current.book.id); put("stage", stageAfter)
-                    put("due_at", dueAfter); put("introduced_at", state?.introducedAt ?: now)
-                    put("last_review_at", now); put("last_review_seq", seq)
-                }, SQLiteDatabase.CONFLICT_REPLACE)
-                db.insertOrThrow("study_reviews", null, ContentValues().apply {
-                    put("token", token); put("entry_key", current.entryKey); put("feedback", feedback.id)
-                    put("stage_before", stageBefore); put("stage_after", stageAfter); put("due_after", dueAfter)
-                    put("reviewed_at", now); put("day_key", StudyRules.dayKey(now, zone))
-                    put("zone_id", zone.id); put("new_word", if (newWord) 1 else 0); put("seq", seq)
-                })
-                db.delete("study_session", "id=0", null)
-                db.setTransactionSuccessful()
-                committed = true
             }
         } finally { db.endTransaction() }
         if (committed) changes.publishCommitted()

@@ -1130,29 +1130,142 @@ class CaptureService : Service() {
     private fun addPanel(view: View) {
         removePanelView()
         val width = minOf(dp(440), (screenWidth - dp(24)).coerceAtLeast(dp(200)))
-        // A long definition scrolls inside a card that never grows into a full-screen surface.
-        val maxHeight = (screenHeight * 3 / 4).coerceAtLeast(dp(240))
+        // A long definition scrolls inside a card that never grows into a full-screen surface. The
+        // cap already excludes the system bars, so the pinned footer is not placed under them.
+        val maxHeight = panelMaxHeight()
         view.measure(View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
             View.MeasureSpec.makeMeasureSpec(maxHeight, View.MeasureSpec.AT_MOST))
         val height = view.measuredHeight.coerceIn(1, maxHeight)
-        // Exclude only the exact centred window this card actually covers. There is deliberately
+        // Exclude only the exact centered window this card actually covers. There is deliberately
         // no fixed outward margin and no accumulated history: a word just above the card, or page
         // pixels left visible around it, must remain page evidence.
-        val left = (screenWidth - width) / 2
-        val top = (screenHeight - height) / 2
-        pageOverlayBoxes = listOf(PixelBox(left, top,
-            (left + width).coerceAtMost(screenWidth), (top + height).coerceAtMost(screenHeight)))
+        pageOverlayBoxes = listOf(panelBox(width, height))
         val params = WindowManager.LayoutParams(width, height, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL, PixelFormat.TRANSLUCENT).apply {
             gravity = Gravity.CENTER
             softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
         }
+        // The owner created by this mount. Back, layout and inset callbacks capture it and the exact
+        // view, so a queued callback from an already-replaced card can neither close the newer card
+        // nor overwrite the newer card's page-exclusion rectangle. Only this card's own Back closes
+        // and returns to the bubble; the service keeps running, and the manual/translation windows
+        // keep their own separate listeners.
+        val owner = panelOwner
         view.isFocusableInTouchMode = true
-        view.setOnKeyListener { _, key, event ->
-            if (key == KeyEvent.KEYCODE_BACK && event.action == KeyEvent.ACTION_UP) { dismissPanel(); showBubble(); true } else false
+        view.setOnKeyListener { v, key, event ->
+            if (key == KeyEvent.KEYCODE_BACK && event.action == KeyEvent.ACTION_UP &&
+                owner == panelOwner && panel === v && !stopped
+            ) {
+                dismissPanel(); showBubble(); true
+            } else false
         }
-        try { windows.addView(view, params); panel = view; view.requestFocus() }
-        catch (e: Exception) { fail("无法打开取词界面：${e.message}") }
+        view.addOnLayoutChangeListener { v, _, _, _, _, _, _, _, _ ->
+            updatePanelOverlayBox(v, owner)
+        }
+        // The IME (inline supplement/correction editors) and a rotation can shrink the usable region
+        // after the card is mounted. Re-cap the same card in a posted pass so the pinned footer is
+        // never clipped; only the body shrinks. The window stays centred (ADJUST_RESIZE already
+        // re-centres it inside the reduced display frame), so no manual y shift is applied twice.
+        view.setOnApplyWindowInsetsListener { v, insets ->
+            val topInset: Int
+            val bottomInset: Int
+            if (Build.VERSION.SDK_INT >= 30) {
+                val bars = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.ime())
+                topInset = bars.top; bottomInset = bars.bottom
+            } else {
+                @Suppress("DEPRECATION") topInset = insets.systemWindowInsetTop
+                @Suppress("DEPRECATION") bottomInset = insets.systemWindowInsetBottom
+            }
+            v.post {
+                fitPanelHeight(v, width, params, topInset, bottomInset)
+                // fitPanelHeight can only republish a pre-layout centred estimate. Read the real
+                // window bounds after the inset pass so the frame mask follows what is covered.
+                updatePanelOverlayBox(v, owner)
+            }
+            insets
+        }
+        try {
+            windows.addView(view, params)
+            panel = view
+            view.requestFocus()
+            view.post { updatePanelOverlayBox(view, owner) }
+        } catch (e: Exception) { fail("无法打开取词界面：${e.message}") }
+    }
+
+    /** Height cap for a floating card, measured against the region between the system bars. */
+    private fun panelMaxHeight(): Int {
+        val body = frameBody()
+        val available = if (body.height > 0) body.height - dp(12) else screenHeight * 3 / 4
+        return available.coerceIn(dp(200), (screenHeight * 3 / 4).coerceAtLeast(dp(200)))
+    }
+
+    /** Screen rectangle actually covered by the centred card window. */
+    private fun panelBox(width: Int, height: Int): PixelBox {
+        val left = (screenWidth - width) / 2
+        val top = (screenHeight - height) / 2
+        return PixelBox(left, top.coerceAtLeast(0),
+            (left + width).coerceAtMost(screenWidth), (top + height).coerceAtMost(screenHeight))
+    }
+
+    /**
+     * Republished page-exclusion rectangle from the mounted card's observed on-screen bounds.
+     *
+     * [addPanel] can only estimate a full-screen-centred window before it is attached, and an
+     * IME/inset or rotation pass can shrink or re-centre the overlay afterwards. This reads the
+     * view's real laid-out size and [View.getLocationOnScreen] instead of re-deriving a centred
+     * rectangle from the old [screenHeight], so the frame mask follows what is actually covered.
+     *
+     * Only the current mount may write: the captured owner and exact view make a late layout/inset
+     * callback from an old card inert, and [stopped] suppresses writes after shutdown. A detached
+     * view, a zero/negative size or an empty clamped rectangle writes nothing (the pre-mount estimate
+     * remains). The rectangle is clamped to the captured display, never enlarged: page-identity
+     * protection and the ENTRY/VERIFY frame paths are unchanged. This is an implementation-level
+     * consistency fix, not a claim that native IME or rotation has been verified on a device.
+     */
+    private fun updatePanelOverlayBox(view: View, owner: Long) {
+        if (stopped || owner != panelOwner) return
+        // [panel] is assigned immediately after addView; allow that tiny pre-assignment window only
+        // for this owner. Once a different (or no) panel is current, an old view is inert.
+        if (panel !== null && panel !== view) return
+        if (!view.isAttachedToWindow) return
+        val width = view.width
+        val height = view.height
+        if (width <= 0 || height <= 0) return
+        val location = IntArray(2)
+        view.getLocationOnScreen(location)
+        val left = location[0].coerceIn(0, screenWidth)
+        val top = location[1].coerceIn(0, screenHeight)
+        val right = (location[0] + width).coerceIn(0, screenWidth)
+        val bottom = (location[1] + height).coerceIn(0, screenHeight)
+        if (right <= left || bottom <= top) return
+        val box = PixelBox(left, top, right, bottom)
+        if (pageOverlayBoxes.size != 1 || pageOverlayBoxes[0] != box) {
+            pageOverlayBoxes = listOf(box)
+        }
+    }
+
+    /**
+     * Shrinks the mounted card to the region actually left by the IME / system bars.
+     *
+     * Only the body loses height: [OverlayCardLayout] measures the header and footer first, so the
+     * "重新划选 | 退出" row stays laid out at every font scale and in landscape. The page-exclusion
+     * rectangle is updated to the window that is really covered, never to a larger one.
+     * Idempotent: a pass that would not change the height does nothing, so insets arriving in a
+     * burst cannot loop through relayout.
+     */
+    private fun fitPanelHeight(view: View, width: Int, params: WindowManager.LayoutParams,
+                               topInset: Int, bottomInset: Int) {
+        if (panel !== view || stopped) return
+        val usable = (screenHeight - topInset - bottomInset).coerceAtLeast(dp(200))
+        val cap = minOf(panelMaxHeight(), usable)
+        if (params.height <= cap) return
+        view.measure(View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
+            View.MeasureSpec.makeMeasureSpec(cap, View.MeasureSpec.AT_MOST))
+        val height = view.measuredHeight.coerceIn(1, cap)
+        if (height >= params.height) return
+        params.height = height
+        pageOverlayBoxes = listOf(panelBox(width, height))
+        runCatching { windows.updateViewLayout(view, params) }
     }
     private fun removePanelView() {
         // Every removal retires the old card owner, including replacement by a newer success card,
@@ -1215,11 +1328,10 @@ class CaptureService : Service() {
         bitmap.recycle() // The only retained pixels are the necessary stroke-area crop.
         val token = gate.next()
         removePanelView()
-        val pending = column().apply { setPadding(dp(24), dp(24), dp(24), dp(24)); background = shape(Paper.surface) }
-        pending.addView(text(RecognitionFeedback.RECOGNIZING, 20f, bold = true))
-        pending.addView(button("重新划选") { beginLiveSelection() }); pending.space(8)
-        pending.addView(button("取消") { dismissPanel(); showBubble() })
-        addPanel(pending)
+        val pending = compactCard("本地识别")
+        pending.headerLine(RecognitionFeedback.RECOGNIZING)
+        pending.body.addView(text("笔迹抬起后在本机识别，不复用旧截图；完成后显示词卡或原因。", 13f, Paper.secondary))
+        mountCompactCard(pending)
         if (!sessionIsActive() || !gate.accepts(token)) {
             pendingPageBaseline = null
             pendingPageBody = null
@@ -1356,21 +1468,26 @@ class CaptureService : Service() {
     private fun showSelectedText(raw: String, words: List<String>, manual: Boolean = false) {
         gate.next()
         perf.snapshot("multi_word")
-        val content = card("选中原文")
-        content.addView(text(raw, 18f)); content.space()
-        content.addView(text("识别到多个候选词，尚未查询或收录。你可以翻译整句，或选择一个词查词；不会批量自动加入生词本。", 16f, Paper.warning)); content.space()
-        content.addView(button("翻译整句（离线英译中）") { openTranslation(raw) }); content.space(8)
-        content.addView(button("编辑原文后翻译") { openTranslation(raw, focusInput = true) }); content.space(8)
+        val card = compactCard("选中原文")
+        card.headerLine("识别到多个候选词 · 尚未查询或收录")
+        val content = card.body
+        content.addView(text(raw, 17f)); content.space(8)
+        content.addView(text("不会批量自动加入生词本：可翻译整句，或选择一个词查词。", 14f, Paper.warning)); content.space(8)
+        // The two sentence exits share one row; the per-word lookups below remain the primary
+        // choice and keep their own full-width buttons. Labels are unchanged; only the padding,
+        // text size and row sharing are compacted.
+        content.actionPair(
+            compactButton("翻译整句（离线英译中）") { openTranslation(raw) },
+            compactButton("编辑原文后翻译") { openTranslation(raw, focusInput = true) })
+        content.space(8)
         words.filter { word ->
             RawKajwebDictionary.normalize(word)
                 ?.let { RecognitionFeedback.hasLatinLetter(it) } == true
         }.distinct().forEach { word ->
-            content.addView(button("查词：$word") { lookup(word, raw, manual = manual) }); content.space(8)
+            content.addView(compactButton("查词：$word") { lookup(word, raw, manual = manual) }); content.space(8)
         }
-        content.addView(button("纠正选中文字") { showTextCorrection(raw) }); content.space(8)
-        content.addView(button("重新划选") { beginLiveSelection() }); content.space(8)
-        content.addView(button("取消") { dismissPanel(); showBubble() })
-        addPanel(scroll(content))
+        content.addView(compactButton("纠正选中文字") { showTextCorrection(raw) })
+        mountCompactCard(card)
     }
 
     /**
@@ -1385,17 +1502,20 @@ class CaptureService : Service() {
         gate.next()
         perf.snapshot("no_english")
         val notice = RecognitionFeedback.notice(RecognitionFailure.NO_ENGLISH_WORD)
-        val content = card("未识别到英文")
-        content.addView(text(notice.message, 16f, Paper.warning)); content.space()
-        content.addView(text("下一步：${notice.nextStep}", 15f, Paper.secondary)); content.space()
-        content.addView(text("选中原文：\n$raw")); content.space()
-        content.addView(button("重新划选") { beginLiveSelection() }); content.space(8)
-        content.addView(button("纠正选中文字") { showTextCorrection(raw) }); content.space(8)
-        content.addView(button("翻译整句（离线英译中）") { openTranslation(raw) }); content.space(8)
-        val manual = button("${RecognitionFeedback.MANUAL_INPUT_LABEL}（本页输入）") {}
-        content.addView(manual); content.space(8)
-        content.addView(button("取消") { dismissPanel(); showBubble() })
-        addPanel(scroll(content))
+        val card = compactCard("未识别到英文")
+        card.headerLine("不是词库缺词 · 本次未查询、未收录")
+        val content = card.body
+        content.addView(text(notice.message, 15f, Paper.warning)); content.space(8)
+        content.addView(text("下一步：${notice.nextStep}", 14f, Paper.secondary)); content.space(8)
+        content.addView(text("选中原文：\n$raw")); content.space(8)
+        // The three secondary exits share two rows, so the fixed footer stays close to the content
+        // instead of being pushed down by three full-width buttons. Labels are unchanged; only the
+        // padding, text size and row sharing are compacted.
+        val manual = compactButton("${RecognitionFeedback.MANUAL_INPUT_LABEL}（本页输入）") {}
+        content.actionPair(manual, compactButton("翻译整句（离线英译中）") { openTranslation(raw) })
+        content.space(8)
+        content.addView(compactButton("纠正选中文字") { showTextCorrection(raw) })
+        mountCompactCard(card)
         val owner = panelOwner
         manual.setOnClickListener { openManualInput(owner, raw) }
     }
@@ -1756,18 +1876,18 @@ class CaptureService : Service() {
         // is being admitted from here, so stop observing the old page.
         endPageGuard()
         gate.next()
-        val content = card("纠正选中文字")
-        content.addView(text("保留大小写、标点与换行；确认后仍需选择一个词查词；也可在多词原文卡中另行选择“翻译整句”，只做本机离线译句、不查词也不收录。"))
+        val card = compactCard("纠正选中文字")
+        card.headerLine("保留大小写、标点与换行")
+        val content = card.body
+        content.addView(text("确认后仍需选择一个词查词；也可在多词原文卡中另行选择「翻译整句」，只做本机离线译句、不查词也不收录。", 14f, Paper.secondary))
         val input = inputField("选中的原文").apply { setText(raw) }
         content.addView(input)
-        content.addView(button("确认文字", true) {
+        content.addView(compactButton("确认文字", true) {
             val corrected = input.text.toString()
             if (corrected.isBlank()) toast("选中文字不能为空；不会查询或入库")
             else showSelectedText(corrected, corrected.split(Regex("\\s+")), manual = true)
-        }); content.space(8)
-        content.addView(button("重新划选") { beginLiveSelection() }); content.space(8)
-        content.addView(button("取消") { dismissPanel(); showBubble() })
-        addPanel(scroll(content))
+        })
+        mountCompactCard(card)
     }
 
     private fun lookup(form: String, raw: String, replaces: String? = null,
@@ -1835,29 +1955,34 @@ class CaptureService : Service() {
         endPageGuard()
         gate.next()
         perf.snapshot("message")
-        val content = card("取词提示")
-        content.addView(text(message, 16f, Paper.warning)); content.space()
+        val card = compactCard("取词提示")
+        card.headerLine("本次未查询、未收录")
+        val content = card.body
+        content.addView(text(message, 15f, Paper.warning)); content.space(8)
         if (nextStep != null) {
-            content.addView(text("下一步：$nextStep", 15f, Paper.secondary)); content.space()
+            content.addView(text("下一步：$nextStep", 14f, Paper.secondary)); content.space(8)
         }
+        // All exits keep their exact behavior and visible labels ("重试取词（重新划词）" is also the
+        // wording the guide and the notice text refer to). The two secondary exits share one row, so
+        // the failure card needs two rows instead of three full-width ones.
+        val retry = compactButton("重试取词（重新划词）") {}
+        val manual = compactButton("${RecognitionFeedback.MANUAL_INPUT_LABEL}（本页输入）") {}
         if (raw.isNotBlank()) {
-            content.addView(text("选中原文：\n$raw")); content.space()
-            content.addView(button("手动纠错") { showCorrection(raw, replaces) }); content.space(8)
+            content.addView(text("选中原文：\n$raw")); content.space(8)
+            content.addView(retry); content.space(8)
+            content.actionPair(manual, compactButton("手动纠错") { showCorrection(raw, replaces) })
+        } else {
+            content.addView(retry); content.space(8)
+            content.addView(manual)
         }
-        // Explicit restart entry. It is wired to the current card's owner after the panel is
-        // mounted, so a queued click from an already-replaced card cannot dismiss or replace a
-        // later card. "返回做题" remains available unchanged.
-        val retry = button("重试取词（重新划词）") {}
-        content.addView(retry); content.space(8)
-        // Deliberate, user-tapped manual lookup on the current page. It may prefill this attempt's
-        // raw text but never submits a query by itself, and it does not open MainActivity.
-        val manual = button("${RecognitionFeedback.MANUAL_INPUT_LABEL}（本页输入）") {}
-        content.addView(manual); content.space(8)
-        content.addView(button("返回做题") { dismissPanel(); showBubble() })
-        addPanel(scroll(content))
+        mountCompactCard(card)
         val owner = panelOwner
         retry.setOnClickListener { retryLiveSelection(owner) }
         manual.setOnClickListener { openManualInput(owner, raw) }
+        // The fixed footer's "重新划选" is the same explicit restart for this card (the message text
+        // refers to "重试取词"). It keeps the guarded entry so a stopped session or a dead projection
+        // reports why instead of arming a frame that can never arrive.
+        card.restart.setOnClickListener { retryLiveSelection(owner) }
     }
 
     /**
@@ -1909,11 +2034,20 @@ class CaptureService : Service() {
             }
         }
         val query = button("查询", true) { submitManualInput(session, input, status) }
-        // Wired after the window exists below, so close/Back can prove they still belong to this
-        // exact box before touching any service state.
-        val close = button("关闭") {}
-        val content = card("手动查词")
-        content.addView(text("仅查本机离线词库，不打开主界面；打开或编辑不会自动查询。", 13f, Paper.secondary))
+        // The box is a specialized editor window, not a word/result card: it keeps its own session
+        // and close admission, and its footer is "关闭" only (a "重新划选" here would retire the
+        // editor the user is typing in). "关闭" returns to the bubble without stopping capture.
+        val card = OverlayCardLayout(this).apply {
+            setPadding(dp(18), dp(18), dp(18), dp(14)); background = shape(Paper.surface, border = true)
+            setTitle("手动查词")
+        }
+        card.headerLine("仅查本机离线词库 · 不会自动查询")
+        card.restart.visibility = View.GONE
+        card.exit.text = "关闭"
+        card.exit.textSize = 15f
+        card.exit.contentDescription = "关闭输入框，返回悬浮条（不停止查词）"
+        val content = card.body
+        content.addView(text("输入一个英文词头后点「查询」或键盘搜索键；打开或编辑不会自动查询。", 13f, Paper.secondary))
         val entry = row()
         // Field and query action share the top row, so both stay above the keyboard.
         entry.addView(input, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
@@ -1921,12 +2055,11 @@ class CaptureService : Service() {
             ViewGroup.LayoutParams.WRAP_CONTENT).apply { marginStart = dp(8) })
         content.addView(entry)
         content.addView(status)
-        content.addView(close)
-        val view = scroll(content)
+        val view = card
         // Close/Back capture the box they were created for. A callback delivered after this box
         // was replaced by a newer one (or already closed) is a complete no-op: it cannot close the
         // newer box or resurrect the bubble. The current box's own close/Back still works.
-        close.setOnClickListener { if (closeManualInput(session, view)) showBubble() }
+        card.exit.setOnClickListener { if (closeManualInput(session, view)) showBubble() }
         val width = minOf(dp(440), (screenWidth - dp(24)).coerceAtLeast(dp(200)))
         val maxHeight = (screenHeight / 2).coerceAtLeast(dp(200))
         view.measure(View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
@@ -2000,26 +2133,35 @@ class CaptureService : Service() {
     /** Bounded visible feedback between a manual submit and the dictionary result card. */
     private fun showManualPending(form: String) {
         if (stopped || !sessionIsActive()) return
-        val content = card("查询中")
-        content.addView(text("正在查询本机离线词库：「$form」…", 16f, Paper.secondary))
+        val card = compactCard("查询中")
+        card.headerLine("本机离线词库")
+        card.body.addView(text("正在查询：「$form」…", 15f, Paper.secondary))
         // Closing advances the gate and makes the in-flight worker result inert. An already
         // committed record is not described as revoked.
-        val cancel = button("取消") {}
-        content.addView(cancel)
-        val view = scroll(content)
-        addPanel(view)
-        // Bind cancellation to the panel actually mounted for this pending query. Once a newer
-        // input box or result card replaces it, the retired callback is a complete no-op: it cannot
-        // close the newer panel, show the bubble or advance the new gate (which would drop a valid
-        // save). The current pending card's own cancel stays effective and still rejects its late
-        // lookup. Deliberately not bound to the lookup gate token: lookup.next() advances it on
+        val cancel = compactButton("取消本次查询") {}
+        card.body.addView(cancel)
+        mountCompactCard(card)
+        val view = card
+        // Bind every action of the pending card to the panel actually mounted for this query. Once
+        // a newer input box or result card replaces it, the retired callback is a complete no-op: it
+        // cannot close the newer panel, show the bubble or advance the new gate (which would drop a
+        // valid save). The current pending card's own cancel stays effective and still rejects its
+        // late lookup. Deliberately not bound to the lookup gate token: lookup.next() advances it on
         // every new query, which would make the current cancel inert.
         val owner = panelOwner
-        cancel.setOnClickListener {
+        val closeIfCurrent = View.OnClickListener {
+            if (owner != panelOwner || panel !== view || stopped || !sessionIsActive()) {
+                return@OnClickListener
+            }
+            dismissPanel(); showBubble()
+        }
+        cancel.setOnClickListener(closeIfCurrent)
+        card.exit.setOnClickListener(closeIfCurrent)
+        card.restart.setOnClickListener {
             if (owner != panelOwner || panel !== view || stopped || !sessionIsActive()) {
                 return@setOnClickListener
             }
-            dismissPanel(); showBubble()
+            beginLiveSelection()
         }
     }
 
@@ -2069,18 +2211,22 @@ class CaptureService : Service() {
         endPageGuard()
         gate.next()
         perf.snapshot("dictionary_missing")
-        val content = card("未收录")
-        content.addView(text("「$form」未命中本地词库（不是识别失败），尚未查询或收录。可以只在本机新增用户词条；保存不会产生查询记录或生词。", 16f, Paper.warning))
-        if (raw.isNotBlank()) { content.addView(text("选中原文：\n$raw")); content.space() }
-        val meaningView = text("", 18f)
-        val supplementStatus = text("", 14f, Paper.secondary)
+        val card = compactCard("未收录")
+        // The headword and the "not a recognition failure" distinction stay in the fixed header so
+        // they remain visible while a long raw text or an open editor scrolls in the body.
+        card.headerLine("「$form」未命中本地词库 · 尚未查询或收录").setTextColor(Paper.warning)
+        val content = card.body
+        content.addView(text("不是识别失败。可以只在本机新增用户词条；保存不会产生查询记录或生词。", 13f, Paper.secondary)); content.space(8)
+        if (raw.isNotBlank()) { content.addView(text("选中原文：\n$raw")); content.space(8) }
+        val meaningView = text("", 17f)
+        val supplementStatus = text("", 13f, Paper.secondary)
         val editorHost = column()
         lateinit var guard: MissingGuard
-        val collect = button("查询并收录", true) {
-            if (!sessionIsActive()) return@button
+        val collect = compactButton("查询并收录", true) {
+            if (!sessionIsActive()) return@compactButton
             // A card whose world was replaced must not start a new explicit query that could be
             // perceived as the old query's write path.
-            if (app.repository.deletions.isStale(form, credential)) { invalidateMissing(guard); return@button }
+            if (app.repository.deletions.isStale(form, credential)) { invalidateMissing(guard); return@compactButton }
             // Explicit user action in the card's still-current world: the only path that may create a
             // real query and personal vocabulary. It keeps the original query credential instead of
             // recapturing, so a later restore cannot be laundered into a fresh write identity.
@@ -2090,15 +2236,15 @@ class CaptureService : Service() {
         var editorRoot: LinearLayout? = null
         val canAdd = PersonalDictionary.normalizeNewKey(form) == form
         if (!canAdd) {
-            content.addView(text("该结果不是单个规范英文词头（可能是短语或多词），不能作为新词头；请修改为一个英文单词。", 15f, Paper.warning, true))
+            content.addView(text("该结果不是单个规范英文词头（可能是短语或多词），不能作为新词头；请修改为一个英文单词。", 14f, Paper.warning, true))
         }
         lateinit var edit: Button
         if (canAdd) {
-            edit = button("新增这个词", true) {
-                if (!sessionIsActive()) return@button
+            edit = compactButton("新增这个词", true) {
+                if (!sessionIsActive()) return@compactButton
                 // Bind the editor to the query-start credential; opening it after a restore must not
                 // capture the new world and write the old text there.
-                if (app.repository.deletions.isStale(form, credential)) { invalidateMissing(guard); return@button }
+                if (app.repository.deletions.isStale(form, credential)) { invalidateMissing(guard); return@compactButton }
                 editorRoot?.let { editorHost.removeView(it) }
                 editorRoot = addSupplementEditor(editorHost, form, form, null, currentUser, credential,
                     newHeadword = true) { saved, merged ->
@@ -2109,18 +2255,17 @@ class CaptureService : Service() {
                     collect.visibility = View.VISIBLE
                     edit.text = "重新编辑词义"
                 }
+                card.scrollBodyToEnd()
             }
             content.addView(edit); content.space(4)
         }
         content.addView(collect); content.space(4)
         content.addView(meaningView); content.addView(supplementStatus)
         content.addView(editorHost)
-        content.addView(button("重新划选") { beginLiveSelection() }); content.space(8)
-        content.addView(button("返回做题") { dismissPanel(); showBubble() })
         guard = MissingGuard(form, credential, if (canAdd) edit else null, collect, supplementStatus) {
             closeSupplementEditors()
         }
-        addPanel(scroll(content))
+        mountCompactCard(card)
         missingGuard = guard
     }
 
@@ -2228,14 +2373,14 @@ class CaptureService : Service() {
         // A correction is an explicit user action, not a late automatic result from the old page.
         endPageGuard()
         gate.next()
-        val content = card("确认正确词形")
-        content.addView(text("只查询本地原始未逐条核对词库；确认成功后原事件撤销，不双计。"))
+        val card = compactCard("确认正确词形")
+        card.headerLine("原事件确认成功后撤销，不双计")
+        val content = card.body
+        content.addView(text("只查询本地原始未逐条核对词库。", 14f, Paper.secondary)); content.space(4)
         val input = EditText(this).apply { setText(raw); hint = "一个英文单词"; setSingleLine(true) }
         content.addView(input)
-        content.addView(button("确认查询", true) { lookup(input.text.toString(), originalRaw, replaces, manual = true) }); content.space(8)
-        content.addView(button("重新划选") { beginLiveSelection() }); content.space(8)
-        content.addView(button("取消") { dismissPanel(); showBubble() })
-        addPanel(scroll(content))
+        content.addView(compactButton("确认查询", true) { lookup(input.text.toString(), originalRaw, replaces, manual = true) })
+        mountCompactCard(card)
     }
 
     private fun showDefinition(form: String, raw: String, entry: DictionaryEntry,
@@ -2244,30 +2389,46 @@ class CaptureService : Service() {
         val token = gate.next()
         val page = pageGuard
         val event = QueryEvent(UUID.randomUUID().toString(), entry.key, raw, form, System.currentTimeMillis())
-        val content = card(entry.headword)
-        val meta = text("原词形：$form · ${entry.partOfSpeech}")
-        val meaningView = text(entry.meaning, 18f)
-        val provenanceView = text(PersonalDictionary.provenance(entry), 14f, Paper.warning)
-        content.addView(meta)
-        content.addView(text("选中原文：\n$raw"))
-        content.addView(meaningView); content.space()
-        content.addView(text(PersonalDictionary.label(entry), 13f, Paper.secondary))
-        content.addView(provenanceView)
-        val status = text("保存中…", 16f, Paper.secondary)
-        content.addView(status)
-        val undo = button("撤销本次收录") {}
-        val correct = button("纠错") {}
-        val retry = button("重试保存") {}
+        val card = compactCard(entry.headword)
+        // The save/undo status is the core feedback of this card, so it stays in the fixed header
+        // (directly under the headword) and cannot be scrolled out of sight by a long meaning or an
+        // open inline editor. Its text and color are still driven by the same invalidate/save
+        // branches as before. It is added before the secondary form/POS line so that, in the rare
+        // case a very large font scale forces the header to be capped, the least important line is
+        // the one that gives way.
+        val status = text("保存中…", 14f, Paper.secondary)
+        card.header.addView(status)
+        val meta = card.headerLine("原词形：$form · ${entry.partOfSpeech}")
+        val content = card.body
+        val meaningView = text(entry.meaning, 17f)
+        val provenanceView = text(PersonalDictionary.provenance(entry), 13f, Paper.warning)
+        // The meaning keeps the most space in the body; the raw selection and provenance are
+        // still present but secondary, and the whole body scrolls instead of truncating.
+        content.addView(meaningView); content.space(4)
+        content.addView(text(PersonalDictionary.label(entry), 12f, Paper.secondary))
+        content.addView(provenanceView); content.space(8)
+        content.addView(text("选中原文：\n$raw", 13f, Paper.secondary)); content.space(8)
+        val undo = compactButton("撤销本次收录") {}
+        val correct = compactButton("纠错") {}
+        val retry = compactButton("重试保存") {}
         undo.isEnabled = false; correct.isEnabled = false; retry.visibility = View.GONE
-        content.addView(undo); content.space(8); content.addView(correct); content.space(8); content.addView(retry); content.space(8)
+        // "撤销本次收录 / 纠错 / 重试保存" keep their exact behavior and enablement; they share the
+        // scrolling body so the fixed footer row stays for navigation.
+        val actions = row()
+        actions.addView(undo, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            .apply { marginEnd = dp(8) })
+        actions.addView(correct, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            .apply { marginEnd = dp(8) })
+        actions.addView(retry, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        content.addView(actions); content.space(8)
         var currentUser = initialUser
         val supplementStatus = text("", 13f, Paper.secondary)
         val editorHost = column()
         var editorRoot: LinearLayout? = null
-        content.addView(button("补充/编辑词义") {
+        content.addView(compactButton("补充/编辑词义") {
             val active = definitionGuard
-            if (active != null && definitionCardStale(active)) { invalidateDefinition(active); return@button }
-            if (!sessionIsActive()) return@button
+            if (active != null && definitionCardStale(active)) { invalidateDefinition(active); return@compactButton }
+            if (!sessionIsActive()) return@compactButton
             editorRoot?.let { editorHost.removeView(it) }
             val original = if (entry.source == PersonalDictionary.SOURCE) null
             else PersonalDictionary.storedEntry(entry)
@@ -2280,11 +2441,10 @@ class CaptureService : Service() {
                 supplementStatus.text = "用户补充已保存到本机；本次查询记录不受影响"
                 supplementStatus.setTextColor(Paper.green)
             }
+            card.scrollBodyToEnd()
         }); content.space(4)
-        content.addView(supplementStatus); content.addView(editorHost); content.space(4)
-        content.addView(button("重新划选") { beginLiveSelection() }); content.space(8)
-        content.addView(button("返回做题", true) { dismissPanel(); showBubble() })
-        addPanel(scroll(content))
+        content.addView(supplementStatus); content.addView(editorHost)
+        mountCompactCard(card)
         val guard = DefinitionGuard(entry.key, credential, page, manual, status, undo, correct, retry)
         definitionGuard = guard
         correct.setOnClickListener {
@@ -2376,11 +2536,73 @@ class CaptureService : Service() {
         }
         save()
     }
-    private fun card(title: String) = column().apply {
-        setPadding(dp(24), dp(24), dp(24), dp(24)); background = shape(Paper.surface, border = true)
-        addView(text(title, 26f, bold = true))
+    /**
+     * A regular floating word/prompt card in the compact form: one short fixed header (the
+     * headword or the card's purpose), an internally scrolling body, and one always-visible
+     * footer row "重新划选 | 退出".
+     *
+     * Only the body scrolls, so long meanings, raw OCR text and the inline editors never push the
+     * navigation row off-screen on a small screen, at a large font scale or with the keyboard up.
+     * The meaning is never hard-truncated to fake a one-screen card.
+     *
+     * Layout only: it owns no capture/OCR/dictionary/page/save admission. [restart] defaults to the
+     * existing explicit "start a new stroke" entry, [exit] to the existing card-close behavior
+     * (remove this card, keep the capture service running and return to the bubble).
+     */
+    private fun compactCard(title: String): OverlayCardLayout {
+        val card = OverlayCardLayout(this)
+        card.setPadding(dp(18), dp(14), dp(18), dp(12))
+        card.background = shape(Paper.surface, border = true)
+        card.setTitle(title)
+        card.body.setPadding(0, dp(4), 0, dp(4))
+        card.footer.setPadding(0, dp(10), 0, 0)
+        return card
     }
-    private fun scroll(content: LinearLayout) = ScrollView(this).apply { addView(content); isFillViewport = true }
+
+    /** A short, fixed secondary line under the card title (for example the queried word form). */
+    private fun OverlayCardLayout.headerLine(value: String): TextView =
+        text(value, 13f, Paper.secondary).also { header.addView(it) }
+
+    /**
+     * Mounts [card] and binds its fixed footer to the panel identity created by this mount.
+     *
+     * "退出" only closes this exact card and returns to the floating bar; it never stops the
+     * capture service and never touches a newer card. A queued click from an already-replaced or
+     * dismissed card sees a different owner and does nothing. "重新划选" uses the existing explicit
+     * stroke entry, which arms a fresh deletion credential and frame — it reuses nothing.
+     */
+    private fun mountCompactCard(card: OverlayCardLayout) {
+        addPanel(card)
+        val owner = panelOwner
+        card.exit.setOnClickListener {
+            if (owner != panelOwner || panel !== card) return@setOnClickListener
+            dismissPanel()
+            showBubble()
+        }
+        card.restart.setOnClickListener {
+            if (owner != panelOwner || panel !== card) return@setOnClickListener
+            beginLiveSelection()
+        }
+    }
+
+    /** A body action: same hit target as before (>=48dp) with less padding and a smaller label. */
+    private fun compactButton(label: String, primary: Boolean = false,
+                              action: () -> Unit): Button =
+        button(label, primary, action).apply {
+            textSize = 15f
+            minHeight = dp(48); minimumHeight = dp(48)
+            setPadding(dp(10), dp(6), dp(10), dp(6))
+        }
+
+    /** Two secondary actions share one row so the body keeps its height for the real content. */
+    private fun LinearLayout.actionPair(first: Button, second: Button) {
+        val pair = row()
+        pair.addView(first, LinearLayout.LayoutParams(0,
+            ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dp(8) })
+        pair.addView(second, LinearLayout.LayoutParams(0,
+            ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        addView(pair)
+    }
     private fun toast(message: String) { Toast.makeText(this, message, Toast.LENGTH_LONG).show() }
     private fun sessionIsActive(): Boolean = !stopped && CaptureStatus.generation == sessionGeneration &&
         CaptureStatus.state.phase == CapturePhase.ACTIVE

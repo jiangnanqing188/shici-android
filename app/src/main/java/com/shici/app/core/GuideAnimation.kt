@@ -18,7 +18,9 @@ object GuideAnimation {
     enum class Demo(val title: String, val shortLabel: String, val action: GuideAction) {
         CAPTURE("划词查词演示", "划词", GuideAction.OPEN_HOME),
         VOCABULARY("生词本演示", "生词本", GuideAction.OPEN_VOCABULARY),
-        STUDY("背词演示", "背词", GuideAction.OPEN_STUDY),
+        // The page route stays the stable GuideRoutes.STUDY id; only the guide's display name
+        // follows the four-choice review wording.
+        STUDY("复习演示", "复习", GuideAction.OPEN_STUDY),
         LOOKUP_SUPPLEMENT("查词与补词演示", "查词/补词", GuideAction.OPEN_LOOKUP)
     }
 
@@ -34,11 +36,12 @@ object GuideAnimation {
         SCOPE,
         CONFIRM_ONE,
         CONFIRM_TWO,
-        STUDY_CARD,
-        KNOW,
-        FUZZY,
-        FORGET,
-        MIX_POOL,
+        // Review is shown as it is now used: pick one of four Chinese meanings, see correct/wrong
+        // feedback, then move to the next card.
+        STUDY_CHOICE,
+        STUDY_CORRECT,
+        STUDY_WRONG,
+        STUDY_NEXT,
         LOOKUP_INPUT,
         LOOKUP_SUCCESS,
         SUPPLEMENT_EDIT,
@@ -99,15 +102,18 @@ object GuideAnimation {
         Kind.SCOPE -> FingerTrack(0.34f, 0.52f, 0.34f, 0.50f, 0.05f, 0.60f)
         Kind.CONFIRM_ONE -> FingerTrack(0.64f, 0.74f, 0.64f, 0.73f, 0.05f, 0.60f)
         Kind.CONFIRM_TWO -> FingerTrack(0.64f, 0.74f, 0.64f, 0.73f, 0.05f, 0.60f)
-        Kind.KNOW -> FingerTrack(0.24f, 0.79f, 0.24f, 0.78f, 0.05f, 0.60f)
-        Kind.FUZZY -> FingerTrack(0.50f, 0.79f, 0.50f, 0.78f, 0.05f, 0.60f)
-        Kind.FORGET -> FingerTrack(0.76f, 0.79f, 0.76f, 0.78f, 0.05f, 0.60f)
+        // The review demo taps the right-hand side of the first Chinese option (the correct one);
+        // hairline coordinates keep the dot clear of the option's own label. On the last step the
+        // finger presses "下一词" while the answered card is still on screen, then leaves before the
+        // demonstration switches to the fresh card, so no finger is left drawn over a result.
+        Kind.STUDY_CHOICE -> FingerTrack(0.42f, 0.61f, 0.42f, 0.60f, 0.05f, 0.60f)
+        Kind.STUDY_NEXT -> FingerTrack(0.66f, 0.905f, 0.66f, 0.895f, 0.30f, 0.80f)
         Kind.LOOKUP_INPUT -> FingerTrack(0.80f, 0.34f, 0.80f, 0.33f, 0.05f, 0.60f)
         Kind.SUPPLEMENT_EDIT -> FingerTrack(0.52f, 0.55f, 0.52f, 0.54f, 0.05f, 0.60f)
         Kind.SUPPLEMENT_SAVE -> FingerTrack(0.30f, 0.82f, 0.30f, 0.81f, 0.05f, 0.60f)
         Kind.RESULT,
-        Kind.STUDY_CARD,
-        Kind.MIX_POOL,
+        Kind.STUDY_CORRECT,
+        Kind.STUDY_WRONG,
         Kind.LOOKUP_SUCCESS,
         Kind.CONTRAST -> null
     }
@@ -135,12 +141,13 @@ object GuideAnimation {
         Kind.SCOPE,
         Kind.CONFIRM_ONE,
         Kind.CONFIRM_TWO -> progress >= 0.08f
-        Kind.KNOW,
-        Kind.FUZZY,
-        Kind.FORGET -> progress >= 0.55f
-        Kind.MIX_POOL,
-        Kind.STUDY_CARD -> progress >= 0.35f
+        // The chosen option turns on only after the tap; the feedback block follows immediately.
+        Kind.STUDY_CHOICE -> progress >= 0.55f
+        Kind.STUDY_CORRECT,
+        Kind.STUDY_WRONG -> progress >= 0.35f
         Kind.SUPPLEMENT_SAVE -> progress >= 0.60f
+        // STUDY_NEXT has no "result" phase: it opens on the already answered card and the drawing
+        // switches to the next card from its own progress threshold.
         else -> false
     }
 
@@ -153,18 +160,17 @@ object GuideAnimation {
         Kind.SCOPE,
         Kind.CONFIRM_ONE,
         Kind.CONFIRM_TWO,
-        Kind.KNOW,
-        Kind.FUZZY,
-        Kind.FORGET,
         Kind.LOOKUP_INPUT,
         Kind.SUPPLEMENT_EDIT,
         Kind.SUPPLEMENT_SAVE -> smooth(progress, 0.15f, 0.60f)
         Kind.RESULT,
         Kind.LOOKUP_SUCCESS,
-        Kind.MIX_POOL,
+        Kind.STUDY_CORRECT,
+        Kind.STUDY_WRONG,
+        Kind.STUDY_NEXT,
         Kind.CONTRAST -> smooth(progress, 0.05f, 0.45f)
-        Kind.LIFT,
-        Kind.STUDY_CARD -> 1f
+        Kind.STUDY_CHOICE -> smooth(progress, 0.05f, 0.50f)
+        Kind.LIFT -> 1f
     }
 
     /**
@@ -191,9 +197,8 @@ object GuideAnimation {
             Kind.SCOPE,
             Kind.CONFIRM_ONE,
             Kind.CONFIRM_TWO,
-            Kind.KNOW,
-            Kind.FUZZY,
-            Kind.FORGET,
+            Kind.STUDY_CHOICE,
+            Kind.STUDY_NEXT,
             Kind.LOOKUP_INPUT,
             Kind.SUPPLEMENT_EDIT,
             Kind.SUPPLEMENT_SAVE -> local >= 0.25f && local <= 0.80f
@@ -216,12 +221,16 @@ object GuideAnimation {
      * these in order; the last one is always the completed stage.
      */
     fun keyPhaseCount(kind: Kind): Int = when (kind) {
+        // The stroke needs its start, mid-drag and lift frames to read as one continuous line.
         Kind.DRAG -> 5
-        Kind.SCOPE,
-        Kind.CONFIRM_ONE,
-        Kind.CONFIRM_TWO,
-        Kind.TAP_STAR,
-        Kind.ENTRY -> 3
+        // Two key frames: the untouched card, then the tap landed / outcome marked.
+        Kind.STUDY_CHOICE,
+        Kind.STUDY_CORRECT -> 2
+        // Wrong answer has three: untouched, wrong pick marked, correct option also lit.
+        Kind.STUDY_WRONG -> 3
+        // The last review step needs its own three: the answered card, the tap on "下一词", the new card.
+        Kind.STUDY_NEXT -> 3
+        // Every other step is a simple before/after with one intermediate reveal.
         else -> 3
     }
 
@@ -305,32 +314,27 @@ object GuideAnimation {
         ),
         DemoSpec(
             demo = Demo.STUDY,
-            summary = "到期复习优先；个人词与原书词共用队列，反馈只有认识、模糊、忘记。",
+            summary = "一张卡看词，选一个中文释义，立即看到对错，再点下一词。",
             steps = listOf(
                 Step(
-                    "study_queue", Demo.STUDY, Kind.STUDY_CARD,
-                    "① 到期复习优先，新词从个人词和原书两池混合抽取。",
-                    "第一步，演示背词卡；到期复习优先，新词来自个人词和原书两池。", 1500
+                    "study_choice", Demo.STUDY, Kind.STUDY_CHOICE,
+                    "① 看单词，从四个中文释义里选一个。",
+                    "第一步，演示看单词，从四个中文释义里点选一个。", 1600
                 ),
                 Step(
-                    "study_know", Demo.STUDY, Kind.KNOW,
-                    "② 点「认识」：按 1/3/7/14/30 天递增。",
-                    "第二步，演示点认识，下次复习按一到三十天递增。", 1300
+                    "study_correct", Demo.STUDY, Kind.STUDY_CORRECT,
+                    "② 选中后立即显示对错反馈。",
+                    "第二步，演示选中后立即显示答对反馈。", 1400
                 ),
                 Step(
-                    "study_fuzzy", Demo.STUDY, Kind.FUZZY,
-                    "③ 点「模糊」：1 天后再来。",
-                    "第三步，演示点模糊，一天后再复习。", 1200
+                    "study_wrong", Demo.STUDY, Kind.STUDY_WRONG,
+                    "③ 选错会标出你选的项和正确答案。",
+                    "第三步，演示选错时标出所选错误项，并标出正确答案。", 1600
                 ),
                 Step(
-                    "study_forget", Demo.STUDY, Kind.FORGET,
-                    "④ 点「忘记」：10 分钟后重新学。",
-                    "第四步，演示点忘记，十分钟后重新学。", 1200
-                ),
-                Step(
-                    "study_mix", Demo.STUDY, Kind.MIX_POOL,
-                    "⑤ 两池合计默认 20，约 1:1；没查过的原书词也能背。",
-                    "第五步，演示个人词与原书词合计默认二十个；没查过的原书词也能背。", 1500
+                    "study_next", Demo.STUDY, Kind.STUDY_NEXT,
+                    "④ 点「下一词」继续复习。",
+                    "第四步，演示点下一词，继续下一张复习卡。", 1400
                 )
             )
         ),

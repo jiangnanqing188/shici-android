@@ -250,7 +250,7 @@ class TranslationScreen(
             background = context.shape(Paper.surface, border = true)
         }
         consentCard.addView(context.text("需要先下载翻译模型", 16f, bold = true))
-        consentCard.addView(context.text("可选组件，不影响查词与背词学习。", 14f, Paper.secondary))
+        consentCard.addView(context.text("可选组件，不影响查词与复习。", 14f, Paper.secondary))
         consentCard.addView(
             context.text("仅 Wi-Fi 下载，模型约 30 MB（估计值，实际以系统下载为准）。", 14f, Paper.secondary)
         )
@@ -338,7 +338,7 @@ class TranslationScreen(
         content.addView(context.helpDisclosure("模型与隐私说明") {
             addView(
                 context.text(
-                    "可选组件，不影响查词、补词、生词本、PDF 与背词学习。初装不下载任何模型。",
+                    "可选组件，不影响查词、补词、生词本、PDF 与复习。初装不下载任何模型。",
                     14f,
                     Paper.secondary
                 )

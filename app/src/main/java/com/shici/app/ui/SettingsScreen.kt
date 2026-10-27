@@ -170,7 +170,7 @@ class SettingsScreen(
                 addView(
                     context.text(
                         "导出会把本机学习数据（全部词条与事件，含已撤销历史、笔记、掌握状态、" +
-                            "统一背词进度与个人补充词库）写成一个 .shicibackup 文件；" +
+                            "统一复习进度与个人补充词库）写成一个 .shicibackup 文件；" +
                             "只通过系统文档选择器创建或读取，不联网、不上传。",
                         15f,
                         Paper.secondary
@@ -243,7 +243,7 @@ class SettingsScreen(
                 addView(context.text("离线 AI 翻译组件与网络", 16f, Paper.ink, true))
                 addView(
                     context.text(
-                        "“离线 AI 翻译”是可选组件，不是查词、补词、生词本、PDF 或背词的前置条件。" +
+                        "“离线 AI 翻译”是可选组件，不是查词、补词、生词本、PDF 或复习的前置条件。" +
                             "初装不下载任何模型；未下载时该页只显示组件说明与“下载并启用（仅 Wi-Fi）”" +
                             "入口，原文只读且草稿/选择位置保留，不开放编辑、翻译或复制。只有你明确" +
                             "确认后才由 Google ML Kit 下载英中离线模型（约 30 MB 只是估计，实际以" +

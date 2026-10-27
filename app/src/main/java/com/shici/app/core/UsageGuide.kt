@@ -27,7 +27,9 @@ enum class GuideAction(val route: String, val label: String) {
     OPEN_LOOKUP(GuideRoutes.LOOKUP, "去查词"),
     OPEN_PERSONAL_ENTRY(GuideRoutes.PERSONAL_ENTRY, "去添加/补词"),
     OPEN_VOCABULARY(GuideRoutes.VOCABULARY, "去生词本"),
-    OPEN_STUDY(GuideRoutes.STUDY, "去背词"),
+    // The route id stays GuideRoutes.STUDY; only the guide's display label follows the
+    // four-choice review wording.
+    OPEN_STUDY(GuideRoutes.STUDY, "去复习"),
     OPEN_SETTINGS(GuideRoutes.SETTINGS, "去设置"),
     OPEN_TRANSLATION(GuideRoutes.TRANSLATION, "去离线翻译")
 }
@@ -61,8 +63,11 @@ object UsageGuide {
 
     const val TITLE = "使用引导"
     const val INTRO =
-        "下面每次只演示一个真实操作：看手指或笔尖怎么移动、什么时候抬笔、结果卡何时出现。" +
-            "每步配一句提示；任何一步都可以跳过，这份引导可以随时重新打开。"
+        "一次只看一个场景：看手指或笔尖怎么动、结果什么时候出现。每步一句提示，可随时跳过或重看。"
+
+    // Compact scene picker. The current scene is the only thing expanded by default; the other
+    // scenes stay behind one small entry so the demonstration keeps the page's focus.
+    const val SCENE_PICKER_LABEL = "切换场景"
 
     // Demo controls. "跳过" and "完成" are the only actions that dismiss the first-run prompt;
     // opening this page, switching scenes or replaying a step never writes guide_seen_v1.
@@ -74,7 +79,6 @@ object UsageGuide {
     const val REPLAY_LABEL = "重播"
     const val SKIP_LABEL = "跳过"
     const val DONE_LABEL = "完成"
-    const val USE_LABEL_PREFIX = "去使用："
     const val LONG_HELP_TITLE = "完整说明与边界"
     const val LONG_HELP_DESCRIPTION = "逐页文字说明、权限边界和危险操作细节；默认收起，需要时再展开。"
     const val NO_PERMISSION_FALLBACK =
@@ -85,19 +89,20 @@ object UsageGuide {
 
     const val FIRST_RUN_TITLE = "第一次使用拾词？"
     const val FIRST_RUN_MESSAGE =
-        "建议先看首页如何开启悬浮查词，再看划词与手动查词、补词和生词本的区别、背词、PDF 与备份、" +
+        "建议先看首页如何开启悬浮查词，再看划词与手动查词、补词和生词本的区别、复习、PDF 与备份、" +
             "可选离线翻译。非阻塞，可随时跳过；以后还能重新打开。"
     const val FIRST_RUN_SKIP_LABEL = "跳过引导"
     const val FIRST_RUN_DONE_LABEL = "看完了，不再自动提示"
 
+    // One short sentence on the HOME card; the full steps stay in the guide page, which the card's
+    // own "查看使用引导" action opens.
     const val HOME_CARD_MESSAGE =
-        "第一次用？几步弄清：首页开启悬浮查词 → 点悬浮「词」划一笔、抬笔取词 → " +
-            "识别不到就换页面重试或手动查词。"
+        "先从首页开启悬浮查词，再划词或手动查词；随时可看完整引导。"
     const val HOME_CARD_OPEN_LABEL = "查看使用引导"
     const val HOME_CARD_DISMISS_LABEL = "跳过，不再提示"
     const val SETTINGS_ENTRY_TITLE = "使用引导"
     const val SETTINGS_ENTRY_DESCRIPTION =
-        "随时重看查词、添加/补词、生词本、背词、PDF、备份恢复和可选离线翻译的步骤与边界。"
+        "随时重看查词、添加/补词、生词本、复习、PDF、备份恢复和可选离线翻译的步骤与边界。"
 
     /** The fixed HOME card copy. The host owns visibility and the `guide_seen_v1` preference. */
     val homeCard: GuideHomeCard = GuideHomeCard(
@@ -175,17 +180,17 @@ object UsageGuide {
         ),
         GuideTopic(
             id = "study",
-            title = "5. 背词：统一范围、默认合计 20 个新词与到期复习",
+            title = "5. 复习：统一范围、默认合计 20 个新词与到期复习",
             summary = "到期复习优先；个人生词与考研/六级原书两池混合抽取，共用一个队列和一份进度。",
             steps = listOf(
-                "背词只有一个统一入口：先到期待复习，再学新词。每日新词默认合计 20 个，可在本页调整（范围 1–200）。",
+                "复习只有一个统一入口：先到期待复习，再学新词。每日新词默认合计 20 个，可在本页调整（范围 1–200）。",
                 "两池都有词时，个人生词与当天原书抽样按约 1:1 交替加入同一队列，不再先把个人生词用完才轮到原书；某一池不足时由另一池补足。",
                 "原书词按当天稳定抽样顺序出现：同一天、同一进度重新进入结果一致，换一天会抽到不同样本。",
-                "没查过的原书词也能直接背，背词不以先查询为前提；查询收录的个人词只是其中一池。",
+                "没查过的原书词也能直接复习，不要求先查询；查询收录的个人词只是其中一池。",
                 "同一个词只保留一份进度，不需要切换词书；个人词和原书不会形成两套复习。",
-                "每张卡只有「认识 / 模糊 / 忘记」三个真实反馈：认识按 1/3/7/14/30 天递增，模糊 1 天后回来，忘记 10 分钟后重新学。",
+                "每张复习卡：看单词，从四个中文释义里选一个；选中后立即显示对错，点「下一词」继续。",
                 "释义来自原始词书（未逐条核对）或本机用户补充；不联网、不自动生成。",
-                "这是固定间隔复习，不是经过验证的记忆算法；进度只按你的真实反馈推进。"
+                "复习按固定间隔排期，不是经过验证的记忆算法；进度只按你的真实作答推进。"
             ),
             actions = listOf(GuideAction.OPEN_STUDY)
         ),
@@ -207,7 +212,7 @@ object UsageGuide {
             title = "7. 备份与恢复：本地明文、完整覆盖",
             summary = "备份只在本机通过系统文档选择器读写；恢复会完整替换，不合并。",
             steps = listOf(
-                "设置 →「导出学习数据备份」：把本机学习数据（词条与事件、已撤销历史、笔记、掌握状态、背词进度和个人补充词库）写成一个 .shicibackup 文件。",
+                "设置 →「导出学习数据备份」：把本机学习数据（词条与事件、已撤销历史、笔记、掌握状态、复习进度和个人补充词库）写成一个 .shicibackup 文件。",
                 "设置 →「从备份完整恢复」：先按提示把当前数据另存为安全备份，再选择要恢复的文件。",
                 "只有安全备份写回并读回校验一致、且数据在此期间没有变化时，才会覆盖当前数据；否则本次不覆盖。",
                 "恢复是完整覆盖，不合并、不猜测冲突：备份里没有的词、查询记录、收藏和补充词条也会被移除；空备份会在确认后清空学习数据。",
@@ -222,7 +227,7 @@ object UsageGuide {
             title = "8. 离线 AI 翻译（可选组件）",
             summary = "初装不下载模型；只有你明确确认后才用 Google ML Kit 在本机下载和翻译。",
             steps = listOf(
-                "它不是查词、补词、生词本、PDF 或背词的前置条件；其他功能完全不依赖它。",
+                "它不是查词、补词、生词本、PDF 或复习的前置条件；其他功能完全不依赖它。",
                 "初装不下载任何模型。未下载时该页只显示组件说明和「下载并启用（仅 Wi-Fi）」，原文只读，不开放编辑、翻译或复制。",
                 "只有你明确点确认后，才由 Google ML Kit 下载英中离线模型（约 30 MB 只是估计，实际以系统为准），且采用 Wi-Fi 条件。",
                 "不会自动改用移动数据，也不会改用在线翻译或收费服务；失败可主动重试，离开页面不会取消系统下载，再次进入只重新检查本地状态。",
@@ -259,7 +264,7 @@ object UsageGuide {
                 "查词：手动输入与真实查询；失败时可重试或改用手动输入。",
                 "添加/补词：只维护本机个人词性/释义，不收录、不计查询次数、不进入复习。",
                 "生词本：查看、搜索、收藏、按明确范围移除，以及导出 PDF；不在这里新增词义。",
-                "背词：统一复习队列与真实反馈；统计：本机查询与复习进度聚合。",
+                "复习：统一队列、四选一作答与对错反馈；统计：本机查询与复习进度聚合。",
                 "设置：权限状态说明、备份/恢复、可选离线翻译入口和其他本地设置；不承载查词输入。",
                 "离线 AI 翻译：可选的本机整句翻译；不查词、不收录、不上传原文。"
             ),

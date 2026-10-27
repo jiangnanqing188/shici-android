@@ -3,6 +3,7 @@ package com.shici.app.ui
 import android.content.Context
 import android.graphics.Color
 import android.graphics.Rect
+import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
@@ -14,15 +15,18 @@ import com.shici.app.core.GuideTopic
 import com.shici.app.core.UsageGuide
 
 /**
- * Standalone, repeatable usage guide. The main area shows one real native demonstration step at a
- * time: a fictional screen, a finger or pen tip, a highlight that follows the word, the lift and the
- * resulting card. The steps only illustrate existing behaviour with invented words; this screen has
- * no repository, dictionary, permissions, downloads or preferences, and no demo control performs a
- * query or writes a study record.
+ * Standalone, repeatable usage guide. The default view shows one scene at a time: the scene title,
+ * one step prompt, the real native demonstration (stroke, lift, result card) and the step counter.
+ * The other scenes live behind one compact "切换场景" entry, and the long text help stays collapsed.
  *
- * The long text help remains available as a secondary collapsed disclosure. Old topic ids and the
- * [UsageGuide.SEEN_PREFERENCE_KEY] contract are unchanged: only an explicit "skip" or "done" tap
- * calls [onDismissFirstRun]; opening the page, choosing a scene or replaying a step never does.
+ * The fixed bottom controls hold "上一步 / 下一步" and "跳过 / 完成"; they never scroll away on a
+ * narrow screen, a large font or landscape, while the content above scrolls on its own.
+ *
+ * The steps only illustrate existing behaviour with invented words; this screen has no repository,
+ * dictionary, permissions, downloads or preferences, and no demo control performs a query or writes
+ * a study record. Old topic ids and the [UsageGuide.SEEN_PREFERENCE_KEY] contract are unchanged: only
+ * an explicit "skip" or "done" tap calls [onDismissFirstRun]; opening the page, choosing a scene,
+ * replaying a step or handing off to a real page never does.
  *
  * Lifecycle: the integrator should call [onHostResume]/[onHostPause] from the Activity lifecycle and
  * [close] when the page is destroyed. The illustration also stops on its own when the view detaches;
@@ -43,27 +47,31 @@ class UsageGuideScreen(
     private val onDismissFirstRun: () -> Unit,
     private val onBack: () -> Unit
 ) {
-    /** Complete scrollable page body. No sidebar and no root padding; the host body supplies those. */
+    /** Fixed footer below a separately scrolling body; the host supplies page padding. */
     val view: View
 
     private val initialDemo: GuideAnimation.Demo? = GuideAnimation.demoForTopic(initialTopicId)
     private var selectedDemo: GuideAnimation.Demo = initialDemo ?: GuideAnimation.Demo.CAPTURE
     private var stepIndex: Int = 0
     private var helpExpanded: Boolean = false
+    private var scenePickerExpanded: Boolean = false
 
     private val sceneButtons = LinkedHashMap<GuideAnimation.Demo, Button>()
     private val topicCards = LinkedHashMap<String, TopicCard>()
 
     private lateinit var animationView: GuideAnimationView
+    private lateinit var demoCard: View
     private lateinit var demoTitle: TextView
-    private lateinit var demoSummary: TextView
     private lateinit var stepCounter: TextView
     private lateinit var promptView: TextView
     private lateinit var staticHint: TextView
     private lateinit var previousButton: Button
     private lateinit var nextButton: Button
+    private lateinit var doneButton: Button
     private lateinit var replayButton: Button
     private lateinit var useButton: Button
+    private lateinit var sceneToggle: Button
+    private lateinit var sceneBody: LinearLayout
     private lateinit var helpToggle: Button
     private lateinit var helpBody: LinearLayout
     private lateinit var scroll: ScrollView
@@ -84,33 +92,35 @@ class UsageGuideScreen(
         get() = GuideAnimation.demo(selectedDemo).steps
 
     init {
+        val root = context.column()
         val content = context.column()
-        content.addView(context.text(UsageGuide.TITLE, 28f, Paper.ink, true))
-        content.space(4)
-        content.addView(context.text(UsageGuide.INTRO, 16f, Paper.secondary))
-        content.space(12)
+        // Default body: page title, the current scene (title + one prompt + demo + progress),
+        // one compact scene entry and the collapsed long help. No intro paragraph competes with
+        // the demonstration; the necessary boundaries live in the demo line and the long help.
+        content.addView(context.text(UsageGuide.TITLE, 26f, Paper.ink, true))
+        content.space(6)
 
         if (firstRun) {
             content.addView(firstRunBanner())
-            content.space(12)
+            content.space(10)
         }
 
         val demo = demoSection()
+        demoCard = demo
         content.addView(demo)
-        content.space(16)
-
-        // Primary exits sit right after the demonstration; the long text help is secondary and
-        // collapsed at the bottom so it cannot push "跳过/完成" out of easy reach.
-        content.addView(controlFooter())
-        content.space(16)
+        content.space(10)
+        content.addView(scenePickerSection())
+        content.space(10)
         content.addView(longHelpSection())
-        content.space(16)
+        content.space(12)
 
         scroll = ScrollView(context).apply {
             isFillViewport = true
             addView(content)
         }
-        view = scroll
+        root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
+        root.addView(controlFooter(), LinearLayout.LayoutParams(-1, -2))
+        view = root
 
         selectScene(selectedDemo, restart = false)
 
@@ -119,7 +129,7 @@ class UsageGuideScreen(
         val linkedDemo = initialDemo
         val linkedTopic = initialTopicId
         if (linkedDemo != null) {
-            scrollToDescendant(demo)
+            scrollToDescendant(demoCard)
         } else if (linkedTopic != null) {
             setHelpExpanded(true)
             topicCards[linkedTopic]?.setExpanded(true)
@@ -146,9 +156,51 @@ class UsageGuideScreen(
 
     private fun demoSection(): View {
         val card = context.column().apply {
-            setPadding(context.dp(18), context.dp(14), context.dp(18), context.dp(14))
+            setPadding(context.dp(16), context.dp(12), context.dp(16), context.dp(12))
             background = context.shape(Paper.surface, 12, true)
         }
+
+        demoTitle = context.text(selectedDemo.title, 20f, Paper.ink, true)
+        card.addView(demoTitle)
+
+        animationView = GuideAnimationView(context, currentStep)
+        card.addView(animationView, LinearLayout.LayoutParams(-1, context.dp(250)))
+        staticHint = context.text(UsageGuide.STATIC_HINT, 12f, Paper.warning).apply {
+            visibility = View.GONE
+        }
+        card.addView(staticHint)
+        // Installed after the hint exists: the setter reports the current mode immediately.
+        animationView.setMotionModeListener { disabled ->
+            staticHint.visibility = if (disabled) View.VISIBLE else View.GONE
+        }
+        // One short line keeps the demonstration boundary explicit without another paragraph.
+        card.addView(context.text(UsageGuide.DEMO_NOTE, 12f, Paper.warning))
+
+        val progressRow = context.row().apply { gravity = Gravity.CENTER_VERTICAL }
+        stepCounter = context.text("", 13f, Paper.secondary)
+        progressRow.addView(stepCounter, LinearLayout.LayoutParams(0, -2, 1f))
+        replayButton = context.button(UsageGuide.REPLAY_LABEL) { animationView.replay() }
+        progressRow.addView(replayButton, LinearLayout.LayoutParams(-2, -2))
+        card.addView(progressRow)
+
+        promptView = context.text("", 16f, Paper.ink)
+        card.addView(promptView)
+
+        // An explicit page hand-off that never dismisses the guide and never performs a query,
+        // permission request or write. It stays a compact quiet action so the demonstration keeps
+        // the focus and the footer's step control remains the only filled primary. The label
+        // already starts with "去".
+        useButton = context.button(selectedDemo.action.label, primary = false) {
+            onNavigate(selectedDemo.action.route)
+        }
+        card.addView(useButton, LinearLayout.LayoutParams(-2, -2))
+        return card
+    }
+
+    /** Compact scene picker: only the current scene is visible until the user asks to switch. */
+    private fun scenePickerSection(): View {
+        val container = context.column()
+        sceneBody = context.column().apply { visibility = View.GONE }
 
         val entries = GuideAnimation.Demo.values().toList()
         for (rowIndex in 0 until 2) {
@@ -157,7 +209,10 @@ class UsageGuideScreen(
                 val index = rowIndex * 2 + columnIndex
                 if (index >= entries.size) break
                 val demo = entries[index]
-                val button = context.button("${index + 1}. ${demo.shortLabel}") { selectScene(demo) }
+                val button = context.button(demo.shortLabel) {
+                    selectScene(demo)
+                    setScenePickerExpanded(false)
+                }
                 button.contentDescription = "查看${demo.title}"
                 sceneButtons[demo] = button
                 row.addView(
@@ -167,65 +222,15 @@ class UsageGuideScreen(
                     }
                 )
             }
-            card.addView(row, LinearLayout.LayoutParams(-1, -2))
-            if (rowIndex == 0) card.space(8)
+            sceneBody.addView(row, LinearLayout.LayoutParams(-1, -2))
+            if (rowIndex == 0) sceneBody.space(8)
         }
-        card.space(8)
 
-        demoTitle = context.text(selectedDemo.title, 21f, Paper.ink, true)
-        demoSummary = context.text(GuideAnimation.demo(selectedDemo).summary, 15f, Paper.secondary)
-        card.addView(demoTitle)
-        card.addView(demoSummary)
-        card.addView(context.text(UsageGuide.DEMO_NOTE, 12f, Paper.warning))
-
-        staticHint = context.text(UsageGuide.STATIC_HINT, 13f, Paper.warning).apply {
-            visibility = View.GONE
-        }
-        animationView = GuideAnimationView(context, currentStep)
-        card.addView(animationView, LinearLayout.LayoutParams(-1, context.dp(250)))
-        animationView.setMotionModeListener { disabled ->
-            staticHint.visibility = if (disabled) View.VISIBLE else View.GONE
-        }
-        card.addView(staticHint)
-
-        stepCounter = context.text("", 13f, Paper.secondary)
-        promptView = context.text("", 17f, Paper.ink)
-        card.addView(stepCounter)
-        card.addView(promptView)
-
-        val navigation = context.row()
-        previousButton = context.button(UsageGuide.PREV_LABEL) {
-            if (stepIndex > 0) {
-                stepIndex -= 1
-                applyStep()
-            }
-        }
-        nextButton = context.button(UsageGuide.NEXT_LABEL, true) {
-            if (stepIndex < currentSteps.lastIndex) {
-                stepIndex += 1
-                applyStep()
-            }
-        }
-        replayButton = context.button(UsageGuide.REPLAY_LABEL) { animationView.replay() }
-        navigation.addView(
-            previousButton,
-            LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = context.dp(8) }
-        )
-        navigation.addView(
-            nextButton,
-            LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = context.dp(8) }
-        )
-        navigation.addView(replayButton, LinearLayout.LayoutParams(0, -2, 1f))
-        card.addView(navigation)
-        card.space(8)
-
-        // "去使用" is a separate, explicit page hand-off: it never dismisses the guide and never
-        // performs a query, permission request or write. Full width keeps long labels uncut.
-        useButton = context.button("${UsageGuide.USE_LABEL_PREFIX}${selectedDemo.action.label}") {
-            onNavigate(selectedDemo.action.route)
-        }
-        card.addView(useButton, LinearLayout.LayoutParams(-1, -2))
-        return card
+        sceneToggle = context.button(sceneToggleLabel(false)) { setScenePickerExpanded(!scenePickerExpanded) }
+        container.addView(sceneToggle, LinearLayout.LayoutParams(-1, -2))
+        container.addView(sceneBody, LinearLayout.LayoutParams(-1, -2))
+        updateSceneToggle()
+        return container
     }
 
     private fun selectScene(demo: GuideAnimation.Demo, restart: Boolean = true) {
@@ -233,9 +238,10 @@ class UsageGuideScreen(
         selectedDemo = demo
         if (sceneChanged || restart) stepIndex = 0
         demoTitle.text = demo.title
-        demoSummary.text = GuideAnimation.demo(demo).summary
-        useButton.text = "${UsageGuide.USE_LABEL_PREFIX}${demo.action.label}"
-        useButton.contentDescription = "去使用：${demo.action.label}；只导航，不记录引导状态"
+        useButton.text = demo.action.label
+        useButton.contentDescription = "${demo.action.label}，只切换页面，不记录引导状态，也不执行查询"
+        sceneToggle.text = sceneToggleLabel(scenePickerExpanded)
+        updateSceneToggle()
         sceneButtons.forEach { (candidate, button) ->
             val selected = candidate == demo
             button.background = context.shape(if (selected) Paper.green else Paper.lightGreen, 8)
@@ -249,6 +255,23 @@ class UsageGuideScreen(
         applyStep()
     }
 
+    private fun setScenePickerExpanded(expand: Boolean) {
+        scenePickerExpanded = expand
+        sceneBody.visibility = if (expand) View.VISIBLE else View.GONE
+        sceneToggle.text = sceneToggleLabel(expand)
+        updateSceneToggle()
+    }
+
+    private fun sceneToggleLabel(expand: Boolean): String {
+        val arrow = if (expand) "▴" else "▾"
+        return "${UsageGuide.SCENE_PICKER_LABEL}：${selectedDemo.shortLabel} $arrow"
+    }
+
+    private fun updateSceneToggle() {
+        sceneToggle.contentDescription = "${UsageGuide.SCENE_PICKER_LABEL}，当前${selectedDemo.title}，" +
+            if (scenePickerExpanded) "点按收起" else "点按展开其他场景"
+    }
+
     private fun applyStep() {
         val step = currentStep
         animationView.showStep(step)
@@ -259,6 +282,10 @@ class UsageGuideScreen(
         previousButton.alpha = if (previousButton.isEnabled) 1f else 0.45f
         nextButton.isEnabled = stepIndex < currentSteps.lastIndex
         nextButton.alpha = if (nextButton.isEnabled) 1f else 0.45f
+        // Exactly one emphasized primary at a time: "下一步" while steps remain, "完成" on the
+        // last step. "跳过" and "上一步" stay secondary but fully tappable.
+        stylePrimary(nextButton, stepIndex < currentSteps.lastIndex)
+        stylePrimary(doneButton, stepIndex >= currentSteps.lastIndex)
         replayButton.contentDescription = "重播第 ${stepIndex + 1} 步：${step.prompt}"
         previousButton.contentDescription = if (previousButton.isEnabled) {
             "上一步，返回第 $stepIndex 步"
@@ -273,10 +300,10 @@ class UsageGuideScreen(
     }
 
     private fun firstRunBanner(): View = context.column().apply {
-        setPadding(context.dp(18), context.dp(14), context.dp(18), context.dp(14))
+        setPadding(context.dp(16), context.dp(12), context.dp(16), context.dp(12))
         background = context.shape(Paper.lightGreen, 12)
-        addView(context.text(UsageGuide.FIRST_RUN_TITLE, 20f, Paper.green, true))
-        addView(context.text(UsageGuide.FIRST_RUN_MESSAGE, 15f, Paper.secondary))
+        addView(context.text(UsageGuide.FIRST_RUN_TITLE, 19f, Paper.green, true))
+        addView(context.text(UsageGuide.FIRST_RUN_MESSAGE, 14f, Paper.secondary))
     }
 
     // ---------------------------------------------------------------- long help
@@ -284,6 +311,8 @@ class UsageGuideScreen(
     private fun longHelpSection(): View {
         val container = context.column()
         helpBody = context.column().apply { visibility = View.GONE }
+        // The page intro is kept, but on demand: the default screen belongs to the demonstration.
+        helpBody.addView(context.text(UsageGuide.INTRO, 14f, Paper.ink))
         helpBody.addView(context.text(UsageGuide.LONG_HELP_DESCRIPTION, 14f, Paper.secondary))
         helpBody.space(8)
 
@@ -374,20 +403,60 @@ class UsageGuideScreen(
 
     // ---------------------------------------------------------------- footer and scrolling
 
+    /**
+     * Fixed controls outside the ScrollView. "上一步/下一步" share one row; "跳过/完成" sit on the
+     * row below, so they stay reachable on a narrow screen, at a large font scale and in landscape.
+     * Both exit labels are dismissals: skip and done share the same explicit user action.
+     */
     private fun controlFooter(): View {
-        val footer = context.column()
-        val row = context.row()
+        val footer = context.column().apply {
+            setPadding(0, context.dp(8), 0, 0)
+        }
+        footer.addView(
+            View(context).apply { setBackgroundColor(Paper.line) },
+            LinearLayout.LayoutParams(-1, context.dp(1))
+        )
+        footer.space(8)
+
+        val navigation = context.row()
+        previousButton = context.button(UsageGuide.PREV_LABEL) {
+            if (stepIndex > 0) {
+                stepIndex -= 1
+                applyStep()
+            }
+        }
+        nextButton = context.button(UsageGuide.NEXT_LABEL, true) {
+            if (stepIndex < currentSteps.lastIndex) {
+                stepIndex += 1
+                applyStep()
+            }
+        }
+        navigation.addView(
+            previousButton,
+            LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = context.dp(8) }
+        )
+        navigation.addView(nextButton, LinearLayout.LayoutParams(0, -2, 1f))
+        footer.addView(navigation)
+
+        footer.space(8)
+        val exits = context.row()
         val skip = context.button(UsageGuide.SKIP_LABEL) { dismissAndBack() }
         skip.contentDescription = "跳过引导并返回；会记录以后不再自动提示"
-        val done = context.button(UsageGuide.DONE_LABEL, true) { dismissAndBack() }
-        done.contentDescription = "完成引导并返回；会记录以后不再自动提示"
-        row.addView(
+        doneButton = context.button(UsageGuide.DONE_LABEL, true) { dismissAndBack() }
+        doneButton.contentDescription = "完成引导并返回；会记录以后不再自动提示"
+        exits.addView(
             skip,
             LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = context.dp(8) }
         )
-        row.addView(done, LinearLayout.LayoutParams(0, -2, 1f))
-        footer.addView(row)
+        exits.addView(doneButton, LinearLayout.LayoutParams(0, -2, 1f))
+        footer.addView(exits)
         return footer
+    }
+
+    /** Switches a footer button between the filled primary style and the quiet secondary style. */
+    private fun stylePrimary(button: Button, primary: Boolean) {
+        button.background = context.shape(if (primary) Paper.green else Paper.lightGreen, 8)
+        button.setTextColor(if (primary) Color.WHITE else Paper.green)
     }
 
     private fun dismissAndBack() {
@@ -433,18 +502,18 @@ object UsageGuideEntries {
         setPadding(context.dp(20), context.dp(16), context.dp(20), context.dp(16))
         background = context.shape(Paper.lightGreen, 12)
         addView(context.text(UsageGuide.FIRST_RUN_TITLE, 20f, Paper.green, true))
-        addView(
-            context.text(
-                "先从首页开启悬浮查词，再划词或手动查词；随时可看完整引导。",
-                15f,
-                Paper.green
-            )
-        )
-        addView(context.button("查看引导", true) { onOpenGuide() })
-        addView(context.button("以后再看") {
+        addView(context.text(UsageGuide.HOME_CARD_MESSAGE, 15f, Paper.green))
+        val openButton = context.button(UsageGuide.HOME_CARD_OPEN_LABEL, true) { onOpenGuide() }
+        openButton.contentDescription = "打开使用引导，不记录引导状态"
+        addView(openButton)
+        // The host persists guide_seen_v1 in this callback, so the label must say the card will not
+        // return; "以后再看" would promise a later prompt the app never shows again.
+        val dismissButton = context.button(UsageGuide.HOME_CARD_DISMISS_LABEL) {
             // Existing explicit-dismiss callback; persistence belongs to the host.
             onDismiss()
-        })
+        }
+        dismissButton.contentDescription = "跳过引导并记录；以后不再自动提示"
+        addView(dismissButton)
     }
 
     /** Settings help entry. Clicking the row asks the host to open the full guide page. */

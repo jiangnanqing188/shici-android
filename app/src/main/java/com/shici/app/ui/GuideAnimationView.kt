@@ -91,13 +91,15 @@ class GuideAnimationView(
         listener(animationsDisabled)
     }
 
-    /** Draws [next] from its first frame and starts it only while attached and resumed. */
+    /**
+     * Draws [next] from its first frame and starts it only while attached and resumed. Every explicit
+     * show (next/previous step, scene switch, deep link) also returns the reduced-motion phase to the
+     * first key frame, even when the step id happens to repeat.
+     */
     fun showStep(next: GuideAnimation.Step) {
         if (closed) return
-        if (step.id != next.id) {
-            step = next
-            staticPhase = 0
-        }
+        step = next
+        staticPhase = 0
         stopAnimation()
         progress = if (animationsDisabled) GuideAnimation.staticProgress(step.kind, staticPhase) else 0f
         contentDescription = talkBackFor(step)
@@ -110,7 +112,8 @@ class GuideAnimationView(
         if (closed) return
         staticPhase = 0
         stopAnimation()
-        progress = if (animationsDisabled) 0f else 0f
+        // Both modes restart from the first frame: animated from 0, reduced-motion from progress 0.
+        progress = 0f
         invalidate()
         startAnimationIfPossible()
     }
@@ -502,69 +505,123 @@ class GuideAnimationView(
 
     // ---------------------------------------------------------------- study
 
+    /**
+     * Review is drawn the way the page works now: one word, four Chinese choices, an explicit
+     * selection, correct/wrong feedback and then the next word. The sample word and meanings are
+     * invented, and no drawn tap submits a real answer.
+     *
+     * The four steps read as one continuous review: pick an option and see it marked, see the
+     * correct feedback, see a second card answered wrong with the right meaning also lit, then tap
+     * "下一词" on that answered card and land on a fresh card.
+     */
     private fun drawStudy(canvas: Canvas, frame: GuideAnimation.Frame, u: Float, w: Float, h: Float) {
-        header(canvas, "背词", u, w, h)
-        if (step.kind == GuideAnimation.Kind.STUDY_CARD || step.kind == GuideAnimation.Kind.MIX_POOL) {
-            label(canvas, "新词队列", w * 0.5f, h * 0.28f, u * 16f, Paper.ink, Paint.Align.CENTER, bold = true)
-            val left = RectF(w * 0.07f, h * 0.38f, w * 0.42f, h * 0.54f)
-            val right = RectF(w * 0.58f, h * 0.38f, w * 0.93f, h * 0.54f)
-            panel(canvas, left, u * 10f, Paper.lightGreen, null)
-            panel(canvas, right, u * 10f, Paper.lightGreen, null)
-            label(canvas, "个人生词", left.centerX(), left.centerY() + u * 2f, u * 13f, Paper.green, Paint.Align.CENTER, bold = true)
-            label(canvas, "原书词", right.centerX(), right.centerY() - u * 3f, u * 13f, Paper.green, Paint.Align.CENTER, bold = true)
-            label(canvas, "无需先查", right.centerX(), right.centerY() + u * 12f, u * 10f, Paper.secondary, Paint.Align.CENTER)
-            arrow(canvas, left.centerX(), h * 0.56f, w * 0.40f, h * 0.68f, frame.highlight, u)
-            arrow(canvas, right.centerX(), h * 0.56f, w * 0.60f, h * 0.68f, frame.highlight, u)
-            if (frame.resultVisible) {
-                panel(canvas, RectF(w * 0.17f, h * 0.68f, w * 0.83f, h * 0.82f), u * 10f, Paper.surface, Paper.green)
-                label(canvas, "同一队列 · 默认合计 20", w * 0.5f, h * 0.755f, u * 14f, Paper.green, Paint.Align.CENTER, bold = true)
-                label(canvas, "约 1:1；一池不足由另一池补足", w * 0.5f, h * 0.80f, u * 10f, Paper.secondary, Paint.Align.CENTER)
-            }
-            label(canvas, "没查过的原书词也能背", w * 0.5f, h * 0.89f, u * 11f, Paper.secondary, Paint.Align.CENTER)
-            return
-        }
-
-        val card = RectF(w * 0.07f, h * 0.20f, w * 0.93f, h * 0.60f)
-        panel(canvas, card, u * 10f, Paper.surface, Paper.line)
-        label(canvas, "orbit", w * 0.5f, h * 0.36f, u * 24f, Paper.ink, Paint.Align.CENTER, bold = true)
-        chip(canvas, "原书词", w * 0.50f, h * 0.43f, u * 11f, Paper.lightGreen, Paper.green, u)
-        label(canvas, "到期复习优先 · 同一份进度", w * 0.5f, h * 0.51f, u * 11f, Paper.secondary, Paint.Align.CENTER)
-        val buttons = listOf(
-            Triple("认识", w * 0.10f, w * 0.37f),
-            Triple("模糊", w * 0.39f, w * 0.66f),
-            Triple("忘记", w * 0.68f, w * 0.95f)
-        )
-        val pressed = when (step.kind) {
-            GuideAnimation.Kind.KNOW -> 0
-            GuideAnimation.Kind.FUZZY -> 1
-            GuideAnimation.Kind.FORGET -> 2
-            else -> -1
-        }
-        buttons.forEachIndexed { index, entry ->
-            val text = entry.first
-            val active = index == pressed && frame.highlight > 0.25f
-            val button = RectF(entry.second, h * 0.70f, entry.third, h * 0.82f)
-            fill.color = when {
-                !active -> Paper.lightGreen
-                index == 2 -> Paper.error
-                else -> Paper.green
-            }
-            canvas.drawRoundRect(button, u * 8f, u * 8f, fill)
-            label(
-                canvas, text, button.centerX(), button.centerY() + u * 5f,
-                u * 13f,
-                if (active) Color.WHITE else Paper.green,
-                Paint.Align.CENTER,
-                bold = active
+        header(canvas, "复习", u, w, h)
+        val kind = step.kind
+        val stepProgress = frame.progress
+        // The "next" step starts on the card the wrong-answer step ended on and switches to a fresh
+        // sample card once its tap lands, so the sequence never jumps back to an earlier card.
+        val nextCase = kind == GuideAnimation.Kind.STUDY_NEXT
+        val advancing = nextCase && stepProgress >= 0.88f
+        val wrongCase = kind == GuideAnimation.Kind.STUDY_WRONG
+        val secondCard = wrongCase || nextCase
+        // Three invented sample cards: the right answer, a second word answered wrong, and the
+        // untouched card the demonstration lands on after "下一词".
+        val (word, answer, options) = when {
+            advancing -> Triple(
+                "pebble",
+                "小石子；鹅卵石",
+                listOf("小石子；鹅卵石", "轨道；运行轨道", "收获；收成", "明显的")
+            )
+            secondCard -> Triple(
+                "meadow",
+                "草地；牧草地",
+                listOf("草地；牧草地", "轨道；运行轨道", "收获；收成", "观察；遵守")
+            )
+            else -> Triple(
+                "orbit",
+                "轨道；运行轨道",
+                listOf("轨道；运行轨道", "收获；收成", "观察；遵守", "明显的")
             )
         }
-        if (frame.resultVisible && pressed >= 0) {
-            val outcome = when (pressed) {
-                0 -> "下次：1 天后（之后 3/7/14/30 递增）"
-                1 -> "下次：1 天后"
-                else -> "10 分钟后重新学"
+        val card = RectF(w * 0.06f, h * 0.27f, w * 0.94f, h * 0.50f)
+        panel(canvas, card, u * 10f, Paper.surface, Paper.line)
+        label(canvas, word, w * 0.5f, h * 0.38f, u * 23f, Paper.ink, Paint.Align.CENTER, bold = true)
+        chip(canvas, "四选一", w * 0.50f, h * 0.45f, u * 10f, Paper.lightGreen, Paper.green, u)
+
+        val rects = listOf(
+            RectF(w * 0.06f, h * 0.55f, w * 0.48f, h * 0.64f),
+            RectF(w * 0.52f, h * 0.55f, w * 0.94f, h * 0.64f),
+            RectF(w * 0.06f, h * 0.66f, w * 0.48f, h * 0.75f),
+            RectF(w * 0.52f, h * 0.66f, w * 0.94f, h * 0.75f)
+        )
+        // Nothing is selected before the demonstration tap lands. The feedback steps start from the
+        // same untouched card and reveal their outcome on their own timer, so no second fake tap is
+        // drawn: a wrong pick is marked first, then the correct option lights up shortly after. The
+        // "next" step opens already answered and switches to a fresh card after its tap.
+        val answered = if (nextCase) !advancing else frame.resultVisible
+        val judging = kind == GuideAnimation.Kind.STUDY_CHOICE
+        val wrongPicked = (wrongCase || nextCase) && answered
+        val selected = when {
+            !answered -> -1
+            wrongPicked -> 1
+            else -> 0
+        }
+        val correctMarked = when (kind) {
+            GuideAnimation.Kind.STUDY_WRONG -> stepProgress >= 0.62f
+            GuideAnimation.Kind.STUDY_CHOICE -> false
+            else -> answered
+        }
+        options.forEachIndexed { index, text ->
+            val rect = rects[index]
+            val isWrongPick = index == selected && wrongPicked
+            val isCorrect = correctMarked && index == 0
+            val isPicked = index == selected && judging
+            fill.color = when {
+                isWrongPick -> withAlpha(Paper.error, 28)
+                isCorrect || isPicked -> Paper.lightGreen
+                else -> Paper.surface
             }
-            chip(canvas, outcome, w * 0.5f, h * 0.90f, u * 11f, Paper.lightGreen, Paper.green, u)
+            canvas.drawRoundRect(rect, u * 8f, u * 8f, fill)
+            stroke.color = when {
+                isWrongPick -> Paper.error
+                isCorrect || isPicked -> Paper.green
+                else -> Paper.line
+            }
+            stroke.strokeWidth = if (isWrongPick || isCorrect || isPicked) u * 1.8f else u
+            canvas.drawRoundRect(rect, u * 8f, u * 8f, stroke)
+            val prefix = when {
+                isWrongPick -> "✗ "
+                isCorrect -> "✓ "
+                isPicked -> "● "
+                else -> ""
+            }
+            label(
+                canvas, prefix + text, rect.left + u * 10f, rect.centerY() + u * 4f, u * 11.5f,
+                when {
+                    isWrongPick -> Paper.error
+                    isCorrect || isPicked -> Paper.green
+                    else -> Paper.ink
+                },
+                Paint.Align.LEFT,
+                bold = isWrongPick || isCorrect || isPicked
+            )
+        }
+
+        if (wrongPicked) {
+            // The wrong pick is marked first; the correct meaning is named once that option lights
+            // up, so the mid key frame and the completed frame stay distinct.
+            val feedback = if (correctMarked) "✗ 答错了 · 正确答案：$answer" else "✗ 答错了"
+            label(
+                canvas, feedback, w * 0.5f, h * 0.815f,
+                u * 11f, Paper.error, Paint.Align.CENTER
+            )
+        } else if (!judging && answered) {
+            chip(canvas, "✓ 答对了", w * 0.5f, h * 0.815f, u * 11f, Paper.lightGreen, Paper.green, u)
+        }
+        if (nextCase && answered) {
+            textButton(canvas, RectF(w * 0.30f, h * 0.86f, w * 0.70f, h * 0.95f), "下一词 →", true, false, u)
+        } else if (advancing) {
+            label(canvas, "下一张复习卡", w * 0.5f, h * 0.815f, u * 11f, Paper.secondary, Paint.Align.CENTER)
         }
     }
 
@@ -732,25 +789,6 @@ class GuideAnimationView(
             Paint.Align.CENTER,
             bold = primary
         )
-    }
-
-    private fun arrow(
-        canvas: Canvas, startX: Float, startY: Float, endX: Float, endY: Float,
-        progress: Float, u: Float
-    ) {
-        val p = progress.coerceIn(0f, 1f)
-        if (p <= 0f) return
-        val x = startX + (endX - startX) * p
-        val y = startY + (endY - startY) * p
-        stroke.color = Paper.green
-        stroke.strokeWidth = u * 2f
-        stroke.strokeCap = Paint.Cap.ROUND
-        canvas.drawLine(startX, startY, x, y, stroke)
-        if (p > 0.9f) {
-            fill.color = Paper.green
-            canvas.drawCircle(endX, endY, u * 4f, fill)
-        }
-        stroke.strokeCap = Paint.Cap.BUTT
     }
 
     private fun drawFinger(
