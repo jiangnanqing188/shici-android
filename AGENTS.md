@@ -1,5 +1,15 @@
 # 项目协作规则
 
+## 2026-10-28 本批完整闭环收尾；AI命名清理仅追踪并待派发
+
+Logo已准确本地提交bcfb4a6（18产品＋5治理），官网仅index/styles已替换并保旧备份；新圆形补验3PASS、部署准备5PASS、真实HTTP6PASS分域统计，原17PASS/1ERROR保持。父核全部5实际Sol/high上下文及L56/P416含111链接/H129准确载荷。无nginxreload/443变更/新设备安装/推送。
+
+复习指定DSF/request max实际普通Flash1017完整交付两路径；独立新Sol/high全部2真实上下文父核，Q01-Q14唯一run14PASS/0FAIL/0ERROR/0SKIP（12宿主＋2源/静态接线），287准确载荷及JSON/JUnit同序已核。原184输入一次重生成180Ready/4Unavailable（further/through各2，兼容词性不足）/5次实际wide/含wide189调用，不是184语义全通过；不重跑原80/34/28/14或36人工。原词库/补词原文/默认20/调度/Repository/schema保持，不代表SQLite反馈动态/真机/全库语义通过。首次语法失败和准备错误均保留。
+
+最终根README-only事实收尾完整success/end_turn/exit0/0Bash、原正文保留；父机械合入准确ReviewChoices＋README。验收候选188的非根README187与语法source02相等；根同时含已单独收尾的websiteREADME，因此准确口径为：**根186个非两README源等于已编译/已验候选，其余两个README仅事实文案差异**，不能冒称根非README187全部仍相等。未因README文案重编译/功能重测。电脑内部2.5.0/50，平板仍2.4.2/49、0安装。复习本次2产品＋5治理准确本地提交以Git和parent-quality-final-commit.json为准；原四草稿content/index及815B原件保留，不推送。
+
+用户最新问AI翻译已只读追到MainActivity/悬浮Capture→TranslationScreen→TranslationSession→OfflineTranslation→MLKit17.0.3真实调用，含isModelDownloaded、明确确认后requireWifi下载、Ready后translate；并非空句译实现。但开源大模型与自有站模型包尚未接入，设备实际下载/译文效果本次未验。拟把可见“离线AI翻译”统一改“离线句子翻译”、保真实功能/隐私下载说明；**完整后续任务已备，未派发/未改产品**。当前host最新已知仅余16%（周66%）接近15%且需足完整批，遵用户先收口、不交半截任务要求，不再开新实现/测试，不切号/刷新/重置/自动等恢复。what句法/多义覆盖、真实触控/IME/OCR/长期功耗与AI命名仍待后续，不以本轮结论外推。
+
 ## 2026-10-28 Logo完成准确收尾；复习质量14项通过待准确收件合入
 
 Logo：独立实际Sol/high全部5真实turn_context父核，三个批次分别L3PASS/P5PASS/H6PASS（各0FAIL/ERROR/SKIP、唯一run），不相加为全站/全软件14项，也不倒填原17PASS/1ERROR。父核L56、P416含111链接目标、H129准确载荷全集合/hash/大小与JSON/JUnit顺序。官方Netcatty单次两静态已真实替换；五URL10真实GET/HEAD正确、两私有路径404、一次360px浏览器4静态请求/页头页脚Logo可见无横溢。仅本线路HTTP/IP，不外推国内各网/HTTPS/OEMLauncher/设备。原备份保私有700stage内600，www四文件644；app/content、nginx配置及当前443853/start1469/boot和unit-config-bin hash保持，无reload/装包/防火墙/DNS/H1H5动作。owned=false只关闭适配器，用户连接保留。指定DSF最后websiteREADME-only完整success/end_turn/exit0/0Bash，历史原字节保留，父只机械合入准确说明，不重编译/功能重测。Logo18及准确治理将单独本地提交，以Git与私有parent-logo-final-commit为准；平板2.4.2/49、0安装，不推送。

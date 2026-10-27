@@ -41,26 +41,48 @@ sealed class ReviewQuestion {
  * Inputs are only [target] (the pending card's resolved snapshot, i.e. the correct meaning), the
  * already loaded, bounded [candidates] and the persisted card [token]. This object never reads the
  * database, the assets, a file or the network, never runs an AI model and never applies a meaning
- * revision: every label is an existing local meaning taken verbatim (only shortened at a clause
- * boundary). It cannot be called with a whole-library scan by itself; the UI loads a bounded list on
- * the application worker first.
+ * revision: every label is an existing local meaning (only a leading known POS label is removed and
+ * the first clause is shortened). It cannot be called with a whole-library scan by itself; the UI
+ * loads a bounded list on the application worker first.
  *
  * The question is deterministic. Distractor order is a stable FNV-1a/SplitMix64 shuffle of the card
  * token, so the same pending card redrawn after rotation, navigation or a process restart shows the
  * same options in the same places, while a freshly dealt card gets a new token and therefore a new,
  * not-fixed correct position. No [java.util.Random], wall clock or hash-map iteration order is used.
  *
+ * Displayed meaning and part of speech:
+ * - A merged display entry (one carrying [DictionaryEntry.originalSnapshot]) is asked with the
+ *   current user supplement, exactly like the lookup card. Its explicit part of speech is recovered
+ *   from the structure [PersonalDictionary.merge] produces, never by scanning marker-like text in a
+ *   raw original meaning. A blank user part of speech is unknown: the original part of speech is not
+ *   borrowed and no part of speech is guessed from the Chinese text. User-only entries behave the
+ *   same way.
+ * - A raw original entry uses the explicit part of speech on its first displayed clause when there is
+ *   one; otherwise it falls back to the original entry's own part of speech, and only when that field
+ *   is itself a supported label. Only a short explicit whitelist (n/n./名词, v/vt/vi/动词,
+ *   adj/a/形容词, adv/ad/副词, pron, prep, conj, num, art, int/interj, aux and their bracketed forms)
+ *   is recognised. Multiple labels form an explicit set; any arbitrary string is unknown.
+ * - When the target's displayed part of speech is known, a distractor must carry an explicitly
+ *   compatible label (a non-empty intersection), still inside the caller's bounded candidate window.
+ *   Fewer than three compatible distractors yields the ordinary
+ *   [ReviewUnavailableReason.NOT_ENOUGH_CANDIDATES] result, so the existing UI widening path decides
+ *   what to do. When it is unknown, no part-of-speech filter or reward is applied and the existing
+ *   deterministic spelling/hash order is kept.
+ * - All four labels have any leading *known* part-of-speech label removed uniformly; Chinese
+ *   qualifiers and the original text are kept, and no label is invented or rewritten.
+ *
  * Distractor rules:
  * - Labels are four distinct normalised strings; the correct label is exactly one of them.
  * - A candidate is dropped when any of its meaning senses is equal to, contains or is contained in
  *   any sense of the full correct meaning (all original senses plus the user-supplied section), so a
  *   duplicate or an obviously contained meaning can never be offered as a wrong answer.
- * - Comparison also ignores a leading ASCII part-of-speech tag and a trailing 的/地/得, and a small
+ * - Comparison also ignores a leading part-of-speech label and a trailing 的/地/得, and a small
  *   curated list of common Chinese near-synonym clusters is treated as the same sense. This removes
  *   obvious pairs such as 美丽的/漂亮的, 高兴/开心 and 快速/迅速 across every sense, including the
- *   user supplement, without special-casing any headword.
- * - Same part of speech and similar spelling (shared prefix, close length) are preferred; ties are
- *   broken by a stable hash of token + keys. Existing meaning text is the only label source.
+ *   user supplement, without special-casing any headword. The intensity family 怒/愤怒/狂怒/暴怒 is
+ *   included only as a further ambiguous-distractor guard; it does not claim those words are equal.
+ * - Similar spelling (shared prefix, close length) is preferred; ties are broken by a stable hash of
+ *   token + keys. Existing meaning text is the only label source.
  *
  * The synonym rule is deliberately finite and conservative, not a semantic model: it covers only
  * the listed common clusters plus the normalisation above, so two synonyms outside that list (or a
@@ -90,10 +112,36 @@ object ReviewChoices {
 
     private val MARKER_SENSE = normalize(PersonalDictionary.MARKER)
 
+    /** The separator [PersonalDictionary.merge] puts between the original and the user POS. */
+    private const val USER_POS_SEPARATOR = "；用户补充："
+
+    /**
+     * The only part-of-speech categories this generator treats as known. Anything outside this
+     * finite enum is unknown, so an arbitrary source string can never act as a filter or a bonus.
+     */
+    private enum class PosKind {
+        NOUN, VERB, ADJECTIVE, ADVERB, PRONOUN, PREPOSITION, CONJUNCTION,
+        NUMERAL, ARTICLE, INTERJECTION, AUXILIARY
+    }
+
+    /** Separators accepted inside one explicit POS field (`n. / v.`, `vt/vi`, `n.或v.`). */
+    private val POS_SEPARATORS = Regex("[\\s/／,，、;&|或]+")
+
+    /** A bare ASCII POS expression at the start of a clause (`adj.`, `n./v.`, `vt`). */
+    private val BARE_ASCII_POS = Regex(
+        "^((?:[A-Za-z]{1,8}\\.?)(?:\\s*[/,，、;&|或]\\s*[A-Za-z]{1,8}\\.?)*)(?=\\s|[\\u4e00-\\u9fff]|$)"
+    )
+
+    /** One or more bare supported Chinese POS labels at the start of a clause (`名词/动词`). */
+    private val BARE_CHINESE_POS = Regex(
+        "^((?:名词|动词|形容词|副词|代词|介词|连词|数词|冠词|感叹词|助动词)(?:\\s*[/,，、;&|或]\\s*(?:名词|动词|形容词|副词|代词|介词|连词|数词|冠词|感叹词|助动词))*)(?=\\s|[：:]|$)"
+    )
+
     /**
      * A leading ASCII part-of-speech tag (`[adj]`, `(n.)`, `【v】`, `adj.`) describes the same sense
-     * as the bare meaning, so it is ignored for comparison. Only a short ASCII tag is removed; a
-     * bracketed Chinese qualifier stays part of the meaning.
+     * as the bare meaning, so it is ignored for comparison. This broad comparison-only normaliser is
+     * separate from the finite POS whitelist above: inference and label stripping never treat an
+     * arbitrary bracket as a known part of speech.
      */
     private val POS_TAG_PREFIX = Regex(
         "^\\s*[\\[(（【]\\s*(?:[A-Za-z][A-Za-z./ ]{0,14}|形容词|副词|名词|动词|介词|连词|代词|数词|量词|冠词|助词|感叹词|拟声词|短语)\\s*[\\])）】]\\s*"
@@ -182,12 +230,22 @@ object ReviewChoices {
         setOf("年轻", "年少"),
         setOf("缓慢", "迟缓", "慢"),
         setOf("清楚", "清晰", "明白", "明确"),
-        setOf("模糊", "含糊", "朦胧")
+        setOf("模糊", "含糊", "朦胧"),
+        // Anger-intensity family. This is only a guard against offering a different strength as a
+        // wrong option; it deliberately does not claim 怒/愤怒/狂怒/暴怒 are interchangeable.
+        setOf("怒", "愤怒", "狂怒", "暴怒")
     )
 
-    private val SYNONYM_CLUSTER_OF: Map<String, Int> = buildMap {
+    /**
+     * Every curated cluster a word belongs to. A word may belong to more than one family (愤怒 is
+     * in both the existing anger cluster and the intensity family), so values are sets rather than
+     * one index; sharing any cluster is enough to treat two labels as too close.
+     */
+    private val SYNONYM_CLUSTERS_OF: Map<String, Set<Int>> = buildMap {
         SYNONYM_CLUSTERS.forEachIndexed { index, cluster ->
-            cluster.forEach { word -> put(word, index) }
+            cluster.forEach { word ->
+                put(word, (this[word] ?: emptySet<Int>()) + index)
+            }
         }
     }
 
@@ -196,37 +254,46 @@ object ReviewChoices {
      * already resolved local entries; this function filters, ranks and picks exactly three distractors.
      */
     fun build(target: DictionaryEntry, candidates: List<DictionaryEntry>, token: String): ReviewQuestion {
-        val correctLabel = conciseLabel(preferredMeaning(target))
+        val targetDisplay = displayed(target)
+        val correctLabel = displayedLabel(targetDisplay)
         val correctNormalised = normalize(correctLabel)
         if (correctNormalised.isEmpty()) {
             return ReviewQuestion.Unavailable(ReviewUnavailableReason.NO_TARGET_MEANING)
         }
         val targetSenses = senses(target.meaning)
         val targetComparison = comparisonSenses(target.meaning).toSet()
+        val targetPos = targetDisplay.pos
         val usedLabels = hashSetOf(correctNormalised)
-        val usedComparison = hashSetOf(comparisonIdentity(correctLabel))
+        val usedComparison = hashSetOf<String>().apply { addAll(comparisonIdentities(correctLabel)) }
         val distractors = ArrayList<DictionaryEntry>(OPTION_COUNT - 1)
         val ranked = candidates.asSequence()
             .filter { it.key != target.key && it.meaning.isNotBlank() }
-            .map { Candidate(it, score(target, it), stableHash("$token\u0000${target.key}\u0000${it.key}")) }
+            .map {
+                Candidate(
+                    it, displayed(it), score(target.key, it.key),
+                    stableHash("$token\u0000${target.key}\u0000${it.key}")
+                )
+            }
+            .filter { compatiblePos(targetPos, it.display.pos) }
             .filter { !overlapsCorrect(it.entry.meaning, targetSenses, targetComparison) }
             .sortedWith(compareByDescending<Candidate> { it.score }.thenBy { it.tieBreak })
             .iterator()
         while (ranked.hasNext() && distractors.size < OPTION_COUNT - 1) {
-            val entry = ranked.next().entry
-            val label = conciseLabel(preferredMeaning(entry))
+            val candidate = ranked.next()
+            val label = displayedLabel(candidate.display)
             val normalised = normalize(label)
-            val comparison = comparisonIdentity(label)
+            val identities = comparisonIdentities(label)
             if (normalised.isEmpty() || !usedLabels.add(normalised) ||
-                !usedComparison.add(comparison)) continue
-            distractors += entry
+                identities.isEmpty() || identities.any { it in usedComparison }) continue
+            usedComparison.addAll(identities)
+            distractors += candidate.entry
         }
         if (distractors.size < OPTION_COUNT - 1) {
             return ReviewQuestion.Unavailable(ReviewUnavailableReason.NOT_ENOUGH_CANDIDATES)
         }
         val options = ArrayList<ReviewOption>(OPTION_COUNT)
         options += ReviewOption(target.key, correctLabel, true)
-        distractors.forEach { options += ReviewOption(it.key, conciseLabel(preferredMeaning(it)), false) }
+        distractors.forEach { options += ReviewOption(it.key, displayedLabel(displayed(it)), false) }
         val order = seededOrder(OPTION_COUNT, "$token\u0000${target.key}")
         return ReviewQuestion.Ready(target.key, order.map { options[it] })
     }
@@ -272,15 +339,210 @@ object ReviewChoices {
         return entry.meaning
     }
 
-    /** First non-blank clause, bounded; never invented, only shortened. */
-    private fun conciseLabel(meaning: String): String {
-        val first = meaning.split('；', ';', '。', '\n', '\r')
+    /** One displayed meaning plus the explicit POS labels that came from the same source. */
+    private data class DisplayedMeaning(val meaning: String, val pos: Set<PosKind>?)
+
+    /**
+     * Resolves the source used for the label and the POS that belongs to *that* source.
+     *
+     * A merged display entry uses the user supplement and the user's own POS recovered from the
+     * merge structure. A blank user POS is unknown and never falls back to the original POS. A
+     * user-only entry is the same rule with its own field. Only a raw original entry may use its
+     * first displayed clause, then its own POS field; marker-like text is never parsed out of the
+     * meaning.
+     */
+    private fun displayed(entry: DictionaryEntry): DisplayedMeaning {
+        val snapshot = entry.originalSnapshot
+        if (snapshot != null) {
+            return DisplayedMeaning(preferredMeaning(entry), mergedUserPos(entry, snapshot))
+        }
+        if (entry.source == PersonalDictionary.SOURCE && entry.version == PersonalDictionary.VERSION) {
+            return DisplayedMeaning(entry.meaning, parsePosSet(entry.partOfSpeech))
+        }
+        val clausePos = leadingPosTags(firstClause(entry.meaning))
+        return DisplayedMeaning(entry.meaning, clausePos ?: parsePosSet(entry.partOfSpeech))
+    }
+
+    /**
+     * Recovers the user POS from the exact shape [PersonalDictionary.merge] writes:
+     * `basePos + USER_POS_SEPARATOR + userPos`, with the field being just `userPos` when the base
+     * has none, and just `basePos` when the user left it blank. A shape that does not match is
+     * unknown rather than being parsed speculatively.
+     */
+    private fun mergedUserPos(entry: DictionaryEntry, snapshot: DictionaryEntry): Set<PosKind>? {
+        val basePos = rawBase(snapshot).partOfSpeech
+        val mergedPos = entry.partOfSpeech
+        val userPos = when {
+            basePos.isBlank() -> mergedPos
+            mergedPos == basePos -> ""
+            mergedPos.startsWith(basePos) -> {
+                val rest = mergedPos.substring(basePos.length)
+                if (rest.startsWith(USER_POS_SEPARATOR)) {
+                    rest.substring(USER_POS_SEPARATOR.length).trim()
+                } else ""
+            }
+            else -> ""
+        }
+        return parsePosSet(userPos)
+    }
+
+    /** Follows only the explicit snapshot chain; never scans text. */
+    private fun rawBase(entry: DictionaryEntry): DictionaryEntry {
+        var current = entry
+        while (true) {
+            current = current.originalSnapshot ?: return current
+        }
+    }
+
+    /** First non-blank clause, before any shortening. */
+    private fun firstClause(meaning: String): String =
+        meaning.split('；', ';', '。', '\n', '\r')
             .firstOrNull { it.isNotBlank() }
             ?.trim()
             .orEmpty()
-        val trimmed = first.trimEnd('，', ',', '：', ':', ' ')
-        if (trimmed.length <= MAX_LABEL_CHARS) return trimmed
-        return trimmed.take(MAX_LABEL_CHARS - 1).trimEnd() + "…"
+
+    /**
+     * The displayed label: first clause, with a leading *known* POS label removed. Chinese
+     * qualifiers and the rest of the original text stay untouched, and the 28-character bound is
+     * applied only after stripping so a POS tag cannot use up the visible budget.
+     */
+    private fun displayedLabel(display: DisplayedMeaning): String {
+        val clause = stripKnownPosPrefix(firstClause(display.meaning))
+            .trimEnd('，', ',', '：', ':', ' ')
+        if (clause.length <= MAX_LABEL_CHARS) return clause
+        return clause.take(MAX_LABEL_CHARS - 1).trimEnd() + "…"
+    }
+
+    /** Removes up to three consecutive known POS labels from the start of a clause. */
+    private fun stripKnownPosPrefix(text: String): String {
+        var value = text.trim()
+        var guard = 0
+        while (guard++ < 3) {
+            val tag = leadingPosTag(value) ?: break
+            value = value.substring(tag.end).trim()
+        }
+        return value
+    }
+
+    /** Union of up to three consecutive known POS labels at the start of a clause, if any. */
+    private fun leadingPosTags(text: String): Set<PosKind>? {
+        var value = text.trim()
+        var result: MutableSet<PosKind>? = null
+        var guard = 0
+        while (guard++ < 3) {
+            val tag = leadingPosTag(value) ?: break
+            result = (result ?: mutableSetOf()).apply { addAll(tag.pos) }
+            value = value.substring(tag.end)
+        }
+        return result
+    }
+
+    private data class LeadingPos(val pos: Set<PosKind>, val end: Int)
+
+    /**
+     * Recognises one leading POS label from the finite whitelist. Bracketed content is accepted only
+     * when every token is a supported label, so `[adj] 美丽的` is known while `[口] 你好` is not.
+     * A bare ASCII label must have a dot or be followed by Chinese text (or be a multi-token
+     * expression); a single uppercase letter without a dot is never mistaken for one.
+     */
+    private fun leadingPosTag(text: String): LeadingPos? {
+        var start = 0
+        while (start < text.length && text[start].isWhitespace()) start++
+        if (start >= text.length) return null
+        val closing = when (text[start]) {
+            '[' -> ']'
+            '(' -> ')'
+            '（' -> '）'
+            '【' -> '】'
+            else -> null
+        }
+        if (closing != null) {
+            val end = text.indexOf(closing, start + 1)
+            if (end <= start + 1 || end - start - 1 > 32) return null
+            val pos = parsePosSet(text.substring(start + 1, end)) ?: return null
+            var after = end + 1
+            while (after < text.length && text[after].isWhitespace()) after++
+            if (after < text.length && (text[after] == '：' || text[after] == ':')) {
+                after++
+                while (after < text.length && text[after].isWhitespace()) after++
+            }
+            return LeadingPos(pos, after)
+        }
+        val remainder = text.substring(start)
+        val chinese = BARE_CHINESE_POS.find(remainder)
+        if (chinese != null) {
+            val pos = parsePosSet(chinese.groupValues[1]) ?: return null
+            var after = start + chinese.range.last + 1
+            while (after < text.length && text[after].isWhitespace()) after++
+            if (after < text.length && (text[after] == '：' || text[after] == ':')) {
+                after++
+                while (after < text.length && text[after].isWhitespace()) after++
+            }
+            return LeadingPos(pos, after)
+        }
+        val ascii = BARE_ASCII_POS.find(remainder) ?: return null
+        val expression = ascii.groupValues[1]
+        val pos = parsePosSet(expression) ?: return null
+        var after = start + ascii.range.last + 1
+        while (after < text.length && text[after].isWhitespace()) after++
+        if (after < text.length && (text[after] == '：' || text[after] == ':')) {
+            after++
+            while (after < text.length && text[after].isWhitespace()) after++
+        }
+        if (!expression.contains('.') && expression.length == 1 && expression[0].isUpperCase()) {
+            return null
+        }
+        if (!expression.contains('.') && after < text.length && !isCjk(text[after])) {
+            return null
+        }
+        return LeadingPos(pos, after)
+    }
+
+    private fun isCjk(character: Char): Boolean = character.code in 0x4e00..0x9fff
+
+    /**
+     * Parses one explicit POS field or tag body into a set. Every token must be a supported label;
+     * a partly unknown value such as `n. / 口语` is unknown rather than guessed. Multiple known
+     * labels form a set and are compared by explicit intersection.
+     */
+    private fun parsePosSet(raw: String): Set<PosKind>? {
+        val tokens = raw.split(POS_SEPARATORS).filter { it.isNotBlank() }
+        if (tokens.isEmpty()) return null
+        val result = mutableSetOf<PosKind>()
+        for (token in tokens) {
+            val pos = canonicalPosToken(token) ?: return null
+            result += pos
+        }
+        return result
+    }
+
+    /** Maps one token to the finite whitelist; trailing dots and wrapping brackets are ignored. */
+    private fun canonicalPosToken(rawToken: String): PosKind? {
+        var token = rawToken.trim().lowercase(Locale.ROOT)
+        token = token.trim('[', ']', '(', ')', '（', '）', '【', '】', '{', '}')
+        token = token.trimEnd('.', '．', '。').trim()
+        if (token.isEmpty()) return null
+        return when (token) {
+            "n", "名词" -> PosKind.NOUN
+            "v", "vt", "vi", "动词" -> PosKind.VERB
+            "adj", "a", "形容词" -> PosKind.ADJECTIVE
+            "adv", "ad", "副词" -> PosKind.ADVERB
+            "pron", "代词" -> PosKind.PRONOUN
+            "prep", "介词" -> PosKind.PREPOSITION
+            "conj", "连词" -> PosKind.CONJUNCTION
+            "num", "数词" -> PosKind.NUMERAL
+            "art", "冠词" -> PosKind.ARTICLE
+            "int", "interj", "感叹词" -> PosKind.INTERJECTION
+            "aux", "助动词" -> PosKind.AUXILIARY
+            else -> null
+        }
+    }
+
+    /** A known target POS accepts only candidates with an explicit, non-empty intersection. */
+    private fun compatiblePos(target: Set<PosKind>?, candidate: Set<PosKind>?): Boolean {
+        if (target == null) return true
+        if (candidate == null) return false
+        return candidate.any { it in target }
     }
 
     /** Raw non-empty sense clauses; the user-supplement marker line itself is not a sense. */
@@ -294,13 +556,14 @@ object ReviewChoices {
         rawSenses(meaning).map { normalize(it) }.filter { it.isNotEmpty() }
 
     /**
-     * Comparison form of one sense: a leading ASCII POS tag is removed, punctuation/whitespace is
-     * normalised, and a trailing structural particle (的/地/得) is ignored. This form is used only
-     * for exact sense equality and the finite synonym clusters, never for substring matching, so a
-     * word such as 目的 is not split apart by a broad containment test.
+     * Comparison form of one sense: leading known/ASCII POS labels are removed,
+     * punctuation/whitespace is normalised, and a trailing structural particle (的/地/得) is
+     * ignored. This form is used only for exact sense equality and the finite synonym clusters,
+     * never for substring matching, so a word such as 目的 is not split apart by a broad
+     * containment test.
      */
     private fun comparisonKey(rawSense: String): String {
-        var text = rawSense.trim()
+        var text = stripKnownPosPrefix(rawSense.trim())
         text = POS_TAG_PREFIX.replace(text, "")
         text = POS_ABBREV_PREFIX.replace(text, "")
         return normalize(text).trimEnd('的', '地', '得')
@@ -318,12 +581,17 @@ object ReviewChoices {
             .map { comparisonKey(it) }
             .filter { it.isNotEmpty() }
 
-    /** A cluster identity for synonyms, or the ordinary comparison key for every other label. */
-    private fun comparisonIdentity(label: String): String {
+    /**
+     * Identities used to keep option labels distinct. A word may belong to more than one curated
+     * cluster (愤怒 is in both the existing anger cluster and the new intensity family), so every
+     * cluster id is returned; sharing any one id means the labels are too close for two options.
+     */
+    private fun comparisonIdentities(label: String): List<String> {
         val key = comparisonKey(label)
-        if (key.isEmpty()) return "n:${normalize(label)}"
-        val cluster = SYNONYM_CLUSTER_OF[key]
-        return if (cluster == null) "k:$key" else "c:$cluster"
+        if (key.isEmpty()) return listOf("n:${normalize(label)}")
+        val clusters = SYNONYM_CLUSTERS_OF[key]
+        if (clusters.isNullOrEmpty()) return listOf("k:$key")
+        return clusters.sorted().map { "c:$it" }
     }
 
     /**
@@ -346,8 +614,10 @@ object ReviewChoices {
         }
         for (candidate in comparisonSenses(candidateMeaning)) {
             if (candidate in targetComparison) return true
-            val cluster = SYNONYM_CLUSTER_OF[candidate] ?: continue
-            if (targetComparison.any { SYNONYM_CLUSTER_OF[it] == cluster }) return true
+            val candidateClusters = SYNONYM_CLUSTERS_OF[candidate] ?: continue
+            if (targetComparison.any { target ->
+                    SYNONYM_CLUSTERS_OF[target]?.any { it in candidateClusters } == true
+                }) return true
         }
         return false
     }
@@ -361,20 +631,14 @@ object ReviewChoices {
         return out.toString()
     }
 
-    /** Same part of speech first, then a shared spelling prefix and a close word length. */
-    private fun score(target: DictionaryEntry, candidate: DictionaryEntry): Int {
-        var score = 0
-        val targetPos = posHead(target.partOfSpeech)
-        if (targetPos.isNotEmpty() && targetPos == posHead(candidate.partOfSpeech)) score += 4
-        score += minOf(commonPrefix(target.key, candidate.key), 3)
-        if (target.key.length - candidate.key.length in -1..1) score += 1
+    /**
+     * Similar spelling (shared prefix, close length) only. POS compatibility is a filter, not a
+     * reward, so an unknown target never inherits a bonus from the original entry's old POS.
+     */
+    private fun score(targetKey: String, candidateKey: String): Int {
+        var score = minOf(commonPrefix(targetKey, candidateKey), 3)
+        if (targetKey.length - candidateKey.length in -1..1) score += 1
         return score
-    }
-
-    private fun posHead(pos: String): String {
-        var end = 0
-        while (end < pos.length && !pos[end].isWhitespace() && pos[end] != '/') end++
-        return pos.substring(0, end).trim()
     }
 
     private fun commonPrefix(first: String, second: String): Int {
@@ -414,5 +678,6 @@ object ReviewChoices {
         return hash
     }
 
-    private data class Candidate(val entry: DictionaryEntry, val score: Int, val tieBreak: Long)
+    private data class Candidate(val entry: DictionaryEntry, val display: DisplayedMeaning,
+                                 val score: Int, val tieBreak: Long)
 }
