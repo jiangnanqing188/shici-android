@@ -1,5 +1,25 @@
 # 项目协作规则
 
+## 2026-10-28 Logo完成准确收尾；复习质量14项通过待准确收件合入
+
+Logo：独立实际Sol/high全部5真实turn_context父核，三个批次分别L3PASS/P5PASS/H6PASS（各0FAIL/ERROR/SKIP、唯一run），不相加为全站/全软件14项，也不倒填原17PASS/1ERROR。父核L56、P416含111链接目标、H129准确载荷全集合/hash/大小与JSON/JUnit顺序。官方Netcatty单次两静态已真实替换；五URL10真实GET/HEAD正确、两私有路径404、一次360px浏览器4静态请求/页头页脚Logo可见无横溢。仅本线路HTTP/IP，不外推国内各网/HTTPS/OEMLauncher/设备。原备份保私有700stage内600，www四文件644；app/content、nginx配置及当前443853/start1469/boot和unit-config-bin hash保持，无reload/装包/防火墙/DNS/H1H5动作。owned=false只关闭适配器，用户连接保留。指定DSF最后websiteREADME-only完整success/end_turn/exit0/0Bash，历史原字节保留，父只机械合入准确说明，不重编译/功能重测。Logo18及准确治理将单独本地提交，以Git与私有parent-logo-final-commit为准；平板2.4.2/49、0安装，不推送。
+
+复习：指定DSF两路径完整交回；最终quality-source-final01/188非README187等语法quality-source02（35.427s/exit0），首次语法失败保留。原质量测试者resume实为xhigh，父在GO前拒收关闭，仅1只读/0写/0测试；不当作high。另新显式Sol/high测试者全部2真实context父核，新唯一Q01-Q14=14PASS/0FAIL/0ERROR/0SKIP（12宿主功能生成＋2静态/完整性），287准确载荷及JSON/JUnit同序父核。原184输入仅重生成一次：180Ready、4Unavailable（further/through各2，兼容候选不足）、5次实际wide、含扩窗189次调用；不是184语义通过。只保有限近义/显示词性防护，不改词义/原文/默认20/Repository/schema，无真SQLite反馈动态复验/设备/旧全集。最终根README事实收尾仍进行、产品尚未机械合根；不以验收通过预报提交或安装。
+
+用户新问AI翻译，父只读追踪已确认MainActivity/悬浮Capture→TranslationScreen→TranslationSession→OfflineTranslation→ML Kit17.0.3真实调用（含确认后requireWifi下载和Ready准入）。没有已接入开源大模型或自有站模型包，不是空句译实现；本次未测设备下载/译文效果。拟清理“离线AI翻译”误导性命名为“离线句子翻译”，保真实SDK、下载/隐私/错误提示及全部原调用，不删除有效功能。此为后续独立小批，尚未派发/产品修改；最新已知当前host仅余16%接近15%完整批门禁，先收口已完整交付批，不给执行AI半截新任务，不刷新切号或自动等恢复。只在既有17.19.4登记、不另造计划。
+
+## 2026-10-28 00:10 Logo两静态已实际替换，HTTP验收中；复习质量仅私有候选
+
+沿用用户“2继续、Logo首位”。新L3PASS/P5PASS分别有界通过，旧17PASS/1ERROR保原；父核准确L56/P416（含111链接目标）及当前全部3Sol/high上下文。官方Netcatty新鲜实核后单次发布两静态：www新index/styles、app/content/config和当前443853/start1469/boot保持，原备份600。无nginxreload/安装包/防火墙/DNS/H1H5动作，用户owned=false会话未关闭。本地适配器已结束；实际HTTP/360px浏览器验收未交结果，不提前称通过。私有parent-logo-apply-receipt、logo-http-acceptance恢复。
+
+质量诊断273准确载荷/2实际Solhigh上下文已父核，184生成不是语义通过；模拟补词显示/POS错位确证、anger-fury只出题风险。指定CommandCodeDSF请求max整批私有实施中，actual普通Flash1017，不冒称Fast/max；只ReviewChoices/根README，保持原词库/实库/20调度/Repository。当前host41%/周70%本完整批门禁不外推第二号。初沙箱retry-only exit1保留、身份检查未实发kill，同链正常权限重连；首次语法失败保留，第二三目标exit0/35.427s，未完整交付/功能验收/合根。what片段与多义覆盖暂不修。平板仍2.4.2/49、0新安装；四草稿/index/815B原件保持，不推送。
+
+## 2026-10-27 23:15 新优先级：Logo补验收尾、复习出题质量有界抽查
+
+用户明确“2可以继续做，logo可以首位”，按Logo优先收尾、继续真实考研/六级四选一质量诊断处理。当前HEAD ae43036、根2.5.0/50、平板最后2.4.2/49；新鲜官方当前host账号五小时剩67%、周剩74%、ordinaryUsageAllowed=true，高于15%，不外推第二CPA账号、不重置/切号/改路由。核root188/原Logo18/旧57证据、四草稿content/index/815B原件保持。
+
+Logo只补原圆形导出夹具缺口及当前包来源，不重跑旧18/倒填17PASS+1ERROR；通过后才官方Netcatty依旧方案仅index/styles更新，不改nginx/443/H1/H5或下载公开范围。出题质量先固定小样本真实生成和选项歧义诊断，词义核验仍暂停、不改词库/用户数据；收到具体问题后才原指定Claude实施，完整语法后实际Sol/high统一验收。不安装平板。当前任务已备，尚无新验收结果/产品改动/远程写入；独立代理实际模型需父核GO。
+
 ## 2026-10-27 22:26 R2统一有限复验14/14闭环，准确本地收件收尾
 
 新独立实际gpt-6.1-sol/high已完整交回并关闭；父直接核全部4真实turn_context（含CPA更新中断后的重连）均Sol/high。source03/188唯一run01为**14PASS/0FAIL/0ERROR/0SKIP**，13宿主动态＋1完整源保护，0重跑。父逐核新467准确载荷全集合/hash/大小及14唯一ID JSON/JUnit顺序，旧419＋446和原失败保持。R02原四真实saveUserEntry支路全部通过，末支路REV0→2（自身reveal＋真实候选保存各1），feedback/state0、pending保留、不假报判答；C09完整原函数含末尾幂等断言确实执行通过，真实CONFLICT提示恢复。S01九有限控制含最终拒绝回滚/无publish、真正admit前后关闭边界、旧同反馈只读分类，不另累计为23项。

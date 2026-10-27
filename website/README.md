@@ -13,6 +13,25 @@
 
 入口按顺序先加载 `content.js`，再加载 `app.js`。修改文案时只改 `content.js` 中对应字段，不把事实写死在 HTML 或 JS 里。
 
+## Logo当前状态（2026-10-28）
+
+用户批准原设计，未重画、未改色；2026-10-26 Logo 验收 17 PASS/1 ERROR 及失败断言原样保留，不并入本轮，不累计旧 18/18。
+
+- 新独立实际 gpt-6.1-sol/high 的全部 5 个真实 turn_context 已由父侧核对，分三个互不相加批次：L01–L03 圆形与当前包补验 3 PASS，P01–P05 私有替身部署准备 5 PASS，H01–H06 真实 HTTP 6 PASS，均 0 FAIL/ERROR/SKIP；不得相加宣称 14 项全站或全软件通过。
+- 官方 Netcatty 真实单次仅替换香港 H2 `/srv/shici-website/www` 的 `index.html`、`styles.css`，旧备份保留在私有 700 stage 内、文件 600；`app.js`、`content.js`、nginx 配置、当前 443 服务身份及 unit/config/binary 三 hash 未变；无 nginx reload、改防火墙/DNS、装包、H1/H5 动作；0 新 APK/模型/词库公开，`publicRelease`/`repositoryUrl` 仍为 `null`。
+- 真实五 URL 的 GET/HEAD 共 10 个响应全部 200，hash/字节数/MIME 一致且显式 UTF-8，HEAD 空体；两条私有路径 404；一次 360px 真实浏览器检查中页头、页脚 Logo 可见，无横向溢出、无外站请求。该结论仅覆盖当前线路 HTTP/IP 与 360px，不承诺国内各网络、HTTPS、OEM Launcher 或真机。
+- Android 候选包 Launcher 已含同源 Logo，圆形当前包引用补验通过；电脑内部 2.5.0/50，平板仍 2.4.2/49，本批 0 安装、0 设备连接；不能把官网替换说成平板已更新，本轮不正式发布。
+
+以下保留 2026-10-26 本地候选历史原文。
+
+## Logo 品牌接入（2026-10-26 本地候选，未上线）
+
+本轮把用户确认的墨绿米白“托起 a 词卡、右侧四指合拢、两道动势线”Logo 接入本地候选。唯一设计源是私有证据目录中的 `approved-logo.png`（1254×1254，SHA-256 `feb77c74558190d5eba97a2dd7116fe4df15707469d71e523012b90a2bf59223`），只做确定性缩放与 PNG 编码，不重画、不改色、不拆开手指或动势线。
+
+- 页头和页脚品牌共用 `styles.css` 中同一个 `--brand-logo` 内嵌 `data:image/png;base64` 背景（96×96 PNG，10521 bytes），`index.html` 的 favicon 内嵌另一个 64×64 PNG data URI（5533 bytes）；两者 MIME 均为 `image/png`，不新增 URL、不发起额外网络请求。
+- 品牌链接原有 `aria-label` 和可见“拾词”文字保留，装饰用的 `brand-mark` span 仍为 `aria-hidden`，图片不会被重复朗读；移动端沿用原 38px / 34px 尺寸，不改变导航换行。
+- `app.js`、`content.js`、下载配置（仍为 `null`）、`nginx.conf`、`install.sh` 和四静态边界未改。该段只说明本地候选已接入，不代表已部署、已通过真实 HTTP 或真机验收；线上更新以父侧统一验收和 Netcatty 流程为准，语法结果见私有交付记录。
+
 ## 本地预览
 
 本地预览只服务 `website` 目录，并只绑定回环地址 `127.0.0.1`。在开发仓库根目录运行：
