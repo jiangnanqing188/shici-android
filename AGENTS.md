@@ -1,5 +1,39 @@
 # 项目协作规则
 
+**2026-10-28 23:18 准确收尾补记：** 指定链根README-only完整success/end_turn/exit0、0Bash，已前置已验事实、原正文逐字节保持。父核最终188中非README187准确等source03，未因文案重编译或功能重测。最终只9路径（3产品代码＋README＋5治理）进入本地提交与后续授权非强推；原四草稿content/index及815B原件未夹带。旧失败与三静态风险仍保留；平板2.4.2/49、0安装。具体提交/远端一致结果以私有parent-final-commit-push.json和本轮最终回复为准，不为回填自身哈希再造提交。
+
+## 2026-10-28 23:15 保存与PDF本批有限逻辑闭环，准确Git收尾中
+
+指定Claude Code→Magpie→CommandCode DSF请求max（实际普通Flash1017）完整实现及两轮最小补齐；最终source03准确188，三目标34.861s/exit0，内部仍2.5.0/50。三个原问题在约定宿主/真实SQLite与文本范围闭环：详情只提交实际编辑字段、同字段冲突保草稿；关闭/stop/销毁在最终准入前拒写、已准入后原子完成；Repository独立最终原credential复查；PDF自补词走PersonalDictionary诚实来源。未改schema/原词库/默认20/ReviewChoices/翻译或网站。
+
+独立实际Sol/high按来源保原结果：原整体18为15PASS/3FAIL；修正首21为19PASS/2FAIL（G03受控API契约＋O01夹具）；R2新12为11PASS/1FAIL（R06夹具）。G03及O01有新控制通过，R06另新S01唯一1PASS/0FAIL/ERROR/SKIP，一次运行/0重跑且七子控制完整BEGIN/END、五事务ROLLBACK/两早拒SQL空；严格SQLhelper原字节保持，只有保存SQL在取证读取前冻结的观察窗口纠正，原有效强断言/尾部未删。原失败不倒填、不将各域次数累加成旧全集全绿。父核两测试者全部2及4真实context均Sol/high，192/183/170精确载荷、140/173/173输入锁、各25当前原块映射及ID JSON/JUnit顺序；测试者均完整结束关闭。
+
+本轮不等于原生Android/平板/全软件验收，触控/IME/OCR/动画/实际PDF成品/Google模型下载/功耗未验。R01快照失败去重、R02撤销关闭、R03原词库坏asset个人fallback仍仅审源风险，不宣称已修。四草稿原content/index、815B原件/原80/旧证据保持；0设备/用户实库/服务器/安装/部署。指定链仅根README最终事实补记进行，不改其它187源、不重编译功能重测；验后准确4产品＋5治理本地提交并非强推现private源码origin/codex/android-mvp，用户明确授权已收。具体commit/push以Git和私有parent-final-commit-push回执为准，不提前称已推送。
+
+## 2026-10-28 22:44 R2原凭据最终复查已交齐，仅受影响补验中
+
+首21项原始19PASS/2FAIL保持；原因19通过/1受控Repository契约失败G03/1夹具误断言O01，不倒填。G03当前UI live同场景G02已通过，父裁决Repository独立API也需保护原credential；指定DSF请求max实际普通Flash1017仅Repository/README两路径完整补齐，final canCommit/admit后UPDATE前复查原key/原凭据，0重新capture。source03/188与root相等、其它186等source02；一次离线三目标34.861s/exit0/APK SHA256 2da6b7c3f879dd72724879c2fd3e8e91c5d79fd9cc30119eca8d1f29e7dbfbf5。执行者3次Bash尝试：一额外只读Git形式权限拒、精确只读基线成功、批准编译成功；无执行者功能测试/Git写。
+
+新独立测试者01a182f6-97a9-7740-939a-52ec598d1cfa首真实context父核实际Sol/high后GO，最多12受影响有限控制，保原O01原FAIL并在新域准确SQL观察/执行原未达末尾，非重跑21全集。当前尚无结果，不预报修好/已提交/已推；原192/原140预锁与208旧载荷、旧845+165、四草稿index/815B保持。开始官方host五小时余51%/周91%，不切号/重置/改路由。内部2.5.0/50、平板仍2.4.2/49，0新设备/服务器/安装/部署。
+
+## 2026-10-28 22:04 保存/PDF修正source02完整交回，独立统一有限验收中
+
+指定CommandCode DSF请求max实际普通Flash1017两次完整success/end_turn/exit0；首次source01编译通过但父静态退回最终准入顺序/旧回调门禁，未提前跑功能测试。R1只MainActivity/Repository/README三路径变化，LearningExport及其余185保持；当前准确188源等source02，离线三目标40.069s/exit0/APK SHA256 056f055c0f6cfafab5d687880181abec765a78c4e43d4ecd062112fa5bf76cb7。R1实际Bash仅只读Git＋批准编译2次；原首交4次尝试/自报差异保留，不倒改。
+
+字段patch/同字段冲突保草稿、事务内相关读后UPDATE前真正owner准入、所有保存结果按原owner/epoch投递及PDF PersonalDictionary来源均已实现/语法通过，尚不自证运行正确。父核原四草稿content/index/815B及184无关源保持，新独立测试者01a182d1-db45-78b0-8a70-1be72386fbf6首真实context父核实际Sol/high后GO；最多24受影响有界控制，不跑旧全集，当前尚无结果。开始官方当前host余65%/周93%，不双号汇总、不刷新切号；本批0平板/服务器/下载/部署/推送。完整验收后才父准确本地提交并推当前private源码origin分支，不改可见性。
+
+## 2026-10-28 21:34 整体追踪已收件，用户新授权先修Bug后准确提交并推送
+
+整体检查唯一实际Sol/high测试者已完整结束关闭，父核全部1真实turn_context、208准确载荷、18唯一ID与JSON/JUnit顺序及188源/四草稿原index/815B原件保持。唯一run01为15PASS/3FAIL/0ERROR/0SKIP：W12旧详情双字段保存覆盖新笔记、W11关闭在准入前的排队保存仍写、W18自补词PDF来源误标。九主链审查加有界宿主/SQLite，不是全60文件逐行/原生Android全验；另3静态风险未确证，原失败不抹，不跑旧全集。
+
+用户随后明确“先修bug，之后再做”，并补充远端也要推送、Claude Code同守Git。本批只相关详情保存两问题及PDF来源文本，指定Claude Code→Magpie→Command Code DSF请求max；先核Git、只4允许产品路径，执行者只语法。F01统一既有owner规则：准入前关闭/stop/销毁拒写，准入后原子完成；F02按字段旧值冲突/未改字段不覆盖，保草稿；F03仅诚实来源分派。旧updateWord调用兼容、schema/默认20/词库/AI命名/网站/设备不动。完整交回与语法后新实际Sol/high统一有限复验，再父准确本地提交并非强推origin/codex/android-mvp；不夹原四草稿、815B原件或私有证据。当前修正尚未派发/完成，恢复入口私有20261028-whole-logic-audit/fix-01；开始host官方五小时余76%/周95%，非双号汇总，不刷新/切号/改路由。
+
+## 2026-10-28 20:38 用户授权整体逻辑检查与代码追踪，仅审查不产品修正
+
+用户明确分一个实际gpt-6.1-sol/high整体查Bug并追踪代码。本次基线codex/android-mvp/5f16053、内部2.5.0/50，根188与上一最终manifest逐hash/bytes保持，60产品Kotlin约957KB；原四草稿内容/index及815B原件冻结。当前host官方ordinaryUsageAllowed=true，五小时余100%/周99%，非两账号汇总；未刷新/切号/改路由。父新独立代理首真实turn_context直接核gpt-6.1-sol/high后GO，唯一测试者负责九条主调用链和最多24个新有价值定点动态控制，不重跑原80/34/28/14/184等旧全集，不凭历史通过说本轮通过。
+
+本轮只读产品，私有20261028-whole-logic-audit/assessment独占新报告/测试；不派产品执行AI、不修改产品/配置/README/原测试或旧证据，不连设备/用户实库/服务器/翻译网络、不安装/部署/推送。需精确根文件行号/回调guard/数据出口追踪矩阵，确认Bug与疑点分栏、失败原证据保留、整批修正建议交父再决策。未接开源LLM/自有站包及AI命名待清理是已知欠账，不冒充新运行Bug。当前审查已启动，尚未交结果，不预报通过或发现数量。恢复入口baseline、audit-task与parent-model-start-receipt，具体最终模型/源保护/收件以本日工作记录和后续回执为准。
+
 ## 2026-10-28 本批完整闭环收尾；AI命名清理仅追踪并待派发
 
 Logo已准确本地提交bcfb4a6（18产品＋5治理），官网仅index/styles已替换并保旧备份；新圆形补验3PASS、部署准备5PASS、真实HTTP6PASS分域统计，原17PASS/1ERROR保持。父核全部5实际Sol/high上下文及L56/P416含111链接/H129准确载荷。无nginxreload/443变更/新设备安装/推送。

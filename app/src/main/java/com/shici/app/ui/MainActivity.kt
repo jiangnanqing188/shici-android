@@ -28,6 +28,7 @@ import com.shici.app.data.PreparedUndo
 import com.shici.app.data.RestoreOutcome
 import com.shici.app.data.RevokeOutcome
 import com.shici.app.data.UndoPrepareOutcome
+import com.shici.app.data.WordDetailSaveOutcome
 import com.shici.app.export.PdfExporter
 import com.shici.app.export.LostPdfFileCleanup
 import java.io.ByteArrayOutputStream
@@ -1834,9 +1835,16 @@ class MainActivity : Activity() {
                 val formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")
                 fun date(time: Long) = Instant.ofEpochMilli(time).atZone(ZoneId.systemDefault()).format(formatter)
                 dates.text = "首次查询：${date(word.firstAt)}\n最近查询：${date(word.lastAt)}"
-                if (note.text.toString() == savedNote && savedNote != word.note) note.setText(word.note)
-                if (mastery.isChecked == savedMastered) mastery.isChecked = word.mastered
-                savedNote = word.note; savedMastered = word.mastered
+                // Refresh only controls without an unsaved edit. A field the user is editing keeps
+                // both its text and its baseline: the click-time expected-old value must stay the
+                // value that edit was based on, so a newer row is a real conflict instead of being
+                // silently merged under the draft.
+                val noteEdited = note.text.toString() != savedNote
+                val masteryEdited = mastery.isChecked != savedMastered
+                if (!noteEdited && savedNote != word.note) note.setText(word.note)
+                if (!masteryEdited) mastery.isChecked = word.mastered
+                if (!noteEdited) savedNote = word.note
+                if (!masteryEdited) savedMastered = word.mastered
                 savedFavorite = word.favorite
                 renderStar()
             }
@@ -1870,6 +1878,20 @@ class MainActivity : Activity() {
         }
         fun masteredValue() = mastery.isChecked
         fun noteValue() = note.text.toString()
+        /** Last saved value this binding observed; frozen with [masteredValue]/[noteValue] at click. */
+        fun baselineMastered() = savedMastered
+        /** Last saved note this binding observed; frozen with the target at the save click. */
+        fun baselineNote() = savedNote
+        /**
+         * Advances only the baselines of fields this click submitted after a committed or idempotent
+         * save. Unedited fields pass null and keep their previous baseline, and the controls are not
+         * touched, so a following edit compares against the database's new value instead of the
+         * pre-save baseline (which would otherwise look like a false conflict).
+         */
+        fun acceptSavedFields(mastered: Boolean? = null, note: String? = null) {
+            if (mastered != null) savedMastered = mastered
+            if (note != null) savedNote = note
+        }
 
         private fun renderStar() {
             star.text = if (savedFavorite) "★ 已收藏（点击取消）" else "☆ 收藏"
@@ -1979,11 +2001,15 @@ class MainActivity : Activity() {
         return binding
     }
     /**
-     * Owner check for a star commit. It is evaluated on the worker thread immediately before BEGIN
-     * (through both [StudyAdmission] and `canCommit`), so a detail closed by navigation/stop, or a
-     * word deleted/restored after the click, can never write. Nothing here re-captures a credential.
+     * Owner check for a detail mutation (save or star). It is evaluated on the worker thread at that
+     * mutation's admission point through both [StudyAdmission] and `canCommit`: before BEGIN for the
+     * star path, and for the detail save inside the transaction after the current-row read and
+     * conflict decision but before its business UPDATE. A detail closed by navigation/stop, a replaced
+     * detail binding, or a word deleted/restored after the click can therefore never write. The same
+     * check is also used as a cheap pre-transaction rejection, which is not the final admission.
+     * Nothing here re-captures a credential; the binding's original key/credential are used.
      */
-    private fun favoriteOwnerLive(binding: WordDetailBinding, epoch: Long): Boolean =
+    private fun detailOwnerLive(binding: WordDetailBinding, epoch: Long): Boolean =
         foreground && epoch == interactionEpoch && !isFinishing && !isDestroyed &&
             binding.ownerAlive() && !binding.isStale() &&
             (inlineDetail === binding || dialogDetail === binding)
@@ -2004,7 +2030,7 @@ class MainActivity : Activity() {
         val key = binding.key
         val credential = binding.deletionCredential
         val target = !binding.favoriteValue()
-        val live = { favoriteOwnerLive(binding, epoch) }
+        val live = { detailOwnerLive(binding, epoch) }
         val admission = StudyAdmission(live)
         binding.beginFavoriteBusy()
         app.worker.execute {
@@ -2081,29 +2107,94 @@ class MainActivity : Activity() {
 
     private fun saveDetail(binding: WordDetailBinding, word: LearnedWord, close: (() -> Unit)?) {
         if (binding.isBusy() || detailBusy) return
+        if (binding.isStale()) {
+            binding.invalidate()
+            toast("该词已删除或数据已恢复，请刷新后重新打开详情再操作")
+            return
+        }
+        // Freeze exactly what this click saw: the binding's last saved baseline and the control
+        // targets. Neither is re-read on the worker, so an old constructor snapshot can never be
+        // mistaken for a newer baseline.
+        val epoch = interactionEpoch
+        val key = binding.key
+        val credential = binding.deletionCredential
+        val baselineMastered = binding.baselineMastered()
+        val baselineNote = binding.baselineNote()
         val marked = binding.masteredValue()
         val noteText = binding.noteValue()
+        val editedMastered = marked != baselineMastered
+        val editedNote = noteText != baselineNote
+        val live = { detailOwnerLive(binding, epoch) }
+        val admission = StudyAdmission(live)
         detailBusy = true
         binding.beginBusy()
         app.worker.execute {
             val result = runCatching {
-                app.repository.updateWord(word.entry.key, marked, noteText, binding.deletionCredential)
+                app.repository.saveWordDetail(
+                    key = key, mastered = marked, note = noteText,
+                    baselineMastered = baselineMastered, baselineNote = baselineNote,
+                    deletionCredential = credential, admission = admission, canCommit = live
+                )
             }
             main.post {
                 if (isDestroyed) return@post
+                // This operation's own busy state is released even when its owner was retired while
+                // the worker ran; otherwise the shared flag and the old controls would stay locked.
+                // Detail mutations are serialized by detailBusy on the main thread, so this release
+                // cannot clear a newer operation, and it only refreshes bindings that are still open.
                 detailBusy = false
                 binding.endBusy()
                 releaseDetailBusy()
+                // Every user-visible consequence of this save (toast, accepting the new baseline,
+                // closing the detail) belongs only to the original live owner/epoch that started it.
+                // A closed or replaced detail must not talk into a newer page, adopt a stale
+                // baseline or dismiss a newer window. The shared busy release above still happens.
+                val stillCurrent = inlineDetail === binding || dialogDetail === binding
+                val originalOwnerLive = stillCurrent && !binding.isClosed() && !binding.isInvalidated() &&
+                    foreground && epoch == interactionEpoch && !isFinishing
                 val error = result.exceptionOrNull()
                 // Re-check the original deletion credential: a deletion may have committed between the
-                // worker result and this callback, so a late true must not be shown as saved nor re-enable old actions.
-                val stale = app.repository.deletions.isStale(word.entry.key, binding.deletionCredential)
+                // worker result and this callback, so a late save must not be shown as current nor
+                // re-enable old actions.
+                val stale = app.repository.deletions.isStale(key, credential)
                 when {
                     // Deletion wins over a late failure: never re-enable old actions on an invalidated word.
-                    stale -> { binding.invalidate(); toast("未保存：该词已删除") }
-                    error != null -> toast("保存失败：${error.message}")
-                    result.getOrNull() == true -> { toast("已保存"); close?.invoke() }
-                    else -> { binding.invalidate(); toast("未保存：该词已删除") }
+                    stale -> {
+                        binding.invalidate()
+                        // The old-word notice is still a save result: only the live original owner
+                        // may see it, never a page that replaced this detail.
+                        if (originalOwnerLive) toast("未保存：该词已删除")
+                    }
+                    error != null -> if (originalOwnerLive) toast("保存失败：${error.message}")
+                    else -> when (result.getOrNull()) {
+                        WordDetailSaveOutcome.SAVED -> if (originalOwnerLive) {
+                            binding.acceptSavedFields(
+                                mastered = if (editedMastered) marked else null,
+                                note = if (editedNote) noteText else null
+                            )
+                            toast("已保存"); close?.invoke()
+                        }
+                        WordDetailSaveOutcome.UNCHANGED -> if (originalOwnerLive) {
+                            // An idempotent save already has these targets in the database; keep the
+                            // binding baseline with the truth so the next edit is not a false conflict.
+                            binding.acceptSavedFields(
+                                mastered = if (editedMastered) marked else null,
+                                note = if (editedNote) noteText else null
+                            )
+                            toast("未修改，无需重复保存")
+                        }
+                        // Honest conflict: nothing was written, the user's draft stays in the field and
+                        // the detail stays open so it can be re-read before another save.
+                        WordDetailSaveOutcome.CONFLICT ->
+                            if (originalOwnerLive) toast("内容已更新，请重新查看后再保存")
+                        // Owner retired before admission: nothing was written; a closed/replaced
+                        // detail must not show an old success or touch a newer window.
+                        WordDetailSaveOutcome.REJECTED -> Unit
+                        WordDetailSaveOutcome.STALE, null -> {
+                            binding.invalidate()
+                            if (originalOwnerLive) toast("未保存：该词已删除")
+                        }
+                    }
                 }
             }
         }

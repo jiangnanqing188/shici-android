@@ -1,5 +1,22 @@
 # 拾词 · Android 演示原型
 
+## 当前事实补记（2026-10-28，README-only 收尾）
+- **范围与版本：** 本批只涉及 `MainActivity.kt`、`LearningRepository.kt`、`LearningExport.kt` 三个产品路径与本 README，非其它功能；内部仍 `2.5.0`/`50`，平板最后记录 `2.4.2`/`49`，本批 `0` 安装，不是正式发布。
+- **字段与准入：** 详情保存只写实际编辑字段，未编辑字段的新数据不被旧快照覆盖，同字段出现第三种值时不写并保留草稿；关闭/`stop`/销毁在最终准入前拒写，已准入事务原子完成；Repository 在最终 `UPDATE` 前按原 key/credential 复查，`0` 次重新 capture；PDF 用户自补词来源如实标注。
+- **构建事实：** 最终 `source03`/`188` 文件离线三目标编译 `34.861` 秒、exit 0，主 APK SHA256 `2da6b7c3f879dd72724879c2fd3e8e91c5d79fd9cc30119eca8d1f29e7dbfbf5`；本次 README-only 收尾后非 README 的 `187` 文件保持，不因文案重编译或重测功能。
+- **分域验收原始口径（实际 `gpt-6.1-sol`/`high`，父已核真实上下文）：** 原 audit 18 项 **15 PASS / 3 FAIL** 保持；修正后首轮 21 项原始 **19 PASS / 2 FAIL**（G03 受控 API 契约、O01 夹具）保持；R2 新 12 项原始 **11 PASS / 1 FAIL**（R06 夹具）保持；G03/O01 另由新控制通过，R06 另由新 S01 **1 PASS** 完整 7 子控制补证，严格 helper 与强断言保全。旧失败不倒填，各域次数不相加，不称旧全集全绿。
+- **父综合边界：** 仅本批宿主、真实 SQLite 与文本范围闭环；原生触控/IME/OCR/真机及整个软件仍未验。
+- **保护：** 原始词库、原 80 测试、默认 `20`、schema、原四草稿、`815B` 原件与用户学习数据保持；`0` 设备/服务器/安装/部署。
+- **后续与不变项：** Git“本批验后准确提交并推当前 private 源码分支”是父下一步，当前不称已提交/已推；本执行者只有只读 Git 基线核对，无 Git 写。未改可见 AI 命名、翻译链或网站。
+
+## 本批有界修正（2026-10-28）：F01/F02/F03，仅编译、逻辑待独立验收
+- **范围与状态：** 只改 `app/src/main/java/com/shici/app/ui/MainActivity.kt`、`app/src/main/java/com/shici/app/data/LearningRepository.kt`、`app/src/main/java/com/shici/app/core/LearningExport.kt` 与本 README；未加功能，未改 schema、数据模型、AI 命名、翻译、复习默认/调度、`ReviewChoices`、收藏/删除恢复语义、原始词库、网站/Logo、版本或原测试。内部仍 `2.5.0`/`50`；未安装、未连接设备、未写用户实库；未下载或上传任何产品、词库、模型或用户数据（执行链自身具备网络能力，故这里只陈述产品侧无下载/上传，不笼统声称“无网络”）；Git 仅按父指定命令做过一次只读基线核对，无任何 Git 写入。本轮 R1 只修 `MainActivity.kt`、`LearningRepository.kt` 与本 README 三处，`LearningExport.kt` 及其余准确基线源保持原字节。
+- **F02 详情字段安全（实现，未做逻辑验收）：** 一次详情保存只提交用户真正编辑的 `mastered`/`note` 字段，并在点击时冻结该控件看到的原保存基线与目标；仓库在同一事务内按字段读取当前值并判断冲突/幂等，owner 的最终 `canCommit`+`StudyAdmission` 准入也在该事务内、上述读取与判断之后、实际业务 `UPDATE` 之前执行；读取期间关闭/离页/销毁则拒绝且不写、不发布，准入后事务原子完成。编辑字段已被更新为目标值时幂等成功且不增加 revision；仍是原基线时安全写入；出现第三种值时不写任何字段、保留草稿并提示重新查看，不静默覆盖。未编辑字段不参与写，因此不会被旧详情擦掉他人新笔记。原公开 `updateWord` 的 3/4 参 Boolean 行为、抛错语义和旧调用保持。
+- **F01 关闭与最终准入（实现，未做逻辑验收）：** 详情保存复用现有 Activity foreground/`interactionEpoch`/binding 身份与 `StudyAdmission`；最终准入位于事务内当前字段读取与冲突判断之后、业务 `UPDATE` 之前，关闭、离页、`onStop`/`onDestroy`、原 binding 被替换在最终准入前发生则拒写且不发布，准入后允许事务原子完成。回调按保存/无变化/冲突/拒绝/已删除分类；toast、接受新基线与关窗只作用于仍活的原 owner/原 epoch，原 owner 已退役时仍释放其自身 busy 与共享 busy，但不向替换页发旧提示、不关新窗，也不把当前控件永久锁死。
+- **F03 PDF 来源（实现，未做逻辑验收）：** PDF 复习行与自测答案改用 `PersonalDictionary.provenance`，用户自补词显示“仅保存在本机/未联网生成”等既有来源说明；导出总说明对用户-only、原 raw-only、demo-only、已知混合与未知历史来源分别诚实标注，原 raw“未逐条核对”声明保留，词义/来源版本/笔记不丢失，未改 PDF 版式。
+- **验证边界：** 本批未运行任何逻辑、单元、仪器、功能或真机测试；只按父指定脚本做离线三编译（`assembleDebug`、`compileDebugUnitTestKotlin`、`assembleDebugAndroidTest`，不运行测试）。当前状态仍是**仅编译待验**：R1 全部改动完成后才执行离线三编译，逻辑与功能仍待独立验收，不预报通过；初始实施回执见 `.tools/validation/20261028-whole-logic-audit/fix-01/delivery-summary.md`（该历史原文保持，不改写），R1 修正后的实际命令、Bash 次数、退出码与回执见同目录 `delivery-r1.md`。编译通过只代表语法可编译，**不表示新逻辑已验收或可发布**；W11/W12/W18 原 FAIL 与旧证据保持原义，不倒填。
+- **R2 收尾：`saveWordDetail` 原凭据最终保护（实现，仅语法待有限补验）：** R2 只另改 `app/src/main/java/com/shici/app/data/LearningRepository.kt` 与本 README。`saveWordDetail` 在同一事务内完成当前字段读取及冲突/幂等判断，并在最终 `canCommit`+`StudyAdmission` 准入之后、实际业务 `UPDATE` 之前，用该次调用的原 `key` 与原 `deletionCredential` 再检查 `deletions.isStale`；若原删除/恢复代次已失效（包括获取 `writableDatabase` 期间的受控重入已真实删除重收或完整恢复），返回 `STALE`，零业务写、零发布，且不重新 `capture()` 新凭据。原 owner 准入顺序、逐字段 CAS/冲突/草稿保留/幂等、`updateWord` 行为与 schema 均不变。R2 只做离线三目标语法编译，接口逻辑与功能待后续有限复验；本段不预报通过数，原验收报告、原 FAIL 与历史正文保持原样，实际命令、退出码与回执见同目录 `delivery-r2.md`。
+
 ## 当前验收补记（2026-10-28）
 - **补记边界：** 本节只追加验收事实；下文全部旧正文（含“仅语法可编译／逻辑待独立 Sol 验收”等表述）是实施交回当时的原文，逐字节保留为历史，不倒填、不改写。本轮由指定 CommandCode DSF/request max 会话实际普通 Flash 1017 执行，完整修正 `ReviewChoices.kt` 及本 README；未改词库、用户补词原文、默认 `20`、到期调度、Repository 或 schema。内部仍 `2.5.0`/`50`，平板 `2.4.2`/`49`，本批 `0` 安装、`0` 设备连接。
 - **源码与编译：** 准确 `quality-source-final01`/`188` 文件中非 README 的 `187` 个与已语法通过的 `quality-source-02` 相等；离线三目标 `35.427` 秒、exit 0，主 APK SHA256 `e15901495d9f971a1ead290150a1d0fa0feabfbcf948b0df5fd1f92e00c0d9d9`；首次编译失败记录保留。

@@ -18,6 +18,15 @@ import java.util.UUID
 enum class RevokeOutcome { REVOKED, NONE, STALE }
 enum class DeleteOutcome { DELETED, NOT_FOUND, STALE, REJECTED }
 
+/**
+ * Outcome of one field-aware personal-detail save. [SAVED] means at least one field the user really
+ * edited was written and published; [UNCHANGED] means no edited field needed a write (nothing was
+ * edited, or the stored value already equals the requested target); [CONFLICT] means an edited field
+ * changed since the click-time baseline and nothing was written; [STALE] means the word or its
+ * deletion credential is no longer current; [REJECTED] means an owner check refused before BEGIN.
+ */
+enum class WordDetailSaveOutcome { SAVED, UNCHANGED, CONFLICT, STALE, REJECTED }
+
 /** Result of preparing the exact event shown by the "仅撤销最近一次有效查询" flow. */
 enum class UndoPrepareOutcome {
     /** A fixed event identity was read; pass [UndoPreparation.prepared] to `commitUndo`. */
@@ -339,6 +348,107 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
         }
         return true
     }
+
+    /**
+     * Saves only the personal fields the user actually edited in one open detail.
+     *
+     * [baselineMastered]/[baselineNote] are the last saved row values observed at the click, and
+     * [mastered]/[note] are the control targets frozen at that same click. A field whose target
+     * equals its baseline is not submitted at all, so an untouched field can never overwrite a newer
+     * value (for example a note committed by another detail). For every edited field the current row
+     * is read and compared inside the same transaction as the write: a value already equal to the
+     * target is an idempotent success with no revision, a value different from both the baseline and
+     * the target is a [WordDetailSaveOutcome.CONFLICT] and nothing is written, and only a value still
+     * equal to the baseline is replaced. The checks are per key and per field, so unrelated words,
+     * favorite changes and query-count changes never reject this save.
+     *
+     * [deletionCredential] is the detail's original credential and is never re-captured; a credential
+     * that is already stale at entry returns [WordDetailSaveOutcome.STALE] without a transaction.
+     * The same original credential is checked again inside the transaction, after the final owner
+     * admission and immediately before the business UPDATE, so a delete/re-collect or full restore
+     * that committed while `writableDatabase` was being acquired also returns
+     * [WordDetailSaveOutcome.STALE] with no business write and no publish.
+     *
+     * Owner liveness is enforced at two points. The pre-transaction [canCommit]/[isActive] read is
+     * only a cheap early rejection for an owner that is already gone. The authoritative final
+     * admission — [canCommit] plus [StudyAdmission.admit] — runs inside the transaction, after the
+     * current-row read and the conflict/idempotence decision. The original-credential re-check runs
+     * after that final admission and immediately before the business UPDATE. A detail
+     * closed/stopped/replaced while those reads were in progress therefore writes nothing and
+     * publishes nothing; once admitted and still on the original credential, the transaction finishes
+     * atomically.
+     */
+    fun saveWordDetail(key: String, mastered: Boolean, note: String,
+                       baselineMastered: Boolean, baselineNote: String,
+                       deletionCredential: Long,
+                       admission: StudyAdmission? = null,
+                       canCommit: () -> Boolean = { true }): WordDetailSaveOutcome {
+        // A late detail save must never edit a word that was deleted after this detail was opened.
+        if (deletions.isStale(key, deletionCredential)) return WordDetailSaveOutcome.STALE
+        val editMastered = mastered != baselineMastered
+        val editNote = note != baselineNote
+        // Nothing the user edited: never touch (or conflict-check) an untouched field.
+        if (!editMastered && !editNote) return WordDetailSaveOutcome.UNCHANGED
+        val db = writableDatabase
+        check(!db.inTransaction()) { "学习变更不能嵌套在未提交事务中" }
+        // Cheap early rejection only, not the admission point: the owner may still retire while the
+        // transaction below reads, so the final check is repeated immediately before the UPDATE.
+        if (!canCommit() || admission?.isActive == false) return WordDetailSaveOutcome.REJECTED
+        var outcome: WordDetailSaveOutcome
+        db.beginTransaction()
+        try {
+            val current = wordPersonalFields(db, key)
+            if (current == null) {
+                outcome = WordDetailSaveOutcome.STALE
+            } else {
+                val masteredConflict = editMastered &&
+                    current.mastered != baselineMastered && current.mastered != mastered
+                val noteConflict = editNote &&
+                    current.note != baselineNote && current.note != note
+                outcome = if (masteredConflict || noteConflict) {
+                    // Never silently replace a value this click did not see; the caller keeps the draft.
+                    WordDetailSaveOutcome.CONFLICT
+                } else {
+                    val writeMastered = editMastered && current.mastered != mastered
+                    val writeNote = editNote && current.note != note
+                    if (!writeMastered && !writeNote) {
+                        WordDetailSaveOutcome.UNCHANGED
+                    } else if (!canCommit() || !admit(admission)) {
+                        // Final admission after every read needed to decide this write and before
+                        // any business UPDATE: a retired owner writes and publishes nothing.
+                        WordDetailSaveOutcome.REJECTED
+                    } else if (deletions.isStale(key, deletionCredential)) {
+                        // Re-check the detail's original credential after the final external gate
+                        // and immediately before the business UPDATE. A real delete/re-collect or
+                        // full restore that committed while writableDatabase was acquired must not
+                        // be overwritten by this old detail; the credential is never re-captured.
+                        WordDetailSaveOutcome.STALE
+                    } else {
+                        val values = ContentValues()
+                        if (writeMastered) values.put("mastered", if (mastered) 1 else 0)
+                        if (writeNote) values.put("note", note)
+                        val affected = db.update("words", values, "entry_key=?", arrayOf(key))
+                        // A row that disappeared between the in-transaction read and this UPDATE is
+                        // not a success; report it stale so the UI freezes the old detail.
+                        if (affected > 0) WordDetailSaveOutcome.SAVED else WordDetailSaveOutcome.STALE
+                    }
+                }
+            }
+            // A final-admission rejection never marks the transaction successful; nothing was
+            // written, nothing is published, and the original detail state is left untouched.
+            if (outcome != WordDetailSaveOutcome.REJECTED) db.setTransactionSuccessful()
+        } finally { db.endTransaction() }
+        if (outcome == WordDetailSaveOutcome.SAVED) changes.publishCommitted()
+        return outcome
+    }
+
+    /** The only two personal fields a detail save may touch; read inside that save's transaction. */
+    private data class WordPersonalFields(val mastered: Boolean, val note: String)
+
+    private fun wordPersonalFields(db: SQLiteDatabase, key: String): WordPersonalFields? =
+        db.rawQuery("SELECT mastered, note FROM words WHERE entry_key=?", arrayOf(key)).use { c ->
+            if (c.moveToFirst()) WordPersonalFields(c.int("mastered") == 1, c.text("note")) else null
+        }
 
     // ---- Personal vocabulary favourites (生词收藏星标) -------------------------------------------
 

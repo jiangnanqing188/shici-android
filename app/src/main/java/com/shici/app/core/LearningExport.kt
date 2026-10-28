@@ -184,7 +184,9 @@ object LearningExportText {
         "${index + 1}. ${word.entry.headword}  ${word.entry.partOfSpeech}\n" +
             "原词形：${word.lastForm} · 查询 ${word.queryCount} 次 · ${if (word.mastered) "已掌握" else "待复习"}\n" +
             word.entry.meaning + (if (word.note.isBlank()) "" else "\n笔记：${word.note}") +
-            "\n${RawKajwebDictionary.provenance(word.source, word.version)}"
+            // Route every row through the same source classification as the detail: the user-only
+            // source keeps its local/offline statement, while raw/demo/unknown labels are unchanged.
+            "\n${PersonalDictionary.provenance(word.source, word.version)}"
 
     /**
      * Self-test prompt: number, English headword and part of speech only. It intentionally omits the
@@ -197,9 +199,31 @@ object LearningExportText {
     /** Answer-page entry: same number and order, with the complete row (nothing truncated). */
     fun answer(index: Int, word: LearnedWord): String = row(index, word)
 
-    fun notice(words: List<LearnedWord>): String = when {
-        words.any { it.source == RawKajwebDictionary.SOURCE } -> "原始词库未逐条核对；历史记录按各自来源标注"
-        words.all { it.source == DemoDictionary.SOURCE && it.version == DemoDictionary.VERSION } -> "自编演示数据，仅用于原型流程验证"
-        else -> "历史词源核对状态未确认；按各自来源版本标注"
+    /**
+     * Export-level source notice. The raw declaration is retained whenever a raw row is present;
+     * otherwise an all-demo or all-user export names its known source honestly instead of calling it
+     * an unknown historical source. A mix of the two known local/demo sources is also named as such.
+     * Any genuinely unknown historical source keeps the explicit "not confirmed" wording.
+     */
+    fun notice(words: List<LearnedWord>): String {
+        val allDemo = words.isNotEmpty() && words.all {
+            it.source == DemoDictionary.SOURCE && it.version == DemoDictionary.VERSION
+        }
+        val allUser = words.isNotEmpty() && words.all {
+            it.source == PersonalDictionary.SOURCE && it.version == PersonalDictionary.VERSION
+        }
+        val allKnown = words.isNotEmpty() && words.all { it.knownExportSource() }
+        return when {
+            words.any { it.source == RawKajwebDictionary.SOURCE } ->
+                "原始词库未逐条核对；历史记录按各自来源标注"
+            allDemo -> "自编演示数据，仅用于原型流程验证"
+            allUser -> "用户补充（仅保存在本机）；未联网、未自动生成或核验"
+            allKnown -> "用户补充仅保存在本机；自编演示数据仅用于原型流程验证"
+            else -> "历史词源核对状态未确认；按各自来源版本标注"
+        }
     }
+
+    private fun LearnedWord.knownExportSource(): Boolean =
+        (source == PersonalDictionary.SOURCE && version == PersonalDictionary.VERSION) ||
+            (source == DemoDictionary.SOURCE && version == DemoDictionary.VERSION)
 }
