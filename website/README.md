@@ -1,5 +1,21 @@
 # 拾词官网（私有开发目录）
 
+## 2.6.1 / 52 测试包下载（2026-10-29，本次发布）
+
+用户已明确授权开放香港站点的测试包下载，并确认当前词库公开再分发授权；这里记录用户确认，不代表本项目另做了法律审查。网站配置与发布由父 GPT 按用户“你直接做”的本次例外完成，不改变长期总工程师默认。
+
+- 包：`shici-2.6.1-52.apk`，110,669,521 字节（105.54 MiB）；SHA-256 `e24e63322def2db7ea4e34783ae238ca5c35c6650703887de642b2f1bfac59b4`。直接复用已保数据安装到平板的 source08 APK，本次不重新构建、不修改 APK、不更换签名。
+- 属于 **Debug 签名公开测试包**，不是正式发行版或应用商店版本。安装前须备份学习数据。大幅滚屏后重试划词可能失败或不显示笔迹的问题仍未定位修复，页面如实提示，手动输入可作为暂时替代入口。
+- 只新增固定下载路径 `/downloads/shici-2.6.1-52.apk`。下载 URL 按当前页面 origin 生成，不在源码中绑定服务器地址；目录索引、其它 APK、源码、README、运维目录、词库原文件、模型和用户数据均不开放。
+- `content.js` 是发布信息唯一来源；`index.html` 的无脚本占位只提示启用 JavaScript，不再写过时的“暂未开放下载”。`app.js` 与 Logo/CSS 不变。Nginx 仅增加上述精确 APK location 和正确 Android 包 MIME，其它路径仍 404，仍只接受 GET/HEAD。
+- 主站仍为 HTTP/IP，没有新域名或 HTTPS。站内 SHA-256 可校验下载字节，但同站 HTTP 校验不能抵御同时篡改，不能当成 HTTPS 等价保护。
+- 发布前须检查当前远程文件/hash、容量、443 服务身份；APK 先经 Netcatty 官方 SFTP 进入 root:root 700 的私有暂存，完整 hash 核对后才开放。保留原 index/content/Nginx 配置备份；只 reload Nginx 使新精确路径生效，不重启/修改 443 服务，不动 H1/H5、DNS 或防火墙。
+- 实际本地验收：父核真实 `gpt-6.1-sol/high` 上下文与 58 份稳定证据；local-01 原 8 项为 7 PASS / 1 FAIL，唯一 L08 是夹具把 rollback 函数里的 reload 当作前向发布；local-02 仅该项补验 1 PASS，原失败保留、不合并宣称原 8 项重跑全绿。真实 Chrome/360px、准确链接/完整本地下载、坏配置拒绝均有证据；本地域的 Nginx/运维检查为静态审查；真实发布与 HTTP 结果见后项，回滚没有做故障注入。
+- 发布执行：Netcatty 官方 SFTP 私有暂存完整字节/hash通过后，固定审查脚本已实际完成 APK/两静态/单站点 Nginx 配置发布，`SHICI_RELEASE_APPLIED`、exit 0；仅 reload Nginx。其原有 `duplicate MIME type "text/html"` warning 保留，`nginx -t` 实际 exit 0。443 服务 unit/config/bin/hash、当前 MainPID/boot 与两不变静态均保持。含 shell substitution 的外层核验命令曾被 Netcatty 安全规则拒绝、没有执行，原回执保留；之后按已核脚本固定路径直接执行成功。
+- 真实上线后验：独立实际 `gpt-6.1-sol/high` 的 post01 六项为 **6 PASS / 0 FAIL / 0 ERROR / 0 SKIP**。完整公网 GET 110,669,521 字节/hash相等；原始 HEAD 200且空体；前段/携真实ETag的续传段/尾段均206且逐字节一致；九条指定目录/README/.git/私有stage/其它APK均404；一次360px真实线上浏览器显示正确元信息、测试/Debug/未修问题/HTTP说明且无横向溢出。父核44份稳定载荷及全部3实际模型上下文，旧58份证据保持；各域不合并成Android全验。
+- 继承的 `app.js` 下载说明仍写“外部下载地址”，与本次同源APK直链不符，列为非阻断N01，本批不扩修。Netcatty自建会话与测试自建浏览器均已关闭。以下旧章节均保留历史含义。
+
+
 本目录是“拾词”介绍与下载落地页的源文件，只介绍软件，不介绍源码。原开发仓库 `jiangnanqing188/shici-android` 保持私有；将来另建的公开仓库只用于发布下载，不是源码仓库。本目录已获用户授权，四个静态文件已实际部署到香港 H2 服务器的 HTTP 80 临时站点（2026-10-26 11:43 安装成功、exit 0），当前可通过公网 IP 访问，暂无域名，也未启用 HTTPS。原首次 POST 有限复验为 9 PASS / 1 FAIL，唯一失败是 `styles.css` 的 GET/HEAD 响应头缺少显式 `charset=utf-8`（内容本身可正常 UTF-8 解码，不是乱码）。该缺口已按指定执行链以 `charset_types` 修正：准确候选先经独立静态单点审查（gpt-6.1-sol/high，1 PASS），再由父侧通过 Netcatty 上传并完成候选 `nginx -t`、生产 `nginx -t`，仅 reload nginx，未 restart 443。修正后 post-css-r1 受影响有界复验 run-01 为 6 PASS / 0 FAIL / 0 ERROR / 0 SKIP：五 URL 的 GET/HEAD 共 10 个响应均 200，HTML/CSS/JS 的 MIME 正确且显式 `charset=utf-8`，正文/hash/长度与冻结四静态一致，HEAD body 为 0；三条私有路径 404，POST/OPTIONS 405；远程只读证据显示原 443 进程身份及 unit/config/binary 三 hash 保持不变。该结论只覆盖当前本机线路 HTTP/IP 与给定远程证据的有限闭环，不能累计声称原 POST 10/10，也不代表整站或全网验收通过。本文说明部署工件与操作要求，完整验收状态仍以父侧部署记录与统一验收为准。
 
 ## 目录与加载顺序

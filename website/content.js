@@ -2,8 +2,15 @@ window.SHICI_SITE = {
   name: '拾词',
   tagline: '阅读不停，生词随手拾起',
   description: '拾词是一款面向安卓平板和手机的阅读查词工具：开启悬浮查词后，在屏幕上划一笔，抬起即可查询；把生词、笔记和复习进度留在本机。本页不提供账号、云同步或上传功能。',
-  internalVersion: '2.2.1',
-  publicRelease: null,
+  internalVersion: '2.6.1',
+  publicRelease: {
+    version: '2.6.1',
+    versionCode: 52,
+    url: new URL('/downloads/shici-2.6.1-52.apk', window.location.origin).href,
+    sha256: 'e24e63322def2db7ea4e34783ae238ca5c35c6650703887de642b2f1bfac59b4',
+    sizeLabel: '105.54 MiB（110,669,521 字节）',
+    channel: 'test'
+  },
   repositoryUrl: null,
   releaseStatus: {
     preparing: {
@@ -36,8 +43,8 @@ window.SHICI_SITE = {
       footerStatus: '公开测试版 {version} · 已开放下载',
       channel: '公开测试版',
       title: '{name} {version}',
-      copy: '公开测试版现已开放下载。安装前请确认设备满足运行要求，并核对文件大小与 SHA-256。',
-      verify: '下载后可自行计算安装包的 SHA-256，并与下方记录逐字核对。'
+      copy: '2.6.1 公开测试包（Debug 签名），不是正式发行版。安装前请备份学习数据。已知问题：大幅滚屏后的再次划词可能失败或不显示笔迹，尚未修复，可先用手动输入。',
+      verify: '请核对下方版本、文件大小及 SHA-256。本站目前使用 HTTP 明文下载；校验值可检查文件是否一致，但同站 HTTP 校验不能替代 HTTPS 的传输保护。'
     }
   },
   features: [
