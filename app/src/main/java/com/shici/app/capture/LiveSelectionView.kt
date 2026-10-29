@@ -10,6 +10,7 @@ import android.view.ViewTreeObserver
 import com.shici.app.core.HighlighterPoint
 import com.shici.app.core.HighlighterStroke
 import com.shici.app.core.HighlighterTuning
+import com.shici.app.core.PixelBox
 import com.shici.app.ui.dp
 import kotlin.math.abs
 import kotlin.math.hypot
@@ -29,7 +30,8 @@ class LiveSelectionView(
     private val screenHeight: Int,
     private val onStroke: (HighlighterStroke) -> Unit,
     private val onTooShort: () -> Unit,
-    private val onCancel: (String) -> Unit
+    private val onCancel: (String) -> Unit,
+    private val onGestureStart: () -> Unit = {}
 ) : View(context) {
     private val density = resources.displayMetrics.density
     private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
@@ -56,6 +58,10 @@ class LiveSelectionView(
     private var downX = 0f
     private var downY = 0f
     @Volatile private var armed = false
+    // Screen-coordinate rectangles occupied by this overlay's own ink and chips. The capture
+    // thread reads this list while comparing the page during a stroke; it is replaced atomically
+    // and never contains a whole-page mask, so the page pixels around the ink stay observable.
+    @Volatile private var screenExclusions: List<PixelBox> = emptyList()
     private var windowReadyCallback: (() -> Unit)? = null
     private var windowReadyReported = false
     private var globalLayoutObserved = false
@@ -70,7 +76,76 @@ class LiveSelectionView(
     /** The clean entry frame is ready; ink feedback and one-stroke submission may start. */
     fun arm() {
         armed = true
+        updateScreenExclusions()
         invalidate()
+    }
+
+    /**
+     * The exact screen rectangles this overlay currently covers with opaque pixels: the stroke
+     * path (inflated by the brush) and the two chips. A frame observer excludes only these and
+     * compares the rest of the page; an empty list before arming is intentional (nothing is drawn).
+     */
+    fun currentScreenExclusions(): List<PixelBox> = screenExclusions
+
+    private fun updateScreenExclusions() {
+        if (!armed) {
+            screenExclusions = emptyList()
+            return
+        }
+        val location = IntArray(2)
+        getLocationOnScreen(location)
+        val boxes = ArrayList<PixelBox>(3)
+        fun add(box: RectF, padding: Float) {
+            // Ink that is exactly horizontal or vertical has zero raw extent on one axis but is
+            // still real: an axis may legitimately degenerate, so a zero-size raw box is not
+            // "empty". Inflate by the real brush radius/edge padding first, then require a strict
+            // positive area and screen clamp. Non-finite or inverted input is bad data, never ink;
+            // it must not be squeezed through a NaN-to-zero conversion into a fake top-left mask.
+            val left = box.left
+            val top = box.top
+            val right = box.right
+            val bottom = box.bottom
+            if (!left.isFinite() || !top.isFinite() || !right.isFinite() || !bottom.isFinite()) return
+            if (right < left || bottom < top) return
+            val screenLeft = left + location[0] - padding
+            val screenTop = top + location[1] - padding
+            val screenRight = right + location[0] + padding
+            val screenBottom = bottom + location[1] + padding
+            if (!screenLeft.isFinite() || !screenTop.isFinite() ||
+                !screenRight.isFinite() || !screenBottom.isFinite()) return
+            if (screenRight <= screenLeft || screenBottom <= screenTop) return
+            val clampedLeft = screenLeft.toInt().coerceIn(0, screenWidth)
+            val clampedTop = screenTop.toInt().coerceIn(0, screenHeight)
+            val clampedRight = screenRight.toInt().coerceIn(0, screenWidth)
+            val clampedBottom = screenBottom.toInt().coerceIn(0, screenHeight)
+            if (clampedRight > clampedLeft && clampedBottom > clampedTop) {
+                boxes += PixelBox(clampedLeft, clampedTop, clampedRight, clampedBottom)
+            }
+        }
+        val inkBounds = RectF()
+        var hasInk = false
+        val path = currentPath
+        if (path != null) {
+            path.computeBounds(inkBounds, true)
+            hasInk = true
+        } else {
+            currentPoints?.forEach { point ->
+                if (!hasInk) {
+                    inkBounds.set(point.x, point.y, point.x, point.y)
+                    hasInk = true
+                } else {
+                    inkBounds.left = minOf(inkBounds.left, point.x)
+                    inkBounds.top = minOf(inkBounds.top, point.y)
+                    inkBounds.right = maxOf(inkBounds.right, point.x)
+                    inkBounds.bottom = maxOf(inkBounds.bottom, point.y)
+                }
+            }
+        }
+        // No stroke means no ink box at all; the default (0,0,0,0) rect must never mask a corner.
+        if (hasInk) add(inkBounds, ink.strokeWidth / 2f + 4f * density)
+        add(hintRect(), 3f * density)
+        add(cancelRect(), 3f * density)
+        screenExclusions = boxes
     }
 
     /**
@@ -123,6 +198,7 @@ class LiveSelectionView(
 
     override fun onLayout(changed: Boolean, left: Int, top: Int, right: Int, bottom: Int) {
         super.onLayout(changed, left, top, right, bottom)
+        updateScreenExclusions()
         reportWindowReady()
     }
 
@@ -150,6 +226,7 @@ class LiveSelectionView(
 
     override fun onDraw(canvas: Canvas) {
         if (!armed) return
+        updateScreenExclusions()
         currentPath?.let { canvas.drawPath(it, ink) }
         drawChip(canvas, hintRect(), "沿完整单词一笔划过 · 抬笔即查", hintText, 34f * density)
         drawChip(canvas, cancelRect(), "取消取词", chipText, 44f * density)
@@ -167,12 +244,14 @@ class LiveSelectionView(
         currentPoints = null
         currentPath = null
         pointerId = -1
+        updateScreenExclusions()
     }
 
     private fun beginStroke(event: MotionEvent) {
         pointerId = event.getPointerId(0)
         currentPoints = mutableListOf(HighlighterPoint(event.x, event.y))
         currentPath = Path().apply { moveTo(event.x, event.y) }
+        updateScreenExclusions()
     }
 
     private fun appendPoint(x: Float, y: Float) {
@@ -181,6 +260,7 @@ class LiveSelectionView(
         if (points.lastOrNull() != point) {
             points += point
             currentPath?.lineTo(x, y)
+            updateScreenExclusions()
         }
     }
 
@@ -216,7 +296,12 @@ class LiveSelectionView(
                 cancelPressed = cancelRect().contains(event.x, event.y)
                 downX = event.x
                 downY = event.y
-                if (!cancelPressed) beginStroke(event)
+                if (!cancelPressed) {
+                    // Opens a fresh page-observation window for this stroke. The capture thread
+                    // only records evidence while this window is active.
+                    onGestureStart()
+                    beginStroke(event)
+                }
             }
             MotionEvent.ACTION_MOVE -> if (!cancelPressed && !interrupted) appendEvent(event)
             MotionEvent.ACTION_POINTER_DOWN, MotionEvent.ACTION_POINTER_UP -> {
@@ -249,13 +334,21 @@ class LiveSelectionView(
                 }
                 appendEvent(event)
                 val points = currentPoints?.toList() ?: emptyList()
-                cancelCurrentStroke()
-                invalidate()
                 if (points.size < 2 || strokeLength(points) < HighlighterTuning.MIN_STROKE_LENGTH_DP * density) {
+                    cancelCurrentStroke()
+                    invalidate()
                     onTooShort()
                     return true
                 }
+                // Keep the final ink/chip exclusion snapshot published while the synchronous
+                // submission closes the capture-side observation window. Clearing it first can
+                // race an ambient frame that is still being compared and turn the already removed
+                // ink into false doubt for an otherwise static stroke.
                 onStroke(HighlighterStroke(points.map(::toScreen)))
+                if (isAttachedToWindow) {
+                    cancelCurrentStroke()
+                    invalidate()
+                }
             }
             MotionEvent.ACTION_CANCEL -> {
                 interrupted = false

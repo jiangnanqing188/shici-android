@@ -20,9 +20,9 @@ import com.shici.app.ui.text
  *
  * The footer and then the header are measured first and never scroll, so a long definition, a
  * large font scale or a short screen can only take space away from the body. The definition is
- * never hard-truncated to fake a one-screen card: the body scrolls instead, while "重新划选 / 退出"
- * stays mounted. The footer buttons are at least 48dp tall and the footer itself is never placed
- * inside the scroll area.
+ * never hard-truncated to fake a one-screen card: the body scrolls instead, while
+ * "划词 / 手动输入 / 退出" stays mounted. The footer buttons are at least 48dp tall and the footer
+ * itself is never placed inside the scroll area.
  *
  * When the hosting window measures the card with an exact height (which is what the service does
  * once it has mounted the card into a fixed-size overlay window), the scrolling body is given the
@@ -38,7 +38,7 @@ internal class OverlayCardLayout(context: Context) : LinearLayout(context) {
     val header: LinearLayout = LinearLayout(context).apply { orientation = VERTICAL }
     /** The only scrolling part of the card: long meanings, raw text and secondary actions. */
     val body: LinearLayout = LinearLayout(context).apply { orientation = VERTICAL }
-    /** Fixed bottom row: "重新划选" and "退出", both at least 48dp tall. */
+    /** Fixed bottom row: "划词", "手动输入" and "退出", each at least 48dp tall. */
     val footer: LinearLayout = LinearLayout(context).apply {
         orientation = HORIZONTAL
         gravity = Gravity.CENTER_VERTICAL
@@ -53,6 +53,7 @@ internal class OverlayCardLayout(context: Context) : LinearLayout(context) {
             LinearLayout.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
     }
     val restart: Button
+    val manual: Button
     val exit: Button
     private val titleView: TextView = context.text("", 20f, bold = true).apply {
         maxLines = 2
@@ -68,15 +69,21 @@ internal class OverlayCardLayout(context: Context) : LinearLayout(context) {
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
         addView(footer, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-        restart = footerAction("重新划选", filled = true)
+        restart = footerAction("划词", filled = true)
+        manual = footerAction("手动输入", filled = false)
         exit = footerAction("退出", filled = false)
-        // Same row, each half the width and at least 48dp tall. The exit is deliberately lighter
-        // than "重新划选" so the row reads as one primary navigation plus one secondary close.
+        // Same row, each a third of the width and at least 48dp tall. "划词" is the filled primary
+        // action; "手动输入" and "退出" are lighter secondary actions. Sharing the row equally with
+        // wrapping labels keeps all three reachable on a narrow screen or at a large font scale
+        // instead of letting "退出" be pushed out.
         footer.addView(restart, LinearLayout.LayoutParams(0,
-            LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = context.dp(8) })
+            LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = context.dp(6) })
+        footer.addView(manual, LinearLayout.LayoutParams(0,
+            LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = context.dp(6) })
         footer.addView(exit, LinearLayout.LayoutParams(0,
             LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        restart.contentDescription = "重新划选：收起这张词卡，开始新的一笔划词"
+        restart.contentDescription = "划词：收起这张词卡，开始新的一笔划词"
+        manual.contentDescription = "手动输入：收起这张词卡，在当前页面输入英文单词查词（打开时不会自动查询）"
         exit.contentDescription = "退出当前词卡，返回悬浮条（不停止查词）"
     }
 
@@ -91,11 +98,14 @@ internal class OverlayCardLayout(context: Context) : LinearLayout(context) {
         isAllCaps = false
         minHeight = context.dp(48)
         minimumHeight = context.dp(48)
-        maxLines = 1
+        // Two lines at most: at a large font scale or on a narrow card a longer label such as
+        // "手动输入" wraps instead of shrinking its hit target or pushing a sibling out.
+        maxLines = 2
+        gravity = Gravity.CENTER
         ellipsize = TextUtils.TruncateAt.END
         setTextColor(if (filled) android.graphics.Color.WHITE else Paper.green)
         background = context.shape(if (filled) Paper.green else Paper.lightGreen, 8)
-        setPadding(context.dp(8), context.dp(6), context.dp(8), context.dp(6))
+        setPadding(context.dp(6), context.dp(6), context.dp(6), context.dp(6))
     }
 
     /**
@@ -121,7 +131,8 @@ internal class OverlayCardLayout(context: Context) : LinearLayout(context) {
         val innerHeight = (offered - outerPadding).coerceAtLeast(0)
         // Priority order: the footer first (it is the only always-visible navigation), then the
         // header, then whatever is left for the scrolling body. Neither fixed part is placed inside
-        // the scroll area, so a large font scale or a short screen can never hide "重新划选 | 退出".
+        // the scroll area, so a large font scale or a short screen can never hide
+        // "划词 | 手动输入 | 退出".
         footer.measure(childWidth, MeasureSpec.makeMeasureSpec(innerHeight, MeasureSpec.AT_MOST))
         val afterFooter = (innerHeight - footer.measuredHeight).coerceAtLeast(0)
         // The header keeps its natural height unless the remaining room is genuinely short: then it
@@ -148,9 +159,9 @@ internal class OverlayCardLayout(context: Context) : LinearLayout(context) {
 
     /**
      * Anchors the footer to the bottom of the card instead of trusting the children's sequential
-     * heights. This is what makes "重新划选 | 退出" survive a header that measured taller than its
-     * offer (for example a very large font scale): the header and the scroll view are clipped by the
-     * exact region left above the footer, and the footer keeps its full 48dp+ height.
+     * heights. This is what makes "划词 | 手动输入 | 退出" survive a header that measured taller
+     * than its offer (for example a very large font scale): the header and the scroll view are
+     * clipped by the exact region left above the footer, and the footer keeps its full 48dp+ height.
      */
     override fun onLayout(changed: Boolean, l: Int, t: Int, r: Int, b: Int) {
         val left = paddingLeft

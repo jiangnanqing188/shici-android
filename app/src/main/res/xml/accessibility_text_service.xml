@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Optional page-text direct reader.
+
+    Deliberately absent: canPerformGestures, canRequestTouchExplorationMode,
+    canRequestFilterKeyEvents and canTakeScreenshot. This service never performs clicks or
+    gestures, never enables touch exploration, never filters keys and never takes screenshots.
+    It only receives window/content/scroll events and reads a node tree for the short lifetime of
+    an explicit in-app highlight request.
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:description="@string/accessibility_text_service_description"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged|typeViewScrolled|typeWindowsChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:notificationTimeout="100"
+    android:canRetrieveWindowContent="true"
+    android:accessibilityFlags="flagRetrieveInteractiveWindows" />

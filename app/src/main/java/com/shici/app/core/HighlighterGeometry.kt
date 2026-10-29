@@ -38,7 +38,14 @@ data class HighlighterStroke(val points: List<HighlighterPoint>)
 data class HighlighterSelection(
     val strokes: List<HighlighterStroke>,
     val crop: PixelBox,
-    val brushRadius: Float = 0f
+    val brushRadius: Float = 0f,
+    /**
+     * The necessary painted-ink region (visible stroke band) in screenshot pixels. This is the
+     * protection region used by page-identity checks: it is deliberately **not** [crop], whose
+     * 64 dp OCR context margin may legitimately sit under this application's own result card.
+     * Null only when the stroke geometry could not produce a non-empty visible band.
+     */
+    val inkBounds: PixelBox? = null
 )
 data class HighlighterWord(val text: String, val bounds: FloatBox, val lineIndex: Int, val lineBounds: FloatBox)
 
@@ -76,7 +83,16 @@ object HighlighterGeometry {
             ceil(visiblePoints.maxOf { it.y } + padding).toInt().coerceIn(0, imageHeight)
         )
         val brushRadius = HighlighterTuning.BRUSH_WIDTH_DP * density / scale / 2f
-        return HighlighterSelection(valid, crop, brushRadius.takeIf { it.isFinite() && it > 0f } ?: 0f)
+        val safeBrush = brushRadius.takeIf { it.isFinite() && it > 0f } ?: 0f
+        // The painted band is the necessary selected region. It is kept separate from [crop]:
+        // the context padding is for OCR input only and must never be required to stay visible.
+        val inkBounds = PixelBox(
+            floor(visiblePoints.minOf { it.x } - safeBrush).toInt().coerceIn(0, imageWidth),
+            floor(visiblePoints.minOf { it.y } - safeBrush).toInt().coerceIn(0, imageHeight),
+            ceil(visiblePoints.maxOf { it.x } + safeBrush).toInt().coerceIn(0, imageWidth),
+            ceil(visiblePoints.maxOf { it.y } + safeBrush).toInt().coerceIn(0, imageHeight)
+        ).takeIf { it.width > 0 && it.height > 0 }
+        return HighlighterSelection(valid, crop, safeBrush, inkBounds)
     }
 
     /** Restore crop-local OCR boxes, including a resized OCR input, to screenshot coordinates. */
@@ -111,6 +127,15 @@ object HighlighterGeometry {
             previous = word
         }
     }
+
+    /**
+     * Explicit EXACT/RECOVERED/AMBIGUOUS/NONE decision for a committed gesture, for the caller that
+     * wants bounded fallback selection. The strict [hitWords]/[selection]/[restoreBox] path above is
+     * unchanged and remains the only EXACT result; [SelectionRecovery.resolve] only adds the bounded
+     * neighbour search and returns original OCR words. It starts no lookup or record.
+     */
+    fun resolveWords(selection: HighlighterSelection, words: List<HighlighterWord>): SelectionResolution =
+        SelectionRecovery.resolve(selection, words)
 
     private fun hits(strokes: List<HighlighterStroke>, box: FloatBox, brushRadius: Float): Boolean {
         val width = box.right - box.left

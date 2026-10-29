@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="accessibility_text_service_label">拾词页面文字直读（可选）</string>
+    <string name="accessibility_text_service_description">默认关闭。只有你在拾词应用内打开开关，并在悬浮查词中实际勾画的短暂请求期间，才会在此处读取当前可见页面的文字和单词屏幕位置，用于直接取词；读取结果只留在内存，不写盘、不记录、不上传，也不读取密码或系统标记的敏感内容。关闭应用内开关或服务断开后立即停止读取。</string>
+</resources>

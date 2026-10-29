@@ -1,6 +1,7 @@
 package com.shici.app.ui
 
 import android.Manifest
+import android.accessibilityservice.AccessibilityServiceInfo
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.Intent
@@ -17,6 +18,7 @@ import android.provider.Settings
 import android.text.Editable
 import android.text.TextWatcher
 import android.view.*
+import android.view.accessibility.AccessibilityManager
 import android.widget.*
 import com.shici.app.ShiciApplication
 import com.shici.app.BuildConfig
@@ -502,6 +504,9 @@ class MainActivity : Activity() {
             settingsScreen?.updatePermissionStatus(
                 overlayPermissionStatus(), notificationPermissionStatus()
             )
+            // Direct reading may have been enabled/disabled or disconnected while the user was in
+            // Android accessibility settings; only the small status block is refreshed.
+            settingsScreen?.updateAccessibilityStatus(accessibilityStatus())
         }
         // Only the page that is currently showing may run its single demo animation. The screen was
         // created by render() during onCreate (before onStart) or by a page switch while started.
@@ -2645,6 +2650,7 @@ class MainActivity : Activity() {
             context = this,
             overlayStatus = overlayPermissionStatus(),
             notificationStatus = notificationPermissionStatus(),
+            accessibilityStatus = accessibilityStatus(),
             // Short, honest display: an internal experience build, not an official release.
             versionText = "体验版 ${BuildConfig.VERSION_NAME}（${BuildConfig.VERSION_CODE}）",
             provenanceText = RawKajwebDictionary.provenance(
@@ -2652,7 +2658,9 @@ class MainActivity : Activity() {
             ),
             onOpenOverlayPermission = { openOverlayPermissionSettings() },
             onOpenNotificationSettings = { openNotificationSettings() },
-            onOpenUsageGuide = { selectPage(MainPage.GUIDE) }
+            onOpenUsageGuide = { selectPage(MainPage.GUIDE) },
+            onAccessibilityTextEnabledChange = { enabled -> setAccessibilityTextEnabled(enabled) },
+            onOpenAccessibilitySettings = { openAccessibilitySettings() }
         )
         settingsScreen = screen
         // SettingsScreen already owns the ScrollView body; do not wrap it in scrolled().
@@ -2700,6 +2708,81 @@ class MainActivity : Activity() {
         val granted = checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) ==
             PackageManager.PERMISSION_GRANTED
         return SettingsScreen.PermissionStatus(if (granted) "已允许" else "未允许", granted)
+    }
+
+    /**
+     * Honest direct-reading state for the settings block: the in-app switch (the actual
+     * authorisation), whether the user-enabled accessibility service is connected, and whether the
+     * service is enabled system-wide at all. A connected service without the in-app switch still
+     * reads nothing, so "healthy" requires both.
+     */
+    private fun accessibilityStatus(): SettingsScreen.AccessibilityStatus {
+        val enabled = AccessibleTextBridge.isEnabled(this)
+        val connected = AccessibleTextBridge.isConnected
+        val systemEnabled = accessibilityServiceEnabledInSystem()
+        val label = when {
+            !enabled -> "未开启"
+            connected -> "已开启 · 系统服务已连接"
+            systemEnabled -> "已开启 · 等待系统服务连接"
+            else -> "已开启 · 尚未在系统无障碍设置启用服务"
+        }
+        return SettingsScreen.AccessibilityStatus(enabled, connected, label, enabled && connected)
+    }
+
+    private fun accessibilityServiceEnabledInSystem(): Boolean = runCatching {
+        val manager = getSystemService(AccessibilityManager::class.java)
+            ?: return@runCatching false
+        manager.getEnabledAccessibilityServiceList(AccessibilityServiceInfo.FEEDBACK_ALL_MASK).any {
+            val service = it.resolveInfo?.serviceInfo ?: return@any false
+            val expected = AccessibleTextService::class.java.name
+            service.packageName == packageName &&
+                (service.name == expected || service.name == ".capture.AccessibleTextService")
+        }
+    }.getOrDefault(false)
+
+    private fun updateAccessibilityStatus() {
+        settingsScreen?.updateAccessibilityStatus(accessibilityStatus())
+    }
+
+    /**
+     * The switch only stores an explicit local authorisation after the short privacy note is
+     * confirmed. It never enables the system accessibility service and never performs gestures;
+     * the user must enable that service in Android settings themselves.
+     */
+    private fun setAccessibilityTextEnabled(enabled: Boolean) {
+        if (!enabled) {
+            AccessibleTextBridge.setEnabled(this, false)
+            updateAccessibilityStatus()
+            toast("已关闭页面文字直读，不再读取页面文字")
+            return
+        }
+        if (AccessibleTextBridge.isEnabled(this)) {
+            updateAccessibilityStatus()
+            return
+        }
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("开启页面文字直读（可选）")
+            .setMessage(
+                "开启后，只有你在悬浮查词中实际勾画的短暂请求内，本机会读取当前可见页面的文字和" +
+                    "单词位置，用于直接取词。结果只留在内存，不写盘、不记录、不上传；不读取密码或" +
+                    "系统标记的敏感内容，也不执行点击或手势。仍需你本人到 Android 无障碍设置中启用" +
+                    "“拾词页面文字直读（可选）”服务；关闭此开关即停止读取。"
+            )
+            .setNegativeButton("取消", null)
+            .setPositiveButton("同意并开启") { _, _ ->
+                AccessibleTextBridge.setEnabled(this, true)
+                updateAccessibilityStatus()
+                toast("已允许页面文字直读；请到系统无障碍设置启用服务")
+            }
+            .create()
+        // A cancelled confirmation must revert the switch to the still-disabled persisted state.
+        dialog.setOnDismissListener { updateAccessibilityStatus() }
+        dialog.show()
+    }
+
+    private fun openAccessibilitySettings() {
+        runCatching { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+            .onFailure { toast("无法打开系统无障碍设置：${it.message}") }
     }
 
     // These entries only open system settings pages. They never request projection/capture and do

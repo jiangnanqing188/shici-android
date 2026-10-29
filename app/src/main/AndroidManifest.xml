@@ -24,6 +24,20 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <!-- Optional page-text direct reader. Disabled by default: the user must first turn on the
+             in-app switch and then enable this service in Android accessibility settings. It never
+             performs gestures or enables touch exploration, and it is not claimed to be a
+             disability-assistive tool (isAccessibilityTool=false). -->
+        <service android:name=".capture.AccessibleTextService" android:exported="true"
+            android:label="@string/accessibility_text_service_label"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+            android:isAccessibilityTool="false">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_text_service" />
+        </service>
         <service android:name=".capture.CaptureService" android:exported="false"
             android:foregroundServiceType="mediaProjection" />
     </application>

@@ -30,6 +30,8 @@ import com.shici.app.ui.*
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
+import kotlin.math.ceil
+import kotlin.math.floor
 
 /**
  * One dictionary read plus the committed revision observed on the worker immediately around it.
@@ -80,6 +82,10 @@ class CaptureService : Service() {
         // still run. The bound prevents an indefinitely observed card from becoming a full-frame
         // sampling loop; after it expires the old request is cancelled rather than allowed to write.
         private const val PAGE_GUARD_TIMEOUT_MS = 60_000L
+        // One optional direct-read attempt is started at lift. It is awaited for at most this long
+        // (counted from the lift, not from the later verify frame) before the single OCR fallback
+        // starts; a request still running at the bound is cancelled on the main thread.
+        private const val DIRECT_READ_WAIT_MS = 800L
     }
     /** The single pending one-shot frame is either the clean entry page or the clean lift page. */
     private enum class FramePurpose { ENTRY, VERIFY }
@@ -173,6 +179,15 @@ class CaptureService : Service() {
     // pixel, so a card rectangle never hides the visible page pixels that merely share a tile or
     // lie inside a fixed outward margin.
     @Volatile private var pageOverlayBoxes: List<PixelBox> = emptyList()
+    // Necessary painted-ink region of the current selection in lift-frame/screen coordinates. It
+    // is used only to place our own card away from the actual target; it is not a page mask and is
+    // cleared with the page guard.
+    @Volatile private var panelTarget: PixelBox? = null
+    // Estimated on-screen top-left of the mounted card before its real layout bounds arrive. Used
+    // only for the page-exclusion estimate and the inset height pass; updatePanelOverlayBox
+    // replaces it with the real window rectangle after layout.
+    private var panelLeft = 0
+    private var panelTop = 0
     // Set only between the accepted lift frame and the pending card being mounted, so the card's
     // own frame is already excluded before observation starts. The pending identity is published
     // to the frame thread so a genuine update in this window is not lost.
@@ -181,10 +196,62 @@ class CaptureService : Service() {
     @Volatile private var pendingPageSourceNanos = 0L
     // A readable frame compared against the pending lift identity already disproved the page.
     @Volatile private var pendingPageChanged = false
+    // Necessary painted-ink region (not the 64 dp OCR context crop) used by the post-lift
+    // comparison. Null means the pending identity is compared strictly (entry frame /
+    // coordinate-sensitive direct-read wait); a non-null box enables the bounded SAME-or-MOVED
+    // identity check, and a card covering this box cannot be treated as same-page evidence.
+    @Volatile private var pendingPageProtection: PixelBox? = null
+    @Volatile private var pageGuardProtection: PixelBox? = null
+    // True while the lift frame's coordinates must not move: the optional direct-read words are in
+    // the lift instant's screen coordinates, so any post-lift page movement makes them unusable.
+    @Volatile private var pendingStrictCoordinates = false
+    // Direct-read (accessibility) page identity. Mutually exclusive with the pixel guard above; it
+    // is created only from a complete AccessibleTextSnapshot and never from fabricated pixels.
+    @Volatile private var textPageGuard: AccessiblePageGuard? = null
+    /**
+     * One optional direct-read attempt for the committed stroke. The request starts at lift (the
+     * external target window is still active then), and the verify frame's accepted bitmap waits
+     * in [bitmap] for at most [DIRECT_READ_WAIT_MS]. Main-thread only.
+     */
+    private class DirectReadAttempt(val session: LiveSelectionSession) {
+        var request: AccessibleTextRequest? = null
+        var timeout: Runnable? = null
+        var result: AccessibleTextResult? = null
+        var settled = false
+        var continued = false
+        var liftReady = false
+        var bitmap: Bitmap? = null
+        var selection: HighlighterSelection? = null
+        var token = -1L
+    }
+    private var directRead: DirectReadAttempt? = null
+    /**
+     * One bounded stroke-time page-observation window. It exists only while the transparent
+     * gesture layer is attached and the finger is down; each usable frame is matched against the
+     * fixed entry identity (never a rebased one) with the ink/chip rectangles as the only excluded
+     * pixels. The result is the real bounded shift (zero or nonzero) or doubt; a pre-stroke or
+     * untimed frame is ignored by time ownership, and an unreadable, blank, ambiguous or changed
+     * plane is doubt, never an optimistic shift.
+     */
+    private class StrokeObservation(
+        val session: LiveSelectionSession,
+        val baseline: LiveFrameFingerprint,
+        val body: PixelBox,
+        val startedNanos: Long
+    )
+    @Volatile private var strokeObservation: StrokeObservation? = null
+    // Text-free change notifications keep a direct-read guard honest. The bridge always dispatches
+    // on the main thread; no snapshot text is stored by this listener or by the guard.
+    private val textChangeListener: (AccessibleTextChange) -> Unit = { change ->
+        val guard = textPageGuard
+        if (guard != null && guard.invalidatedBy(change)) {
+            invalidateTextPage(guard, "页面文字已变化，本次查询已失效；已完成的提交不会自动撤销。")
+        }
+    }
     private val app get() = application as ShiciApplication
     // The visible "已收录" card; invalidated if its word is deleted while the card is still on screen.
     private class DefinitionGuard(
-        val key: String, val credential: Long, val page: LivePageGuard?, val manual: Boolean,
+        val key: String, val credential: Long, val page: LookupPageGuard?, val manual: Boolean,
         val status: TextView, val undo: Button, val correct: Button, val retry: Button
     ) { @Volatile var invalid = false; @Volatile var saved = false }
     @Volatile private var definitionGuard: DefinitionGuard? = null
@@ -248,6 +315,9 @@ class CaptureService : Service() {
         framesThread = HandlerThread("shici-capture").apply { start() }
         frames = Handler(framesThread.looper)
         app.repository.changes.observe(deletionListener)
+        // Registered for the whole service lifetime; it invalidates only the text guard that is
+        // actually current and never stores the change's (text-free) details.
+        AccessibleTextBridge.addChangeListener(textChangeListener)
     }
     override fun onBind(intent: Intent?) = null
 
@@ -405,6 +475,11 @@ class CaptureService : Service() {
                                 synchronized(pageLock) {
                                     pendingPageBaseline = acceptedIdentity
                                     pendingPageBody = request.body
+                                    // Until main delivery proves the stroke's selected crop (verify) or
+                                    // the entry frame is consumed, the pending identity is compared
+                                    // strictly: no whole-page movement is assumed.
+                                    pendingPageProtection = null
+                                    pendingStrictCoordinates = true
                                     pendingPageSourceNanos = image.timestamp
                                     pendingPageChanged = false
                                 }
@@ -476,17 +551,54 @@ class CaptureService : Service() {
      * Our own visible card windows are excluded per pixel; page changes elsewhere still count.
      */
     private fun observeAmbientPage(image: Image) {
-        fun matchesImage(baseline: LiveFrameFingerprint, body: PixelBox): Boolean = try {
+        /**
+         * One page-identity comparison.
+         *
+         * A strict pixel equality is still checked first, but (per the SAME identity rule) it is
+         * only accepted when the retained baseline itself carries page information. When the
+         * coordinates are allowed to move and a necessary painted-ink [protection] box is known, a
+         * bounded whole-page shift is accepted only after
+         * [LiveFrameFingerprint.matchBoundedPlane] proves it; that matcher verifies the protection
+         * region pixel by pixel. Null means the plane could not be read and is treated as "cannot
+         * prove" by both callers.
+         */
+        fun sameAs(baseline: LiveFrameFingerprint, body: PixelBox, protection: PixelBox?,
+                   strict: Boolean): Boolean? = try {
+            val excluded = pageOverlayExclusions()
+            // A selected-word protection region that is covered/masked by our own card cannot be
+            // checked for changes. The surrounding page may still match, but the word the user
+            // actually selected is invisible: that is not page identity and must not pass.
+            fun protectionMasked(): Boolean {
+                val region = protection ?: return false
+                return excluded.any { other ->
+                    region.left < other.right && other.left < region.right &&
+                        region.top < other.bottom && other.top < region.bottom
+                }
+            }
             val plane = image.planes.firstOrNull()
-            plane != null && baseline.matchesPlane(image.width, image.height, body,
-                plane.rowStride, plane.pixelStride, plane.buffer, pageOverlayExclusions())
+            when {
+                plane == null -> null
+                baseline.matchesPlane(image.width, image.height, body,
+                    plane.rowStride, plane.pixelStride, plane.buffer, excluded) ->
+                    // The baseline is the clean entry/lift frame, sampled before this app's
+                    // current card existed. Measure its identity without masking the card: if the
+                    // only page text lies under our own card, masking it would turn a real page
+                    // into a blank one and wrongly invalidate the lookup. Candidate pixels remain
+                    // masked; a card covering the necessary ink is still rejected below.
+                    baseline.hasIdentityInformation() && !protectionMasked()
+                !strict && protection != null -> !protectionMasked() && baseline.matchBoundedPlane(
+                    image.width, image.height, body, plane.rowStride, plane.pixelStride,
+                    plane.buffer, protection, resources.displayMetrics.density,
+                    excluded).accepted
+                else -> false
+            }
         } catch (_: Exception) {
-            false
+            null
         }
 
         fun timestampBelongsToGuard(candidate: LivePageGuard, timestampNanos: Long): Boolean =
-            pageGuard === candidate &&
-                (timestampNanos <= 0 || pageGuardSourceNanos <= 0 || timestampNanos >= pageGuardSourceNanos)
+            pageGuard === candidate && timestampNanos > 0 && pageGuardSourceNanos > 0 &&
+                timestampNanos >= pageGuardSourceNanos
 
         fun invalidateOnFrameThread(guard: LivePageGuard) {
             val invalidated = synchronized(pageLock) {
@@ -504,6 +616,52 @@ class CaptureService : Service() {
             }
         }
 
+        // Stroke-time evidence. While the finger is down the gesture layer's ink is the only thing
+        // this application draws. Each usable frame is matched against the fixed entry identity in
+        // the same screen-pixel space as the later OCR word boxes and stroke, so a page already
+        // shifted before/while the stroke was drawn yields its real bounded shift instead of a
+        // hard-coded "no movement". Frames are attributed by compositor time: a queued frame from
+        // before ACTION_DOWN is ignored rather than turning the evidence doubtful, and a frame with
+        // no timestamp cannot join the dynamic proof. Only a bounded number of comparisons per
+        // stroke is attempted; no fingerprint, bitmap or text is retained.
+        val stroke = strokeObservation
+        if (stroke != null) {
+            val session = live
+            val gesture = liveView
+            if (session !== stroke.session || gesture == null || !session.isStrokeMotionActive()) return
+            if (stopped || !sessionIsActive() || session.generation != CaptureStatus.generation) return
+            if (stroke.startedNanos <= 0) return
+            if (image.timestamp <= 0) return
+            if (image.timestamp < stroke.startedNanos) return
+            val plane = image.planes.firstOrNull()
+            if (plane == null) {
+                session.noteMotionUnavailable()
+                return
+            }
+            if (!session.beginMotionObservation(image.timestamp)) return
+            // Exclude only the ink and the two small chips. The page around the stroke remains
+            // observable, and no accumulated or whole-page mask is used.
+            val excluded = gesture.currentScreenExclusions()
+            val match = try {
+                stroke.baseline.probeBoundedPlane(image.width, image.height, stroke.body,
+                    plane.rowStride, plane.pixelStride, plane.buffer,
+                    resources.displayMetrics.density, excluded)
+            } catch (_: Exception) {
+                null
+            }
+            if (match == null) {
+                session.noteMotionUnavailable()
+            } else when (match.kind) {
+                FrameMatchKind.SAME ->
+                    session.noteMotionObservation(PageShift.NONE)
+                FrameMatchKind.MOVED ->
+                    session.noteMotionObservation(match.shift)
+                else ->
+                    // Blank/ambiguous/unreadable/changed plane: not zero movement, not a guess.
+                    session.noteMotionUnavailable()
+            }
+            return
+        }
         val guard = pageGuard
         if (guard == null) {
             // The lift frame has been accepted but main delivery/guard mounting has not finished.
@@ -518,8 +676,13 @@ class CaptureService : Service() {
             // an accepted request awaiting main delivery is, even though canInspect is now false.
             if (awaiting != null && !awaiting.isAwaitingDelivery()) return
             val sourceNanos = pendingPageSourceNanos
-            if (sourceNanos > 0 && image.timestamp > 0 && image.timestamp < sourceNanos) return
-            val same = matchesImage(pending, pendingBody)
+            // An image without a known compositor timestamp cannot be placed after the accepted
+            // lift image. It is ignored as ambient evidence rather than accepted or used to tear
+            // down a pending request; a later timestamped frame remains the evidence source.
+            if (sourceNanos <= 0 || image.timestamp <= 0 || image.timestamp < sourceNanos) return
+            val protection = pendingPageProtection
+            val strict = pendingStrictCoordinates || protection == null
+            val same = sameAs(pending, pendingBody, protection, strict) == true
             if (awaiting != null) {
                 if (same) return
                 // Invalidate the accepted-but-not-yet-delivered offer on this frame thread, so the
@@ -560,7 +723,12 @@ class CaptureService : Service() {
         // Ignore a late image produced before the accepted lift frame. Zero timestamps keep the
         // old "no lower bound" safety semantics and are still checked, never silently trusted.
         if (!timestampBelongsToGuard(guard, image.timestamp)) return
-        if (!matchesImage(guard.baseline, guard.body)) invalidateOnFrameThread(guard)
+        val protection = pageGuardProtection
+        // The guard baseline is the lift frame. A strict unchanged frame wins; otherwise only a
+        // bounded, protection-verified shift is accepted. Anything unprovable closes the guard.
+        if (sameAs(guard.baseline, guard.body, protection, protection == null) != true) {
+            invalidateOnFrameThread(guard)
+        }
     }
 
     /** Screen rectangles covered by this application's own card; page changes elsewhere still count. */
@@ -575,6 +743,10 @@ class CaptureService : Service() {
         val previous = pageGuard
         pageGuard = null
         previous?.invalidate()
+        // A text guard from an older direct-read identity cannot coexist with a new pixel guard.
+        val previousText = textPageGuard
+        textPageGuard = null
+        previousText?.invalidate()
         pageGuardTimeout?.let { main.removeCallbacks(it) }
         // Keep the current card's exact exclusion: it was recorded by addPanel just before this call.
         val guard = LivePageGuard(++pageGuardCounter, body, baseline)
@@ -585,12 +757,15 @@ class CaptureService : Service() {
             // being compared against the pending identity either sets pendingPageChanged before
             // this lock or sees the mounted guard and invalidates it directly.
             pageGuardSourceNanos = pendingPageSourceNanos
+            pageGuardProtection = pendingPageProtection
             pageGuard = guard
             changedBeforeMount = pendingPageChanged
             pendingPageChanged = false
             pendingPageBaseline = null
             pendingPageBody = null
+            pendingPageProtection = null
             pendingPageSourceNanos = 0L
+            pendingStrictCoordinates = false
         }
         val timeout = Runnable { expirePageGuard(guard) }
         pageGuardTimeout = timeout
@@ -601,19 +776,88 @@ class CaptureService : Service() {
         }
     }
 
+    /**
+     * Mounts the text-path page identity for one complete direct-read snapshot. Like
+     * [startPageGuard], it consumes the pending lift identity, keeps the card's current exclusion
+     * and invalidates at most once. It never fabricates a pixel fingerprint: the snapshot's
+     * window/package/content generation is the identity, and later changes are checked by
+     * [textChangeListener].
+     */
+    private fun startTextPageGuard(snapshot: AccessibleTextSnapshot) {
+        val previous = pageGuard
+        pageGuard = null
+        previous?.invalidate()
+        val previousText = textPageGuard
+        textPageGuard = null
+        previousText?.invalidate()
+        pageGuardTimeout?.let { main.removeCallbacks(it) }
+        // An Available snapshot is usable only while the service instance that produced it is still
+        // connected and its text-change generation is unchanged. Events dispatched after the read
+        // completed but before this guard mounted are not yet visible to the guard listener, so this
+        // second, main-thread check closes that gap. A missing instance is not "no evidence"; it is
+        // an unprovable page and fails closed.
+        val serviceGeneration = AccessibleTextService.connectedInstance()?.currentGeneration()
+        val guard = AccessiblePageGuard(++pageGuardCounter, textGuardBody(snapshot),
+            snapshot.windowId, snapshot.packageName, snapshot.generation)
+        var changedBeforeMount = false
+        synchronized(pageLock) {
+            pageGuardSourceNanos = 0L
+            pageGuardProtection = null
+            textPageGuard = guard
+            changedBeforeMount = serviceGeneration == null ||
+                serviceGeneration != snapshot.generation || pendingPageChanged
+            pendingPageChanged = false
+            pendingPageBaseline = null
+            pendingPageBody = null
+            pendingPageProtection = null
+            pendingPageSourceNanos = 0L
+            pendingStrictCoordinates = false
+        }
+        val timeout = Runnable { expirePageGuard(guard) }
+        pageGuardTimeout = timeout
+        main.postDelayed(timeout, PAGE_GUARD_TIMEOUT_MS)
+        if (changedBeforeMount) {
+            invalidateTextPage(guard, "页面在本次查询开始后已变化；本次查询已失效。")
+        }
+    }
+
+    /** The proven region of a text snapshot: its window viewport clamped to this display. */
+    private fun textGuardBody(snapshot: AccessibleTextSnapshot): PixelBox {
+        val viewport = snapshot.viewport
+        if (viewport.left.isFinite() && viewport.top.isFinite() &&
+            viewport.right.isFinite() && viewport.bottom.isFinite()) {
+            val left = floor(viewport.left).toInt().coerceIn(0, screenWidth)
+            val top = floor(viewport.top).toInt().coerceIn(0, screenHeight)
+            val right = ceil(viewport.right).toInt().coerceIn(0, screenWidth)
+            val bottom = ceil(viewport.bottom).toInt().coerceIn(0, screenHeight)
+            if (right > left && bottom > top) return PixelBox(left, top, right, bottom)
+        }
+        return frameBody()
+    }
+
+    /** The one page authority a result/save may rely on, regardless of which path proved it. */
+    private fun currentPageGuard(): LookupPageGuard? = textPageGuard ?: pageGuard
+
     /** Ends observation for a finished/dismissed request without invalidating any newer guard. */
     private fun endPageGuard() {
+        val text = textPageGuard
+        textPageGuard = null
+        text?.invalidate()
         synchronized(pageLock) {
             val previous = pageGuard
             pageGuard = null
             previous?.invalidate()
             pageGuardSourceNanos = 0L
+            pageGuardProtection = null
             pendingPageBaseline = null
             pendingPageBody = null
+            pendingPageProtection = null
             pendingPageSourceNanos = 0L
             pendingPageChanged = false
+            pendingStrictCoordinates = false
         }
         pageOverlayBoxes = emptyList()
+        panelTarget = null
         pageGuardTimeout?.let { main.removeCallbacks(it) }
         pageGuardTimeout = null
     }
@@ -631,12 +875,39 @@ class CaptureService : Service() {
             guard.invalidate()
             pageGuard = null
             pageGuardSourceNanos = 0L
+            pageGuardProtection = null
             pendingPageBaseline = null
             pendingPageBody = null
+            pendingPageProtection = null
             pendingPageSourceNanos = 0L
             pendingPageChanged = false
+            pendingStrictCoordinates = false
         }
+        retireInvalidatedPage(message, "changed")
+    }
+
+    /** The direct-read snapshot was disproved by a text-free change notification. */
+    private fun invalidateTextPage(guard: AccessiblePageGuard, message: String) {
+        if (stopped) { guard.invalidate(); return }
+        synchronized(pageLock) {
+            if (textPageGuard !== guard) return
+            guard.invalidate()
+            textPageGuard = null
+            pageGuardSourceNanos = 0L
+            pageGuardProtection = null
+            pendingPageBaseline = null
+            pendingPageBody = null
+            pendingPageProtection = null
+            pendingPageSourceNanos = 0L
+            pendingPageChanged = false
+            pendingStrictCoordinates = false
+        }
+        retireInvalidatedPage(message, "text_changed")
+    }
+
+    private fun retireInvalidatedPage(message: String, stage: String) {
         pageOverlayBoxes = emptyList()
+        panelTarget = null
         pageGuardTimeout?.let { main.removeCallbacks(it) }
         pageGuardTimeout = null
         gate.next()
@@ -644,7 +915,7 @@ class CaptureService : Service() {
         // page that was derived from this now-unverifiable page instead of leaving a local result
         // floating over a new page.
         closeTranslationScreen()
-        perf.stage("page", "changed")
+        perf.stage("page", stage)
         val definition = definitionGuard
         if (definition == null) {
             removePanelView()
@@ -666,14 +937,39 @@ class CaptureService : Service() {
             if (pageGuard !== guard) return
             pageGuard = null
             pageGuardSourceNanos = 0L
+            pageGuardProtection = null
             pendingPageBaseline = null
             pendingPageBody = null
+            pendingPageProtection = null
             pendingPageSourceNanos = 0L
             pendingPageChanged = false
+            pendingStrictCoordinates = false
         }
-        pageOverlayBoxes = emptyList()
-        pageGuardTimeout = null
         guard.invalidate()
+        retireExpiredPage()
+    }
+
+    private fun expirePageGuard(guard: AccessiblePageGuard) {
+        synchronized(pageLock) {
+            if (textPageGuard !== guard) return
+            textPageGuard = null
+            pageGuardSourceNanos = 0L
+            pageGuardProtection = null
+            pendingPageBaseline = null
+            pendingPageBody = null
+            pendingPageProtection = null
+            pendingPageSourceNanos = 0L
+            pendingPageChanged = false
+            pendingStrictCoordinates = false
+        }
+        guard.invalidate()
+        retireExpiredPage()
+    }
+
+    private fun retireExpiredPage() {
+        pageOverlayBoxes = emptyList()
+        panelTarget = null
+        pageGuardTimeout = null
         gate.next()
         // The page identity expired, so any translation page derived from it is retired too.
         closeTranslationScreen()
@@ -754,8 +1050,10 @@ class CaptureService : Service() {
             frameTimeout = null
             pendingPageBaseline = null
             pendingPageBody = null
+            pendingPageProtection = null
             pendingPageSourceNanos = 0L
             pendingPageChanged = false
+            pendingStrictCoordinates = false
             true
         }
         if (!closed) return false
@@ -775,10 +1073,13 @@ class CaptureService : Service() {
         synchronized(pageLock) {
             pendingPageBaseline = null
             pendingPageBody = null
+            pendingPageProtection = null
             pendingPageSourceNanos = 0L
             pendingPageChanged = false
+            pendingStrictCoordinates = false
         }
         val session = live
+        abortDirectRead(session)
         removeLiveLayer()
         live = null
         session?.selection = null
@@ -900,8 +1201,10 @@ class CaptureService : Service() {
             val identity = pendingPageBaseline
             pendingPageBaseline = null
             pendingPageBody = null
+            pendingPageProtection = null
             pendingPageSourceNanos = 0L
             pendingPageChanged = false
+            pendingStrictCoordinates = false
             identity
         }
         if (!sessionIsActive() || !gate.accepts(request.token)) { bitmap.recycle(); return }
@@ -930,7 +1233,17 @@ class CaptureService : Service() {
         val view = LiveSelectionView(this, screenWidth, screenHeight,
             { stroke -> commitLiveStroke(session, stroke) },
             { toast("请沿完整单词一笔划过；轻点不查询") },
-            { reason -> cancelLiveMode(reason) })
+            { reason -> cancelLiveMode(reason) },
+            {
+                if (live === session) {
+                    session.beginStrokeMotion()
+                    // The compositor timestamp of a frame must be at/after this point to count as
+                    // stroke-time evidence; a queued pre-stroke image is not reused. The fixed
+                    // entry identity (never a rebased one) is compared until the lift decision.
+                    strokeObservation = StrokeObservation(
+                        session, session.entryFingerprint, session.body, System.nanoTime())
+                }
+            })
         if (!addLiveLayer(view)) return
         liveView = view
         scheduleLiveTimeout()
@@ -965,14 +1278,28 @@ class CaptureService : Service() {
             return
         }
         removeLiveLayer()
+        // The ink disappeared with the overlay. Close the evidence window before the verify frame
+        // is armed so a late frame is not compared against a mask that no longer exists; evidence
+        // recorded while the finger was down remains available to the lift decision.
+        session.endStrokeMotion()
         session.selection = selection
         perf.selectionSubmit()
         val request = armFrame(FramePurpose.VERIFY, session.body,
             SystemClock.elapsedRealtime() + VERIFY_FRAME_TIMEOUT_MS)
         session.verifyToken = request.token
+        startDirectRead(session)
     }
 
-    /** Rejects a stroke whose page changed, went black or could not be read while it was drawn. */
+    /**
+     * Rejects a stroke whose page changed, went black or could not be read while it was drawn.
+     *
+     * The entry and lift frames are compared with the bounded matcher against the fixed entry
+     * baseline. The stroke is reused only through [LiveSelectionSession.decideStrokeShift], which
+     * refuses a bare start/end offset. A nonzero shift is accepted only when real stroke-time
+     * frames proved the same shift as the lift frame, in which case the ink already is in lift
+     * coordinates and is used unchanged. The legacy strictly-unmoved endpoints path is named
+     * separately; the match's dx/dy is never added implicitly.
+     */
     private fun onVerifyFrame(request: FreshFrameRequest, bitmap: Bitmap) {
         val session = live
         val selection = session?.selection
@@ -980,6 +1307,7 @@ class CaptureService : Service() {
             session.generation != CaptureStatus.generation || session.verifyToken != request.token ||
             !gate.accepts(request.token)) {
             bitmap.recycle()
+            abortDirectRead(session)
             return
         }
         val published = synchronized(pageLock) { pendingPageBaseline }
@@ -990,31 +1318,258 @@ class CaptureService : Service() {
         }.getOrNull()
         if (fingerprint == null) {
             bitmap.recycle()
+            abortDirectRead(session)
             failLiveLookup("已拿到抬笔画面但无法读取页面特征（采集异常，不是 OCR 或词库问题）。本次未查询、未收录。请点「重试取词」。", "verify_frame")
             return
         }
-        if (!session.entryFingerprint.matches(fingerprint)) {
+        val match = session.matchLift(fingerprint, resources.displayMetrics.density)
+        if (!match.accepted) {
             bitmap.recycle()
-            val pageChanged = RecognitionFeedback.notice(RecognitionFailure.PAGE_CHANGED)
-            failLiveLookup(pageChanged.message, "page_changed", pageChanged.nextStep)
+            abortDirectRead(session)
+            if (match.kind == FrameMatchKind.CHANGED) {
+                val pageChanged = RecognitionFeedback.notice(RecognitionFailure.PAGE_CHANGED)
+                failLiveLookup(pageChanged.message, "page_changed", pageChanged.nextStep)
+            } else {
+                failLiveLookup("已拿到抬笔画面，但无法证明它与划词前是同一页面（画面证据不足或超出允许的移动范围）。本次未查询、未收录；请在页面稳定后重新划词。", "verify_unproven")
+            }
             return
         }
-        // Fresh lift frame, clean of bubble/ink/card, and materially the same page as the entry
-        // frame: this is the only frame handed to OCR. Its colour identity becomes the page
-        // baseline for the following OCR -> dictionary -> display/save/retry admissions, with the
-        // image's own source timestamp as the lower bound for later observations.
+        val decision = session.decideStrokeShift(match, session.strokeMotionEvidence(match.shift))
+        val liftSelection = when (decision) {
+            is StrokeShiftDecision.UseEntryCoordinates -> decision.selection
+            is StrokeShiftDecision.Translate -> decision.selection
+            is StrokeShiftDecision.Reselect -> {
+                bitmap.recycle()
+                abortDirectRead(session)
+                failLiveLookup(shiftReselectMessage(decision.reason), "verify_shift")
+                return
+            }
+        }
+        // The necessary painted-ink region, not the 64 dp OCR context crop. A card may cover a
+        // corner of the context crop without hiding the selected word; only this box is required
+        // to stay visible/provable, and its real bounds are the frame-thread exclusion.
+        val liftProtection = session.liftProtection()
+        if (liftProtection == null) {
+            bitmap.recycle()
+            abortDirectRead(session)
+            failLiveLookup("无法定位本次划选的笔迹区域。本次未查询、未收录；请重新划词。", "verify_protection")
+            return
+        }
+        // Fresh lift frame, clean of bubble/ink/card, and a page the bounded matcher proved is the
+        // entry page at the accepted (possibly zero) shift: this is the only frame handed to OCR.
+        // Its colour identity becomes the page baseline for the following direct-read/OCR ->
+        // dictionary -> display/save/retry admissions, with the image's own source timestamp as
+        // the lower bound for later observations.
         live = null
         session.selection = null
         // A differing frame observed between the accepted offer and this delivery is retained:
-        // startPageGuard consumes it after mounting and invalidates before OCR/save can continue.
+        // startPageGuard/startTextPageGuard consume it after mounting and invalidate before
+        // OCR/save can continue. The protection box is in the accepted lift frame's coordinates.
+        panelTarget = liftProtection
         synchronized(pageLock) {
             pendingPageSourceNanos = request.acceptedTimestampNanos
             pendingPageBody = session.body
-            // Publish the identity last: a frame thread that sees it also sees source and body.
+            pendingPageProtection = liftProtection
+            pendingStrictCoordinates = true
+            // Publish the identity last: a frame thread that sees it also sees source, body and
+            // protection.
             pendingPageBaseline = fingerprint
         }
-        perf.stage("frame", "verified")
-        recognize(bitmap, selection, session.deletionCredential)
+        perf.stage("frame", if (decision is StrokeShiftDecision.Translate) "verified_shift" else "verified")
+        val attempt = directRead?.takeIf { it.session === session }
+        if (attempt == null) {
+            recognize(bitmap, liftSelection, session.deletionCredential)
+            return
+        }
+        beginDirectReadCard(attempt, bitmap, liftSelection)
+    }
+
+    /** Honest, per-reason reselect copy; no path here queries, records or retries by itself. */
+    private fun shiftReselectMessage(reason: StrokeShiftReason): String = when (reason) {
+        StrokeShiftReason.PAGE_SHIFT_WITHOUT_TIME_MAPPING ->
+            "页面在划词过程中移动了，无法证明笔迹始终落在同一个词上。本次未查询、未收录；请在页面稳定后重新划词。"
+        StrokeShiftReason.SELECTION_OUTSIDE_PAGE ->
+            "页面移动后笔迹超出了可验证范围。本次未查询、未收录；请在页面稳定后重新划词。"
+        StrokeShiftReason.PROTECTION_MISMATCH, StrokeShiftReason.MATCH_NOT_ACCEPTED ->
+            "无法把这次笔迹安全对应到当前页面。本次未查询、未收录；请重新划词。"
+        else ->
+            "页面移动不是可验证的连续位移。本次未查询、未收录；请在页面稳定后重新划词。"
+    }
+
+    /**
+     * Starts the one optional accessibility direct read at lift. It is requested before any card is
+     * mounted, while the external application window is still the active/focused target. Only an
+     * explicit in-app switch plus a connected service enables it; otherwise the old OCR path runs
+     * immediately and no wait is added.
+     */
+    private fun startDirectRead(session: LiveSelectionSession) {
+        if (stopped || !sessionIsActive()) return
+        if (!AccessibleTextBridge.isEnabled(this) || !AccessibleTextBridge.isConnected) {
+            perf.stage("direct_read", "skipped")
+            return
+        }
+        val attempt = DirectReadAttempt(session)
+        directRead = attempt
+        val timeout = Runnable { onDirectReadDeadline(attempt) }
+        attempt.timeout = timeout
+        main.postDelayed(timeout, DIRECT_READ_WAIT_MS)
+        attempt.request = AccessibleTextBridge.requestSnapshot { result ->
+            onDirectReadResult(attempt, result)
+        }
+    }
+
+    private fun onDirectReadResult(attempt: DirectReadAttempt, result: AccessibleTextResult) {
+        // The bridge answers on the main thread and at most once.
+        if (directRead !== attempt || attempt.settled) return
+        attempt.settled = true
+        attempt.result = result
+        attempt.timeout?.let { main.removeCallbacks(it) }
+        attempt.timeout = null
+        if (attempt.liftReady) continueAfterDirectRead(attempt)
+    }
+
+    private fun onDirectReadDeadline(attempt: DirectReadAttempt) {
+        if (directRead !== attempt || attempt.settled) return
+        attempt.settled = true
+        perf.stage("direct_read", "timeout")
+        if (attempt.liftReady) continueAfterDirectRead(attempt)
+    }
+
+    /**
+     * Mounts the waiting card and parks the accepted lift bitmap for the bounded direct-read wait.
+     * The window is deliberately not focusable, so the external application keeps window focus
+     * while the accessibility service is still reading it. The card's rectangle is recorded in the
+     * frame mask exactly like every other panel.
+     */
+    private fun beginDirectReadCard(attempt: DirectReadAttempt, bitmap: Bitmap,
+                                    selection: HighlighterSelection) {
+        if (directRead !== attempt) { bitmap.recycle(); return }
+        val token = gate.next()
+        removePanelView()
+        val pending = compactCard("读取本页文字")
+        pending.headerLine("优先直接读取本页可见文字 · 不截图识别")
+        pending.body.addView(text("若本页文字无法直接读取，将只在本机识别这一次；完成前不查询、不收录。",
+            13f, Paper.secondary))
+        mountCompactCard(pending, focusable = false)
+        if (!sessionIsActive() || !gate.accepts(token)) {
+            releaseDirectAttempt(attempt)
+            bitmap.recycle()
+            return
+        }
+        if (pendingPageBaseline == null || pendingPageBody == null) {
+            // The page authority was retired while the card was mounted.
+            releaseDirectAttempt(attempt)
+            bitmap.recycle()
+            return
+        }
+        attempt.token = token
+        attempt.bitmap = bitmap
+        attempt.selection = selection
+        attempt.liftReady = true
+        if (attempt.settled) continueAfterDirectRead(attempt)
+    }
+
+    /**
+     * Resolves the direct read once (result or deadline) and either uses it or starts exactly one
+     * OCR fallback on the accepted lift bitmap. An ambiguous/no-hit/unavailable direct read is not
+     * guessed and never blocks the old path; a page change observed during the wait makes both
+     * paths fail closed through the pending/guard admission.
+     */
+    private fun continueAfterDirectRead(attempt: DirectReadAttempt) {
+        if (attempt.continued) return
+        attempt.continued = true
+        attempt.timeout?.let { main.removeCallbacks(it) }
+        attempt.timeout = null
+        val session = attempt.session
+        val attemptBitmap = attempt.bitmap
+        val attemptSelection = attempt.selection
+        if (directRead !== attempt || stopped || attemptBitmap == null || attemptSelection == null ||
+            !sessionIsActive() || session.generation != CaptureStatus.generation ||
+            !gate.accepts(attempt.token)) {
+            releaseDirectAttempt(attempt)
+            return
+        }
+        val result = attempt.result
+        if (result is AccessibleTextResult.Available) {
+            val resolution = SelectionRecovery.resolve(attemptSelection, result.snapshot.words)
+            // An exact punctuation/non-Latin hit is not an English direct-read result; it falls
+            // back to the single OCR instead of being shown as a no-English success.
+            val usable = resolution.selected.isNotEmpty() &&
+                (resolution.mode == SelectionResolutionMode.EXACT ||
+                    resolution.mode == SelectionResolutionMode.RECOVERED) &&
+                resolution.selected.any { word ->
+                    word.text.any { it in 'A'..'Z' || it in 'a'..'z' }
+                }
+            if (usable) {
+                // The snapshot is the page authority for the following dictionary/save/undo
+                // admissions; it is never mixed with a fabricated pixel identity.
+                startTextPageGuard(result.snapshot)
+                if (!sessionIsActive() || !gate.accepts(attempt.token)) {
+                    releaseDirectAttempt(attempt)
+                    return
+                }
+                val bitmap = detachDirectBitmap(attempt)
+                releaseDirectAttempt(attempt)
+                bitmap?.recycle()
+                perf.stage("direct_read", "used")
+                routeSelectedWords(resolution.selected, session.deletionCredential, source = "direct")
+                return
+            }
+            if (resolution.mode == SelectionResolutionMode.AMBIGUOUS &&
+                resolution.candidates.isNotEmpty()) {
+                // The same-page text identity now owns the explicit candidate card. No OCR is run
+                // and no candidate is queried/recorded before the user taps one.
+                startTextPageGuard(result.snapshot)
+                if (!sessionIsActive() || !gate.accepts(attempt.token)) {
+                    releaseDirectAttempt(attempt)
+                    return
+                }
+                val bitmap = detachDirectBitmap(attempt)
+                releaseDirectAttempt(attempt)
+                bitmap?.recycle()
+                perf.stage("direct_read", "ambiguous")
+                showAmbiguousSelection(resolution.candidates, session.deletionCredential)
+                return
+            }
+            perf.stage("direct_read", "unusable")
+        } else {
+            perf.stage("direct_read", "unavailable")
+        }
+        val bitmap = detachDirectBitmap(attempt) ?: run {
+            releaseDirectAttempt(attempt)
+            return
+        }
+        releaseDirectAttempt(attempt)
+        // Exactly one OCR fallback for this lift; the direct-read words (if any) are not reused.
+        recognize(bitmap, attemptSelection, session.deletionCredential)
+    }
+
+    private fun detachDirectBitmap(attempt: DirectReadAttempt): Bitmap? {
+        val bitmap = attempt.bitmap
+        attempt.bitmap = null
+        return bitmap
+    }
+
+    /** Releases the request and every retained snapshot/bitmap. Idempotent. */
+    private fun releaseDirectAttempt(attempt: DirectReadAttempt) {
+        if (directRead === attempt) directRead = null
+        attempt.continued = true
+        attempt.settled = true
+        attempt.timeout?.let { main.removeCallbacks(it) }
+        attempt.timeout = null
+        attempt.request?.cancel()
+        attempt.request = null
+        attempt.bitmap?.recycle()
+        attempt.bitmap = null
+        attempt.selection = null
+        attempt.result = null
+    }
+
+    /** Aborts the pending direct read of [session] (or any attempt when no session is named). */
+    private fun abortDirectRead(session: LiveSelectionSession? = null) {
+        val attempt = directRead ?: return
+        if (session != null && attempt.session !== session) return
+        releaseDirectAttempt(attempt)
     }
 
     /**
@@ -1034,6 +1589,7 @@ class CaptureService : Service() {
     }
 
     private fun failLiveLookup(message: String, stage: String, nextStep: String? = null) {
+        abortDirectRead()
         removeLiveLayer()
         live = null
         endPageGuard()
@@ -1061,6 +1617,10 @@ class CaptureService : Service() {
     }
 
     private fun removeLiveLayer() {
+        // Close the stroke-time evidence window with the layer. Observations recorded while the
+        // finger was down remain in the session for the lift decision; no frame captured after the
+        // ink disappeared may be attributed to the stroke.
+        strokeObservation = null
         liveTimeout?.let { main.removeCallbacks(it) }
         liveTimeout = null
         val view = liveView
@@ -1082,6 +1642,7 @@ class CaptureService : Service() {
     /** Leaves one-stroke mode without querying or writing anything. */
     private fun cancelLiveMode(reason: String?) {
         val hadLive = live != null || liveView != null
+        abortDirectRead()
         removeLiveLayer()
         live?.selection = null
         live = null
@@ -1127,7 +1688,7 @@ class CaptureService : Service() {
      * A compact, non-full-screen result/pending card. FLAG_NOT_TOUCH_MODAL keeps everything outside
      * the card's own bounds going to the page below; there is no dim layer or full-screen backdrop.
      */
-    private fun addPanel(view: View) {
+    private fun addPanel(view: View, focusable: Boolean = true) {
         removePanelView()
         val width = minOf(dp(440), (screenWidth - dp(24)).coerceAtLeast(dp(200)))
         // A long definition scrolls inside a card that never grows into a full-screen surface. The
@@ -1136,14 +1697,23 @@ class CaptureService : Service() {
         view.measure(View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
             View.MeasureSpec.makeMeasureSpec(maxHeight, View.MeasureSpec.AT_MOST))
         val height = view.measuredHeight.coerceIn(1, maxHeight)
-        // Exclude only the exact centered window this card actually covers. There is deliberately
-        // no fixed outward margin and no accumulated history: a word just above the card, or page
-        // pixels left visible around it, must remain page evidence.
-        pageOverlayBoxes = listOf(panelBox(width, height))
+        // Prefer a position that does not cover the necessary painted-ink region of this
+        // selection. The card is still a compact floating window; only its exact real bounds are
+        // excluded from page evidence, never the 64 dp OCR context crop around the stroke.
+        val placement = panelPlacement(width, height, panelTarget)
+        panelLeft = placement.box.left
+        panelTop = placement.box.top
+        pageOverlayBoxes = listOf(placement.box)
         val params = WindowManager.LayoutParams(width, height, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL, PixelFormat.TRANSLUCENT).apply {
+            WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                (if (focusable) 0 else WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE),
+            PixelFormat.TRANSLUCENT).apply {
             gravity = Gravity.CENTER
-            softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
+            // CENTER + vertical offset keeps the window in the same coordinate system as before;
+            // updatePanelOverlayBox still republishes the real laid-out rectangle afterwards.
+            y = placement.yOffset
+            softInputMode = if (focusable) WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
+            else WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING
         }
         // The owner created by this mount. Back, layout and inset callbacks capture it and the exact
         // view, so a queued callback from an already-replaced card can neither close the newer card
@@ -1151,8 +1721,11 @@ class CaptureService : Service() {
         // and returns to the bubble; the service keeps running, and the manual/translation windows
         // keep their own separate listeners.
         val owner = panelOwner
-        view.isFocusableInTouchMode = true
-        view.setOnKeyListener { v, key, event ->
+        // A waiting direct-read card is deliberately non-focusable: the external application must
+        // keep window focus while the accessibility service is still reading it. Its footer buttons
+        // remain touchable, so 划词 / 手动输入 / 退出 are still reachable; only Back is unavailable.
+        view.isFocusableInTouchMode = focusable
+        if (focusable) view.setOnKeyListener { v, key, event ->
             if (key == KeyEvent.KEYCODE_BACK && event.action == KeyEvent.ACTION_UP &&
                 owner == panelOwner && panel === v && !stopped
             ) {
@@ -1187,7 +1760,7 @@ class CaptureService : Service() {
         try {
             windows.addView(view, params)
             panel = view
-            view.requestFocus()
+            if (focusable) view.requestFocus()
             view.post { updatePanelOverlayBox(view, owner) }
         } catch (e: Exception) { fail("无法打开取词界面：${e.message}") }
     }
@@ -1205,6 +1778,40 @@ class CaptureService : Service() {
         val top = (screenHeight - height) / 2
         return PixelBox(left, top.coerceAtLeast(0),
             (left + width).coerceAtMost(screenWidth), (top + height).coerceAtMost(screenHeight))
+    }
+
+    private class PanelPlacement(val box: PixelBox, val yOffset: Int)
+
+    /**
+     * Chooses the card's vertical side so it does not cover the necessary selection ink when the
+     * centred position would. "尽量": when neither side has room, the original centred position is
+     * kept rather than inventing a position outside the usable page. The horizontal centre is
+     * unchanged; the returned offset is relative to [Gravity.CENTER], matching the pre-existing
+     * window coordinate basis.
+     */
+    private fun panelPlacement(width: Int, height: Int, avoid: PixelBox?): PanelPlacement {
+        val centered = panelBox(width, height)
+        if (avoid == null || width <= 0 || height <= 0) return PanelPlacement(centered, 0)
+        if (avoid.left >= centered.right || centered.left >= avoid.right ||
+            avoid.top >= centered.bottom || centered.top >= avoid.bottom) {
+            return PanelPlacement(centered, 0)
+        }
+        val body = frameBody()
+        val gap = dp(10)
+        val below = avoid.bottom + gap
+        val above = avoid.top - gap - height
+        val belowFits = below >= body.top && below + height <= body.bottom
+        val aboveFits = above >= body.top && above + height <= body.bottom
+        val targetTop = when {
+            belowFits && aboveFits ->
+                if ((avoid.top + avoid.bottom) / 2 < (body.top + body.bottom) / 2) below else above
+            belowFits -> below
+            aboveFits -> above
+            else -> return PanelPlacement(centered, 0)
+        }
+        val top = targetTop.coerceIn(body.top, (body.bottom - height).coerceAtLeast(body.top))
+        val box = PixelBox(centered.left, top, centered.right, top + height)
+        return PanelPlacement(box, top - centered.top)
     }
 
     /**
@@ -1239,6 +1846,8 @@ class CaptureService : Service() {
         val bottom = (location[1] + height).coerceIn(0, screenHeight)
         if (right <= left || bottom <= top) return
         val box = PixelBox(left, top, right, bottom)
+        panelLeft = left
+        panelTop = top
         if (pageOverlayBoxes.size != 1 || pageOverlayBoxes[0] != box) {
             pageOverlayBoxes = listOf(box)
         }
@@ -1248,7 +1857,7 @@ class CaptureService : Service() {
      * Shrinks the mounted card to the region actually left by the IME / system bars.
      *
      * Only the body loses height: [OverlayCardLayout] measures the header and footer first, so the
-     * "重新划选 | 退出" row stays laid out at every font scale and in landscape. The page-exclusion
+     * "划词 | 手动输入 | 退出" row stays laid out at every font scale and in landscape. The page-exclusion
      * rectangle is updated to the window that is really covered, never to a larger one.
      * Idempotent: a pass that would not change the height does nothing, so insets arriving in a
      * burst cannot loop through relayout.
@@ -1264,7 +1873,11 @@ class CaptureService : Service() {
         val height = view.measuredHeight.coerceIn(1, cap)
         if (height >= params.height) return
         params.height = height
-        pageOverlayBoxes = listOf(panelBox(width, height))
+        // Keep the chosen horizontal/vertical position; only the body's height shrinks. The real
+        // bounds are republished by updatePanelOverlayBox after this layout pass.
+        pageOverlayBoxes = listOf(PixelBox(panelLeft, panelTop,
+            (panelLeft + width).coerceAtMost(screenWidth),
+            (panelTop + height).coerceAtMost(screenHeight)))
         runCatching { windows.updateViewLayout(view, params) }
     }
     private fun removePanelView() {
@@ -1303,6 +1916,7 @@ class CaptureService : Service() {
         // Closing the page card ends every editor it owned, even before its view detaches.
         closeSupplementEditors()
         perf.end("closed", "dismiss")
+        abortDirectRead()
         gate.next(); requestedFrame.getAndSet(null)?.cancel(); clearFrameTimeout()
         // The dismissed attempt is over; queued failure notifications for it must stay silent.
         lookupEpoch++
@@ -1335,8 +1949,10 @@ class CaptureService : Service() {
         if (!sessionIsActive() || !gate.accepts(token)) {
             pendingPageBaseline = null
             pendingPageBody = null
+            pendingPageProtection = null
             pendingPageSourceNanos = 0L
             pendingPageChanged = false
+            pendingStrictCoordinates = false
             crop.recycle()
             return
         }
@@ -1397,7 +2013,21 @@ class CaptureService : Service() {
                         }
                     } }
                 }
-                val selected = HighlighterGeometry.hitWords(selection, elements)
+                // One real resolve for the OCR path too: exact English hits stay untouched, only a
+                // zero-exact-English stroke may use the bounded recovery, an ambiguous result is a
+                // visible candidate choice (no query before the tap), and none is a failure card.
+                val resolution = SelectionRecovery.resolve(selection, elements)
+                if (resolution.mode == SelectionResolutionMode.AMBIGUOUS) {
+                    perf.stage("ocr_ambiguous", "needs_confirmation")
+                    showAmbiguousSelection(resolution.candidates, credential)
+                    return@addOnSuccessListener
+                }
+                if (resolution.mode == SelectionResolutionMode.NONE) {
+                    perf.stage("ocr_empty", "failed")
+                    showRecognitionFailure(RecognitionFeedback.notice(RecognitionFailure.OCR_EMPTY))
+                    return@addOnSuccessListener
+                }
+                val selected = resolution.selected
                 val raw = HighlighterGeometry.selectedText(selected)
                 val words = selected.map { it.text }
                 // normalize() accepts any Unicode letters, so "dictionary-shaped" is not the same
@@ -1488,6 +2118,91 @@ class CaptureService : Service() {
         }
         content.addView(compactButton("纠正选中文字") { showTextCorrection(raw) })
         mountCompactCard(card)
+    }
+
+    /**
+     * Routes one already resolved selection (direct-read or OCR) through the existing
+     * single-word / sentence / correction / no-English decisions.
+     *
+     * The list is the original selected [HighlighterWord]s in reading order. This method never joins
+     * the whole stroke line, never fills a second blank word and never sets `manual=true`: its
+     * lookups keep the explicit capture [credential] and therefore still require the current page
+     * guard for an automatic save. It starts one query at most when the selection is a single word;
+     * every other branch is a visible result/choice card that queries nothing by itself.
+     */
+    private fun routeSelectedWords(selected: List<HighlighterWord>, credential: Long, source: String) {
+        if (selected.isEmpty() || stopped || !sessionIsActive()) return
+        val raw = HighlighterGeometry.selectedText(selected)
+        val words = selected.map { it.text }
+        // normalize() accepts any Unicode letters, so only a real English candidate may enter the
+        // single-word query path; non-Latin OCR text stays a recognition result.
+        val singleForm = selected.singleOrNull()?.let { word ->
+            RawKajwebDictionary.normalize(word.text)?.takeIf { RecognitionFeedback.hasLatinLetter(it) }
+        }
+        val hasEnglishCandidate = words.any { word ->
+            RawKajwebDictionary.normalize(word)?.let { RecognitionFeedback.hasLatinLetter(it) } == true
+        }
+        when {
+            singleForm != null -> lookup(selected.first().text, raw, credentialOverride = credential)
+            isDirectEnglishSentence(raw, words) -> {
+                perf.stage("selection_sentence", source)
+                openTranslation(raw, autoTranslate = true, selectionWords = words)
+            }
+            !hasEnglishCandidate -> {
+                perf.stage("selection_no_english", source)
+                showNoEnglish(raw)
+            }
+            else -> {
+                perf.stage("selection_multiple", source)
+                showSelectedText(raw, words)
+            }
+        }
+    }
+
+    /**
+     * Shows the few original OCR words that [SelectionRecovery] could not disambiguate.
+     *
+     * Nothing is queried, counted or recorded before the user taps one candidate. Every button
+     * captures this card's owner, its gate token, the original capture credential and the one page
+     * guard; a tap delivered after replacement/invalidation is inert, and an admitted tap enters the
+     * normal non-manual lookup/save path. The candidates are never concatenated or treated as a
+     * sentence.
+     */
+    private fun showAmbiguousSelection(candidates: List<HighlighterWord>, credential: Long) {
+        val choices = candidates.filter { word ->
+            RawKajwebDictionary.normalize(word.text)
+                ?.let { RecognitionFeedback.hasLatinLetter(it) } == true
+        }.distinctBy { it.text }.take(3)
+        val page = currentPageGuard()
+        if (choices.isEmpty() || page == null || !page.isValid) {
+            gate.next()
+            endPageGuard()
+            perf.stage("ambiguous", "page_invalid")
+            showMessage("本次笔迹附近的候选已无法在当前页面上确认；本次未查询、未收录。请重新划词。")
+            return
+        }
+        val token = gate.next()
+        perf.snapshot("ambiguous")
+        val card = compactCard("选择要查的词")
+        card.headerLine("笔迹附近有多个可能的词 · 点击前不查询、不收录")
+        val content = card.body
+        content.addView(text("本次笔迹无法唯一对应一个词。请选择一个真实候选；不会自动合并整行，也不使用手动查词入口。",
+            14f, Paper.warning)); content.space(8)
+        mountCompactCard(card)
+        val owner = panelOwner
+        choices.forEach { word ->
+            content.addView(compactButton("查词：${word.text}") {
+                if (owner != panelOwner || panel !== card || stopped || !sessionIsActive()) {
+                    return@compactButton
+                }
+                if (!gate.accepts(token)) return@compactButton
+                if (page.isValid != true) {
+                    toast("页面状态已变化，本次候选已失效；请重新划词")
+                    return@compactButton
+                }
+                lookup(word.text, word.text, credentialOverride = credential)
+            }); content.space(8)
+        }
     }
 
     /**
@@ -1979,9 +2694,11 @@ class CaptureService : Service() {
         val owner = panelOwner
         retry.setOnClickListener { retryLiveSelection(owner) }
         manual.setOnClickListener { openManualInput(owner, raw) }
-        // The fixed footer's "重新划选" is the same explicit restart for this card (the message text
+        // The fixed footer's "划词" is the same explicit restart for this card (the message text
         // refers to "重试取词"). It keeps the guarded entry so a stopped session or a dead projection
-        // reports why instead of arming a frame that can never arrive.
+        // reports why instead of arming a frame that can never arrive. The footer's "手动输入" stays
+        // bound by mountCompactCard; the body's prefilled manual action above remains the shortcut
+        // that keeps the shown raw text.
         card.restart.setOnClickListener { retryLiveSelection(owner) }
     }
 
@@ -2035,14 +2752,18 @@ class CaptureService : Service() {
         }
         val query = button("查询", true) { submitManualInput(session, input, status) }
         // The box is a specialized editor window, not a word/result card: it keeps its own session
-        // and close admission, and its footer is "关闭" only (a "重新划选" here would retire the
-        // editor the user is typing in). "关闭" returns to the bubble without stopping capture.
+        // and close admission. It already has its own "查询" action, so both "划词" and the
+        // secondary "手动输入" footer entries are hidden here instead of offering a meaningless
+        // second input box; only "关闭" stays, and it returns to the bubble without stopping
+        // capture. An unfinished draft lives in this window's EditText and is not rebuilt or
+        // dismissed by background card/page updates.
         val card = OverlayCardLayout(this).apply {
             setPadding(dp(18), dp(18), dp(18), dp(14)); background = shape(Paper.surface, border = true)
             setTitle("手动查词")
         }
         card.headerLine("仅查本机离线词库 · 不会自动查询")
         card.restart.visibility = View.GONE
+        card.manual.visibility = View.GONE
         card.exit.text = "关闭"
         card.exit.textSize = 15f
         card.exit.contentDescription = "关闭输入框，返回悬浮条（不停止查词）"
@@ -2387,7 +3108,9 @@ class CaptureService : Service() {
                                initialUser: UserDictionaryEntry?, replaces: String?,
                                credential: Long, manual: Boolean = false) {
         val token = gate.next()
-        val page = pageGuard
+        // The authority may be either the pixel lift guard or the direct-read text guard. Binding
+        // only pageGuard would silently drop the text guard's save admission for direct-read words.
+        val page = currentPageGuard()
         val event = QueryEvent(UUID.randomUUID().toString(), entry.key, raw, form, System.currentTimeMillis())
         val card = compactCard(entry.headword)
         // The save/undo status is the core feedback of this card, so it stays in the fixed header
@@ -2475,8 +3198,13 @@ class CaptureService : Service() {
             }
             retry.visibility = View.GONE; status.text = "保存中…"
             app.worker.execute {
-                if (!sessionIsActive() || !gate.accepts(token)) return@execute
-                val result = runCatching { app.repository.record(event, entry, replaces, credential) { sessionIsActive() && gate.accepts(token) } }
+                // The page/card admission is re-read at the worker boundary and again inside the
+                // repository's pre-transaction predicate, so an invalidation on another thread
+                // cannot be lost between the main-thread comparison and the commit.
+                fun admittedNow(): Boolean = sessionIsActive() && gate.accepts(token) &&
+                    (guard.manual || guard.page?.isValid == true)
+                if (!admittedNow()) return@execute
+                val result = runCatching { app.repository.record(event, entry, replaces, credential) { admittedNow() } }
                 main.post {
                     if (sessionIsActive() && gate.accepts(token) && definitionGuard === guard && !guard.invalid) {
                         val error = result.exceptionOrNull()
@@ -2539,15 +3267,16 @@ class CaptureService : Service() {
     /**
      * A regular floating word/prompt card in the compact form: one short fixed header (the
      * headword or the card's purpose), an internally scrolling body, and one always-visible
-     * footer row "重新划选 | 退出".
+     * footer row "划词 | 手动输入 | 退出".
      *
      * Only the body scrolls, so long meanings, raw OCR text and the inline editors never push the
      * navigation row off-screen on a small screen, at a large font scale or with the keyboard up.
      * The meaning is never hard-truncated to fake a one-screen card.
      *
      * Layout only: it owns no capture/OCR/dictionary/page/save admission. [restart] defaults to the
-     * existing explicit "start a new stroke" entry, [exit] to the existing card-close behavior
-     * (remove this card, keep the capture service running and return to the bubble).
+     * existing explicit "start a new stroke" entry, [manual] to the service-owned in-page input box
+     * (bound by [mountCompactCard]), and [exit] to the existing card-close behavior (remove this
+     * card, keep the capture service running and return to the bubble).
      */
     private fun compactCard(title: String): OverlayCardLayout {
         val card = OverlayCardLayout(this)
@@ -2566,13 +3295,21 @@ class CaptureService : Service() {
     /**
      * Mounts [card] and binds its fixed footer to the panel identity created by this mount.
      *
-     * "退出" only closes this exact card and returns to the floating bar; it never stops the
-     * capture service and never touches a newer card. A queued click from an already-replaced or
-     * dismissed card sees a different owner and does nothing. "重新划选" uses the existing explicit
-     * stroke entry, which arms a fresh deletion credential and frame — it reuses nothing.
+     * All three entries share the same admission: the captured [owner] and the exact [card] must
+     * still be the mounted panel, and the capture session must still be alive. A click queued by an
+     * already-replaced or dismissed card is therefore a complete no-op and can neither close a newer
+     * card nor start a query in its world.
+     *
+     * "划词" uses the existing explicit stroke entry, which arms a fresh deletion credential, gate
+     * token and entry frame — it reuses no previous word's event or credential. "手动输入" retires
+     * this card (including any unadmitted lookup/frame/page guard), then opens the service-owned
+     * input box on the current page. The box starts empty, opens no MainActivity and never queries
+     * until the user submits once; a rejected or cancelled card therefore writes nothing. "退出"
+     * only closes this exact card and returns to the floating bar; it never stops the capture
+     * service and never touches data already committed by an admitted save.
      */
-    private fun mountCompactCard(card: OverlayCardLayout) {
-        addPanel(card)
+    private fun mountCompactCard(card: OverlayCardLayout, focusable: Boolean = true) {
+        addPanel(card, focusable)
         val owner = panelOwner
         card.exit.setOnClickListener {
             if (owner != panelOwner || panel !== card) return@setOnClickListener
@@ -2582,6 +3319,13 @@ class CaptureService : Service() {
         card.restart.setOnClickListener {
             if (owner != panelOwner || panel !== card) return@setOnClickListener
             beginLiveSelection()
+        }
+        card.manual.setOnClickListener {
+            if (owner != panelOwner || panel !== card || stopped || !sessionIsActive()) {
+                return@setOnClickListener
+            }
+            // Empty next word, focused by openManualInput; no query is submitted here.
+            openManualInput("")
         }
     }
 
@@ -2623,6 +3367,9 @@ class CaptureService : Service() {
         // transaction yet; an already-admitted save keeps its atomic commit.
         closeSupplementEditors()
         app.repository.changes.remove(deletionListener)
+        // The service-owned bridge listener lives as long as this service; remove it before the
+        // panel/live teardown so a late text-free change cannot touch a destroyed service.
+        AccessibleTextBridge.removeChangeListener(textChangeListener)
         dismissPanel(); removeBubble()
         display?.release(); display = null
         projection?.stop(); projection = null

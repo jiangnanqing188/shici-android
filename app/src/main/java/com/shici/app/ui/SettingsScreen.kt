@@ -6,6 +6,7 @@ import android.view.View
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.Switch
 import android.widget.TextView
 
 /**
@@ -17,37 +18,52 @@ import android.widget.TextView
  *   都由 MainActivity 沿用原有字段创建后挂到本类的 host 上，仍由原异步回调与 statusListener 更新；
  * - 系统权限入口只回调调用方打开的按钮，本页不会自动申请或开启屏幕捕获投影。
  *
- * 首屏优先显示日常状态和动作：查词会话 → 两个权限入口 → 备份/恢复 → 使用帮助 → 关于。
- * 权限与捕获说明、备份校验/覆盖规则、词库来源、联网边界和隐私细节都放在默认收起的
- * [helpDisclosure] 中；恢复覆盖提醒与明文隐私短提醒始终在备份区域可见。
+ * 首屏优先显示日常状态和动作：查词会话 → 权限入口 → 页面文字直读开关 → 备份/恢复 →
+ * 使用帮助 → 关于。权限与捕获说明、备份校验/覆盖规则、词库来源、联网边界和隐私细节都放在
+ * 默认收起的 [helpDisclosure] 中；恢复覆盖提醒与文字直读的短隐私提醒始终可见。
  *
  * 汇总接线提示：`MainActivity.settings()` 构造本组件后，把 [view] 加到 body；再将原有
  * `backupExportButton` / `restoreButton` 加入 [backupActionHost]，`backupStatusView` 加入
  * [backupStatusHost]，`floatingText` 加入 [captureStatusHost]，`stopCaptureButton` 加入
  * [captureActionHost]，`dictionaryStatus()` 加入 [dictionaryStatusHost]，最后调用原有
  * `updateBackupButtons()` 与 `statusListener(CaptureStatus.state)`。权限徽章在重新进入设置页
- * 或由调用方在回到前台时通过 [updatePermissionStatus] 刷新；本组件不自行读取系统权限。
+ * 或由调用方在回到前台时通过 [updatePermissionStatus] 刷新；文字直读开关与状态行由
+ * [updateAccessibilityStatus] 按持久化/连接实况同步；本组件不自行读取系统权限或启用服务。
  *
  * @param overlayStatus 悬浮窗权限的展示状态（由 Activity 读取系统状态后传入）。
  * @param notificationStatus 通知权限的展示状态；API 33 以下可传“无需单独授权”。
+ * @param accessibilityStatus 页面文字直读的开关与连接状态；label 由调用方按真实状态生成。
  * @param versionText 内部版本说明，由调用方从 BuildConfig 读取，避免本组件硬编码版本。
  * @param provenanceText 原始词库来源说明，由调用方沿用 RawKajwebDictionary.provenance 生成。
  * @param onOpenOverlayPermission 打开系统悬浮窗权限设置；不在此处申请捕获。
  * @param onOpenNotificationSettings 打开系统通知设置；不自动弹出运行时授权。
  * @param onOpenUsageGuide 打开完整使用说明页；尚未接线时传 null，本页不显示空的帮助入口。
+ * @param onAccessibilityTextEnabledChange 用户拨动页面文字直读开关；Activity 负责隐私确认与持久化。
+ * @param onOpenAccessibilitySettings 打开系统无障碍设置；本组件不会启用或关闭系统服务。
  */
 class SettingsScreen(
     context: Context,
     overlayStatus: PermissionStatus,
     notificationStatus: PermissionStatus,
+    accessibilityStatus: AccessibilityStatus,
     versionText: String,
     provenanceText: String,
     onOpenOverlayPermission: () -> Unit,
     onOpenNotificationSettings: () -> Unit,
-    onOpenUsageGuide: (() -> Unit)? = null
+    onOpenUsageGuide: (() -> Unit)? = null,
+    onAccessibilityTextEnabledChange: (Boolean) -> Unit = {},
+    onOpenAccessibilitySettings: () -> Unit = {}
 ) {
     /** 权限徽章文案与配色状态；label 由调用方决定，便于区分“无需单独授权”。 */
     data class PermissionStatus(val label: String, val granted: Boolean)
+
+    /** 页面文字直读的展示状态：开关是否开启、系统服务是否已连接及诚实的短标签。 */
+    data class AccessibilityStatus(
+        val enabled: Boolean,
+        val connected: Boolean,
+        val label: String,
+        val healthy: Boolean
+    )
 
     /** 完整可滚动正文；加到页面 body 时使用 MATCH_PARENT 宽高。 */
     val view: View
@@ -69,6 +85,11 @@ class SettingsScreen(
 
     private lateinit var overlayBadge: TextView
     private lateinit var notificationBadge: TextView
+    private lateinit var accessibilitySwitch: Switch
+    private lateinit var accessibilityStatusView: TextView
+    // True only while the switch is synchronised from the real persisted state, so programmatic
+    // updates never look like a user tap and never re-open the privacy confirmation.
+    private var syncingAccessibility = false
 
     init {
         val content = context.column()
@@ -109,6 +130,43 @@ class SettingsScreen(
         session.addView(notificationRow)
         session.addView(
             context.button("打开系统通知设置") { onOpenNotificationSettings() },
+            LinearLayout.LayoutParams(-1, -2)
+        )
+        session.space(12)
+        session.divider()
+
+        // Optional direct text reading. The switch is the in-app authorisation; the system service
+        // itself can only be enabled by the user in Android accessibility settings.
+        val directReadingRow = context.row().apply { gravity = Gravity.CENTER_VERTICAL }
+        directReadingRow.addView(
+            context.text("页面文字直读（可选）", 17f, Paper.ink, true),
+            LinearLayout.LayoutParams(0, -2, 1f)
+        )
+        accessibilitySwitch = Switch(context).apply {
+            isChecked = accessibilityStatus.enabled
+            minHeight = context.dp(48)
+            contentDescription = "页面文字直读开关"
+            setOnCheckedChangeListener { _, checked ->
+                if (!syncingAccessibility) onAccessibilityTextEnabledChange(checked)
+            }
+        }
+        directReadingRow.addView(accessibilitySwitch, LinearLayout.LayoutParams(-2, -2))
+        session.addView(directReadingRow)
+        accessibilityStatusView = context.text(
+            accessibilityStatus.label,
+            15f,
+            if (accessibilityStatus.healthy) Paper.green else Paper.secondary
+        )
+        session.addView(accessibilityStatusView)
+        session.addView(
+            context.text(
+                "仅本机、仅在你勾画取词的短暂请求中读取当前页面文字与单词位置；只在内存，不写盘、不记录、不上传。默认关闭。",
+                15f,
+                Paper.secondary
+            )
+        )
+        session.addView(
+            context.button("打开系统无障碍设置") { onOpenAccessibilitySettings() },
             LinearLayout.LayoutParams(-1, -2)
         )
         session.space(12)
@@ -289,6 +347,21 @@ class SettingsScreen(
     fun updatePermissionStatus(overlay: PermissionStatus, notification: PermissionStatus) {
         applyBadge(overlayBadge, overlay)
         applyBadge(notificationBadge, notification)
+    }
+
+    /**
+     * Syncs the direct-reading switch and status line from the real persisted/connection state
+     * without firing the change callback, so a cancelled privacy confirmation reverts the switch
+     * and returning from system accessibility settings shows the true connection state.
+     */
+    fun updateAccessibilityStatus(status: AccessibilityStatus) {
+        syncingAccessibility = true
+        accessibilitySwitch.isChecked = status.enabled
+        syncingAccessibility = false
+        accessibilityStatusView.text = status.label
+        accessibilityStatusView.setTextColor(
+            if (status.healthy) Paper.green else Paper.secondary
+        )
     }
 
     private fun applyBadge(view: TextView, status: PermissionStatus) {
