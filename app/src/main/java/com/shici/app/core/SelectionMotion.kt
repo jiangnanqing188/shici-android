@@ -2,7 +2,8 @@ package com.shici.app.core
 
 import java.nio.ByteBuffer
 import kotlin.math.abs
-import kotlin.math.roundToInt
+import kotlin.math.sqrt
+import kotlin.math.ceil
 
 /** One whole-page content translation, in screenshot pixels, relative to a fixed baseline frame. */
 data class PageShift(val dx: Int, val dy: Int) {
@@ -54,7 +55,7 @@ fun PixelBox.shifted(dx: Int, dy: Int): PixelBox =
     PixelBox(left + dx, top + dy, right + dx, bottom + dy)
 
 enum class FrameMatchKind {
-    /** Strict zero-shift identity: every compared pixel equals the baseline. */
+    /** Stationary page content; see reason for strict or sampled-context evidence. */
     SAME,
 
     /** A unique bounded whole-page translation was proven; [FrameMatch.dx]/[FrameMatch.dy] matter. */
@@ -69,6 +70,7 @@ enum class FrameMatchKind {
 
 enum class FrameMatchReason {
     STRICT_ZERO_SHIFT,
+    STABLE_CONTENT_WITH_ANIMATION,
     UNIQUE_BOUNDED_SHIFT,
     CONTENT_MISMATCH,
     NO_UNIQUE_SHIFT,
@@ -107,14 +109,18 @@ data class FrameMatch(
     val candidateOverlap: PixelBox?,
     val protection: PixelBox?,
     val reason: FrameMatchReason,
-    /** Hard bound (`<= 48 px`) used for this comparison, derived from display density. */
+    /** Screen-derived search bound used for this comparison; never a fixed dp/48px limit. */
     val maxOffset: Int = 0,
     val sampledAnchors: Int = 0,
     val confirmingAnchors: Int = 0,
     val confirmingQuadrants: Int = 0,
     val probeSupport: Int = 0,
     val examinedCandidates: Int = 0,
-    val comparedPixels: Long = 0L
+    val comparedPixels: Long = 0L,
+    val contextSamples: Long = 0L,
+    val changedContextSamples: Long = 0L,
+    val edgeContextSamples: Long = 0L,
+    val changedEdgeContextSamples: Long = 0L
 ) {
     val shift: PageShift get() = PageShift(dx, dy)
     val accepted: Boolean get() = kind == FrameMatchKind.SAME || kind == FrameMatchKind.MOVED
@@ -209,87 +215,37 @@ sealed interface StrokeShiftDecision {
 }
 
 /**
- * Pure, Android-free bounded translation matching and gesture-shift admission.
- *
- * The matcher accepts at most a small whole-page translation (per display density, hard-capped at
- * [MAX_BOUNDED_SHIFT_PX]). It never compares only a percentage of the page and never accepts a
- * candidate merely because most pixels agree: a single changed glyph in the selected-word
- * protection region is a mismatch.
- *
- * Evidence rules:
- *  - zero displacement is checked first by the existing strict pixel comparison;
- *  - otherwise several dispersed high-contrast anchors must agree on exactly one integer shift
- *    (5x5 patch-confirmed in at least three screen quadrants);
- *  - the shifted overlap must be large enough and must fully contain the protection region, so a
- *    word that would fall into newly exposed edge pixels is rejected;
- *  - the winner is then verified pixel by pixel over the whole visible overlap with the original
- *    colour-bucket tolerance of [LiveFrameFingerprint]. There is no mismatch budget;
- *  - pure white/blank pages, repeated patterns with multiple equally strong shifts, too few
- *    anchors, ambiguous results, zoom/rotation/reflow and changes to the selected word all fail
- *    closed as [FrameMatchKind.UNAVAILABLE] or [FrameMatchKind.CHANGED].
- *
- * Hard resource budgets: at most [PROBE_ANCHORS] anchors scan offsets, at most
- * [MAX_CANDIDATES] candidates are ranked, and only a uniquely confirmed candidate reaches the
- * full-pixel pass. The search is never a `(2r+1)^2` scan over every page pixel and no OCR, network,
- * bitmap or second identity/fingerprint is allocated. Exclusions are screen-coordinate boxes
- * (this application's own windows), applied per pixel on both the baseline and candidate side; the
- * selected-word protection region may not intersect them.
+ * Full-screen translation search against one fixed baseline. The selected region must remain
+ * visible and exact; outside it a 0.5% animation allowance avoids rejecting a moving page title.
+ * Sparse signature votes keep memory independent of the square of the screen dimensions.
+ * Ambiguous, blank, unreadable frames and insufficient overlap still fail closed. A search
+ * result alone never proves the page position during a stroke; admitStrokeShift enforces that.
  */
 object SelectionMotion {
-    /** Hard ceiling for any bounded shift, independent of display density. */
-    const val MAX_BOUNDED_SHIFT_PX = 48
-
-    /** Nominal small shift in dp; multiplied by density, then clamped to the hard ceiling. */
-    const val BOUNDED_SHIFT_DP = 24f
-
     private const val GRID_COLUMNS = 6
     private const val GRID_ROWS = 6
-    private const val LATTICE = 5
     private const val MAX_ANCHORS = 12
     private const val MIN_ANCHORS = 6
     private const val PROBE_ANCHORS = 6
     private const val SIGNATURE_RADIUS = 1
-    private const val SIGNATURE_POINTS = 5
     private const val PATCH_RADIUS = 2
     private const val HIGH_CONTRAST_BUCKETS = 3
     private const val MIN_CONFIRMING_ANCHORS = 4
-    private const val MIN_CONFIRMING_QUADRANTS = 3
+    private const val MIN_CONFIRMING_QUADRANTS = 2
     private const val MIN_PROBE_VOTES = 2
-    private const val MAX_CANDIDATES = 4
-    private const val MIN_OVERLAP_PERCENT = 60L
+    private const val MAX_CANDIDATES = 16
+    private const val MIN_OVERLAP_PERCENT = 10L
     private const val MIN_COMPARED_PERCENT = 20L
-    private const val MAX_SEARCH_COMPARISONS = 320_000L
+    private const val MAX_SEARCH_POSITIONS = 64_000_000L
+    private const val MAX_VOTED_SHIFTS = 8_192
     private const val MAX_ALLOWED_SHIFT_PROOFS = 9_409
 
     private val NEIGHBOURS = intArrayOf(-1, 0, 1, 0, 0, -1, 0, 1)
     private val SIGNATURE = intArrayOf(0, 0, -1, 0, 1, 0, 0, -1, 0, 1)
-    private val LATTICE_POINTS: List<Pair<Int, Int>> = run {
-        val points = ArrayList<Pair<Int, Int>>(LATTICE * LATTICE)
-        for (y in 0 until LATTICE) for (x in 0 until LATTICE) points += x to y
-        points.sortWith(compareBy<Pair<Int, Int>>(
-            { abs(it.first - LATTICE / 2) + abs(it.second - LATTICE / 2) },
-            { it.first },
-            { it.second }
-        ))
-        points
-    }
-
-    /**
-     * Bounded offset for [density], in pixels. Invalid densities yield 0 (no shift search);
-     * values are clamped to [MAX_BOUNDED_SHIFT_PX].
-     */
-    fun maxOffsetPx(density: Float): Int {
-        if (!density.isFinite() || density <= 0f) return 0
-        return (BOUNDED_SHIFT_DP * density).roundToInt().coerceIn(0, MAX_BOUNDED_SHIFT_PX)
-    }
-
-    /** The complete finite set of shifts the matcher may consider, or null for an invalid density. */
-    fun boundedShifts(density: Float): List<PageShift>? {
-        if (!density.isFinite() || density <= 0f) return null
-        val radius = maxOffsetPx(density)
-        val shifts = ArrayList<PageShift>((2 * radius + 1) * (2 * radius + 1))
-        for (dy in -radius..radius) for (dx in -radius..radius) shifts += PageShift(dx, dy)
-        return shifts
+    /** Search the full captured page in either axis; no fixed density-dependent cutoff. */
+    fun maxOffsetPx(density: Float, body: PixelBox): Int {
+        if (!density.isFinite() || density <= 0f || body.width <= 0 || body.height <= 0) return 0
+        return maxOf(body.width, body.height) - 1
     }
 
     /**
@@ -514,11 +470,13 @@ object SelectionMotion {
             overlap: PixelBox,
             body: PixelBox,
             baselineBuckets: ShortArray,
-            excluded: List<PixelBox>
+            excluded: List<PixelBox>,
+            protection: PixelBox?
         ): Verification
     }
 
-    internal class Verification(val comparedPixels: Long, val mismatch: Boolean)
+    internal class Verification(val comparedPixels: Long, val mismatch: Boolean,
+        val changed: Long = 0L, val edges: Long = 0L, val changedEdges: Long = 0L)
 
     internal class FingerprintPixels(private val buckets: ShortArray) : CandidatePixels {
         override fun colorAt(x: Int, y: Int, body: PixelBox): Int =
@@ -529,34 +487,10 @@ object SelectionMotion {
             overlap: PixelBox,
             body: PixelBox,
             baselineBuckets: ShortArray,
-            excluded: List<PixelBox>
+            excluded: List<PixelBox>,
+            protection: PixelBox?
         ): Verification {
-            val width = body.width
-            var compared = 0L
-            var row = 0
-            while (row < overlap.height) {
-                val baselineY = overlap.top + row
-                val candidateY = baselineY + shift.dy
-                var column = 0
-                while (column < overlap.width) {
-                    val baselineX = overlap.left + column
-                    val candidateX = baselineX + shift.dx
-                    if (!excludedAt(baselineX, baselineY, excluded) &&
-                        !excludedAt(candidateX, candidateY, excluded)) {
-                        compared++
-                        val baselineIndex = (baselineY - body.top) * width + (baselineX - body.left)
-                        val candidateIndex = (candidateY - body.top) * width + (candidateX - body.left)
-                        if (!LiveFrameFingerprint.bucketsMatch(
-                                baselineBuckets[baselineIndex].toInt(),
-                                buckets[candidateIndex].toInt())) {
-                            return Verification(compared, true)
-                        }
-                    }
-                    column++
-                }
-                row++
-            }
-            return Verification(compared, false)
+            return verifyPixels(shift, overlap, body, baselineBuckets, excluded, protection, this)
         }
     }
 
@@ -579,38 +513,78 @@ object SelectionMotion {
             overlap: PixelBox,
             body: PixelBox,
             baselineBuckets: ShortArray,
-            excluded: List<PixelBox>
+            excluded: List<PixelBox>,
+            protection: PixelBox?
         ): Verification {
-            var compared = 0L
-            var row = 0
-            while (row < overlap.height) {
-                val baselineY = overlap.top + row
-                val candidateY = baselineY + shift.dy
-                var column = 0
-                while (column < overlap.width) {
-                    val baselineX = overlap.left + column
-                    val candidateX = baselineX + shift.dx
-                    if (!excludedAt(baselineX, baselineY, excluded) &&
-                        !excludedAt(candidateX, candidateY, excluded)) {
-                        compared++
-                        val offset = candidateY * rowStride + candidateX * pixelStride
-                        val candidateColor = LiveFrameFingerprint.encodeColor(
-                            buffer.get(offset).toInt() and 255,
-                            buffer.get(offset + 1).toInt() and 255,
-                            buffer.get(offset + 2).toInt() and 255
-                        )
-                        if (!LiveFrameFingerprint.bucketsMatch(
-                                bucketAt(baselineBuckets, body, baselineX, baselineY),
-                                candidateColor)) {
-                            return Verification(compared, true)
-                        }
-                    }
-                    column++
-                }
-                row++
-            }
-            return Verification(compared, false)
+            return verifyPixels(shift, overlap, body, baselineBuckets, excluded, protection, this)
         }
+    }
+
+    /**
+     * The selected ink/word is exact within RGB565 noise tolerance. Outside it, at most 0.5%
+     * of context samples may differ, and at most 20% of the sampled edge neighbourhoods
+     * (for example a marquee title or clock). White/black pages still need real page features.
+     * A whole-page pixel-equality gate otherwise rejects a stationary word in ordinary apps.
+     */
+    private fun verifyPixels(
+        shift: PageShift, overlap: PixelBox, body: PixelBox, baselineBuckets: ShortArray,
+        excluded: List<PixelBox>, protection: PixelBox?, candidate: CandidatePixels
+    ): Verification {
+        // The word itself is exhaustive, never sampled or allowed to change.
+        if (protection != null) {
+            if (!contains(overlap, protection) || intersects(protection, excluded) ||
+                intersects(protection.shifted(shift.dx, shift.dy), excluded)) return Verification(0, true)
+            for (y in protection.top until protection.bottom) for (x in protection.left until protection.right) {
+                if (!LiveFrameFingerprint.bucketsMatch(bucketAt(baselineBuckets, body, x, y),
+                        candidate.colorAt(x + shift.dx, y + shift.dy, body))) return Verification(0, true)
+            }
+        }
+        // Only context is sampled. Bound the frame-thread work independently of a tablet's DPI.
+        val step = contextStep(overlap)
+        var compared = 0L
+        var changed = 0L
+        var edgeCompared = 0L
+        var edgeChanged = 0L
+        for (y in overlap.top until overlap.bottom step step) {
+            for (x in overlap.left until overlap.right step step) {
+                val cx = x + shift.dx
+                val cy = y + shift.dy
+                if (excludedAt(x, y, excluded) || excludedAt(cx, cy, excluded)) continue
+                compared++
+                val original = bucketAt(baselineBuckets, body, x, y)
+                val different = !LiveFrameFingerprint.bucketsMatch(original, candidate.colorAt(cx, cy, body))
+                if (different) changed++
+                // Whitespace must not dilute a moved paragraph to less than 0.5% of the screen.
+                // Keep a separate foreground-edge denominator, allowing a small animated title
+                // but not treating the displacement of the actual text as stationary content.
+                var edge = false
+                var edgeDifferent = different
+                for (direction in 0..1) {
+                    val nx = x + if (direction == 0) 1 else 0
+                    val ny = y + if (direction == 1) 1 else 0
+                    if (nx >= overlap.right || ny >= overlap.bottom || excludedAt(nx, ny, excluded) ||
+                        excludedAt(nx + shift.dx, ny + shift.dy, excluded)) continue
+                    val neighbour = bucketAt(baselineBuckets, body, nx, ny)
+                    if (bucketContrast(original, neighbour) >= HIGH_CONTRAST_BUCKETS) {
+                        edge = true
+                        if (!LiveFrameFingerprint.bucketsMatch(neighbour,
+                                candidate.colorAt(nx + shift.dx, ny + shift.dy, body))) edgeDifferent = true
+                    }
+                }
+                if (edge) { edgeCompared++; if (edgeDifferent) edgeChanged++ }
+            }
+        }
+        return Verification(compared, edgeCompared < 8L || changed * 200L > compared ||
+            edgeChanged * 5L > edgeCompared, changed, edgeCompared, edgeChanged)
+    }
+
+    private fun contextStep(box: PixelBox): Int =
+        maxOf(1, ceil(sqrt(box.width.toDouble() * box.height / 32_768.0)).toInt())
+
+    private fun minimumContextPixels(box: PixelBox): Long {
+        val step = contextStep(box)
+        val samples = ((box.width + step - 1L) / step) * ((box.height + step - 1L) / step)
+        return maxOf(16L, samples * MIN_COMPARED_PERCENT / 100)
     }
 
     /**
@@ -625,105 +599,93 @@ object SelectionMotion {
         excluded: List<PixelBox>,
         maxOffset: Int
     ): FrameMatch {
+        // First handle stationary content with a small unrelated animation, before searching.
+        val still = candidate.verify(PageShift.NONE, body, body, baselineBuckets, excluded, protection)
+        if (!still.mismatch && still.comparedPixels >= minimumContextPixels(body) &&
+            hasIdentityInformation(body, emptyList(), baselineBuckets)) {
+            return FrameMatch(FrameMatchKind.SAME, 0, 0, body, body, protection,
+                FrameMatchReason.STABLE_CONTENT_WITH_ANIMATION, maxOffset, comparedPixels = still.comparedPixels,
+                contextSamples = still.comparedPixels, changedContextSamples = still.changed,
+                edgeContextSamples = still.edges, changedEdgeContextSamples = still.changedEdges)
+        }
+        return searchTranslation(body, baselineBuckets, candidate, protection, excluded, maxOffset).copy(
+            contextSamples = still.comparedPixels, changedContextSamples = still.changed,
+            edgeContextSamples = still.edges, changedEdgeContextSamples = still.changedEdges)
+    }
+
+    private fun searchTranslation(
+        body: PixelBox, baselineBuckets: ShortArray, candidate: CandidatePixels,
+        protection: PixelBox?, excluded: List<PixelBox>, maxOffset: Int
+    ): FrameMatch {
         val anchors = selectAnchors(body, baselineBuckets, excluded)
         val quadrantCount = anchors.mapTo(HashSet<Int>(4)) { it.quadrant }.size
         if (anchors.size < MIN_ANCHORS || quadrantCount < MIN_CONFIRMING_QUADRANTS) {
             return rejected(FrameMatchKind.UNAVAILABLE, FrameMatchReason.INSUFFICIENT_ANCHORS,
                 protection, maxOffset, sampledAnchors = anchors.size)
         }
-        if (maxOffset <= 0) {
-            return rejected(FrameMatchKind.CHANGED, FrameMatchReason.CONTENT_MISMATCH,
-                protection, maxOffset, sampledAnchors = anchors.size)
-        }
-        val span = 2 * maxOffset + 1
-        val probes = anchors.subList(0, minOf(PROBE_ANCHORS, anchors.size))
-        val comparisons = probes.size.toLong() * span * span * SIGNATURE_POINTS
-        if (comparisons > MAX_SEARCH_COMPARISONS) {
-            return rejected(FrameMatchKind.UNAVAILABLE, FrameMatchReason.SEARCH_BUDGET_EXCEEDED,
-                protection, maxOffset, sampledAnchors = anchors.size)
-        }
+        if (maxOffset <= 0) return rejected(FrameMatchKind.CHANGED,
+            FrameMatchReason.CONTENT_MISMATCH, protection, maxOffset)
+        val span = 2L * maxOffset + 1L
+        val probes = anchors.take(PROBE_ANCHORS)
         val bodyArea = body.width.toLong() * body.height.toLong()
         val minOverlap = (bodyArea * MIN_OVERLAP_PERCENT + 99) / 100
-        val admissible = BooleanArray(span * span)
-        val votes = IntArray(span * span)
-        var dx = -maxOffset
-        while (dx <= maxOffset) {
-            var dy = -maxOffset
-            while (dy <= maxOffset) {
-                if (shiftAdmissible(body, protection, excluded, dx, dy, minOverlap)) {
-                    admissible[(dx + maxOffset) * span + (dy + maxOffset)] = true
-                }
-                dy++
-            }
-            dx++
-        }
+        // Sparse votes, not a (2*screenSize+1)^2 bitmap. The latter would consume hundreds
+        // of MB on a tablet. Scan each candidate position once per probe, with a fixed cap.
+        val votes = HashMap<Long, Int>()
+        var positions = 0L
         for (anchor in probes) {
-            var dy = -maxOffset
-            while (dy <= maxOffset) {
-                var dxProbe = -maxOffset
-                while (dxProbe <= maxOffset) {
-                    val index = (dxProbe + maxOffset) * span + (dy + maxOffset)
-                    if (admissible[index] && signatureMatches(
-                            baselineBuckets, body, anchor, candidate, dxProbe, dy, excluded)) {
-                        votes[index]++
-                    }
-                    dxProbe++
+            val left = maxOf(-maxOffset, body.left + SIGNATURE_RADIUS - anchor.x)
+            val right = minOf(maxOffset, body.right - SIGNATURE_RADIUS - 1 - anchor.x)
+            val topY = maxOf(-maxOffset, body.top + SIGNATURE_RADIUS - anchor.y)
+            val bottom = minOf(maxOffset, body.bottom - SIGNATURE_RADIUS - 1 - anchor.y)
+            for (dy in topY..bottom) for (dx in left..right) {
+                if (++positions > MAX_SEARCH_POSITIONS) return rejected(FrameMatchKind.UNAVAILABLE,
+                    FrameMatchReason.SEARCH_BUDGET_EXCEEDED, protection, maxOffset)
+                if (!LiveFrameFingerprint.bucketsMatch(
+                        bucketAt(baselineBuckets, body, anchor.x, anchor.y),
+                        candidate.colorAt(anchor.x + dx, anchor.y + dy, body))) continue
+                if (!signatureMatches(baselineBuckets, body, anchor, candidate, dx, dy, excluded)) continue
+                if (!shiftAdmissible(body, protection, excluded, dx, dy, minOverlap)) continue
+                if (!patchMatches(baselineBuckets, body, anchor, candidate, PageShift(dx, dy), excluded)) continue
+                val key = (dx.toLong() + maxOffset) * span + dy + maxOffset
+                if (!votes.containsKey(key) && votes.size >= MAX_VOTED_SHIFTS) {
+                    return rejected(FrameMatchKind.UNAVAILABLE, FrameMatchReason.AMBIGUOUS_SHIFT,
+                        protection, maxOffset, sampledAnchors = anchors.size)
                 }
-                dy++
+                votes[key] = (votes[key] ?: 0) + 1
             }
         }
-        val top = topCandidates(votes, span, maxOffset)
-        if (top.isEmpty()) {
-            return rejected(FrameMatchKind.CHANGED, FrameMatchReason.NO_UNIQUE_SHIFT,
-                protection, maxOffset, sampledAnchors = anchors.size)
-        }
-        val strong = ArrayList<Confirmation>(top.size)
+        val top = votes.entries.asSequence().filter { it.value >= MIN_PROBE_VOTES }.map {
+            val dx = (it.key / span - maxOffset).toInt()
+            val dy = (it.key % span - maxOffset).toInt()
+            RankedShift(PageShift(dx, dy), it.value, abs(dx) + abs(dy))
+        }.sortedWith(RANKING).take(MAX_CANDIDATES).toList()
+        if (top.isEmpty()) return rejected(FrameMatchKind.CHANGED, FrameMatchReason.NO_UNIQUE_SHIFT,
+            protection, maxOffset, sampledAnchors = anchors.size)
+        val strong = ArrayList<Pair<Confirmation, Verification>>(top.size)
         for (ranked in top) {
+            val overlap = shiftedOverlap(body, ranked.shift.dx, ranked.shift.dy) ?: continue
             var confirming = 0
-            val quadrants = HashSet<Int>(4)
             for (anchor in anchors) {
-                if (patchMatches(baselineBuckets, body, anchor, candidate, ranked.shift, excluded)) {
-                    confirming++
-                    quadrants += anchor.quadrant
-                }
+                if (patchMatches(baselineBuckets, body, anchor, candidate, ranked.shift, excluded)) confirming++
             }
-            if (confirming >= MIN_CONFIRMING_ANCHORS &&
-                quadrants.size >= MIN_CONFIRMING_QUADRANTS) {
-                strong += Confirmation(ranked.shift, confirming, quadrants.size, ranked.votes)
+            // A large diagonal move can leave only one original screen quadrant visible. The
+            // actual shared content, not the original quadrant labels, decides its identity.
+            val needed = if (overlap.width.toLong() * overlap.height * 2 < bodyArea) 2 else MIN_CONFIRMING_ANCHORS
+            if (confirming < needed) continue
+            val checked = candidate.verify(ranked.shift, overlap, body, baselineBuckets, excluded, protection)
+            if (!checked.mismatch && checked.comparedPixels >= minimumContextPixels(overlap)) {
+                strong += Confirmation(ranked.shift, confirming, 0, ranked.votes) to checked
             }
         }
-        if (strong.size > 1) {
-            return rejected(FrameMatchKind.UNAVAILABLE, FrameMatchReason.AMBIGUOUS_SHIFT,
-                protection, maxOffset, sampledAnchors = anchors.size,
-                examinedCandidates = top.size)
-        }
-        if (strong.isEmpty()) {
-            return rejected(FrameMatchKind.CHANGED, FrameMatchReason.CONTENT_MISMATCH,
-                protection, maxOffset, sampledAnchors = anchors.size,
-                examinedCandidates = top.size)
-        }
-        val winner = strong.single()
-        val overlap = shiftedOverlap(body, winner.shift.dx, winner.shift.dy)
-            ?: return rejected(FrameMatchKind.UNAVAILABLE, FrameMatchReason.INSUFFICIENT_OVERLAP,
-                protection, maxOffset, sampledAnchors = anchors.size,
-                confirmingAnchors = winner.anchors, confirmingQuadrants = winner.quadrants,
-                probeSupport = winner.votes, examinedCandidates = top.size)
-        val verification = candidate.verify(winner.shift, overlap, body, baselineBuckets, excluded)
-        if (verification.mismatch) {
-            return rejected(FrameMatchKind.CHANGED, FrameMatchReason.CONTENT_MISMATCH,
-                protection, maxOffset, sampledAnchors = anchors.size,
-                confirmingAnchors = winner.anchors, confirmingQuadrants = winner.quadrants,
-                probeSupport = winner.votes, examinedCandidates = top.size,
-                comparedPixels = verification.comparedPixels)
-        }
-        val minCompared = (bodyArea * MIN_COMPARED_PERCENT + 99) / 100
-        if (verification.comparedPixels < minCompared) {
-            return rejected(FrameMatchKind.UNAVAILABLE, FrameMatchReason.INSUFFICIENT_OVERLAP,
-                protection, maxOffset, sampledAnchors = anchors.size,
-                confirmingAnchors = winner.anchors, confirmingQuadrants = winner.quadrants,
-                probeSupport = winner.votes, examinedCandidates = top.size,
-                comparedPixels = verification.comparedPixels)
-        }
+        // Repeated letter edges are candidate hints, not proof of whole-page ambiguity. Only
+        // decide uniqueness after each candidate's exact word and visible context were checked.
+        if (strong.size > 1) return rejected(FrameMatchKind.UNAVAILABLE, FrameMatchReason.AMBIGUOUS_SHIFT,
+            protection, maxOffset, sampledAnchors = anchors.size, examinedCandidates = top.size)
+        if (strong.isEmpty()) return rejected(FrameMatchKind.CHANGED, FrameMatchReason.CONTENT_MISMATCH,
+            protection, maxOffset, sampledAnchors = anchors.size, examinedCandidates = top.size)
+        val (winner, verification) = strong.single()
+        val overlap = requireNotNull(shiftedOverlap(body, winner.shift.dx, winner.shift.dy))
         return FrameMatch(
             kind = FrameMatchKind.MOVED,
             dx = winner.shift.dx,
@@ -774,11 +736,8 @@ object SelectionMotion {
                     body.left + ((body.width.toLong() * (column + 1)) / GRID_COLUMNS).toInt()
                 if (cellRight <= cellLeft) continue
                 var chosen: Anchor? = null
-                for (point in LATTICE_POINTS) {
-                    val x = cellLeft +
-                        ((cellRight - cellLeft) * (2 * point.first + 1)) / (2 * LATTICE)
-                    val y = cellTop +
-                        ((cellBottom - cellTop) * (2 * point.second + 1)) / (2 * LATTICE)
+                val step = maxOf(1, minOf(body.width, body.height) / 256)
+                for (y in cellTop until cellBottom step step) for (x in cellLeft until cellRight step step) {
                     if (!patchVisible(x, y, SIGNATURE_RADIUS, body, excluded)) continue
                     val contrast = contrastAt(buckets, body, x, y, excluded)
                     if (contrast < HIGH_CONTRAST_BUCKETS) continue
@@ -893,28 +852,6 @@ object SelectionMotion {
             py++
         }
         return true
-    }
-
-    private fun topCandidates(votes: IntArray, span: Int, maxOffset: Int): List<RankedShift> {
-        val ranked = ArrayList<RankedShift>(MAX_CANDIDATES + 1)
-        for (index in votes.indices) {
-            val count = votes[index]
-            if (count < MIN_PROBE_VOTES) continue
-            val dx = index / span - maxOffset
-            val dy = index % span - maxOffset
-            val candidate = RankedShift(PageShift(dx, dy), count, abs(dx) + abs(dy))
-            var inserted = false
-            for (position in ranked.indices) {
-                if (RANKING.compare(candidate, ranked[position]) < 0) {
-                    ranked.add(position, candidate)
-                    inserted = true
-                    break
-                }
-            }
-            if (!inserted) ranked.add(candidate)
-            if (ranked.size > MAX_CANDIDATES) ranked.removeAt(ranked.size - 1)
-        }
-        return ranked
     }
 
     private fun shiftAdmissible(

@@ -1,5 +1,30 @@
 # 项目协作规则
 
+## 当前执行约定补充（2026-10-29）
+
+不再调用Claude Code。后续需要且已获授权调用外部执行AI时，仅用DeepSeek Harness的DeepSeek Flash，并先在交流中确认分组、套餐和具体入口；当前任务已确认的选择可沿用，切换必须重新确认。本批仍按用户“这次你来修”的明确例外由父GPT直接修复，不调用外部实现AI；正式验收固定实际gpt-6.1-sol/high。不得把历史Claude路由文字当作新的派发授权。
+
+## 整屏划词修复已在有限范围闭环，准确Git收尾（2026-10-29）
+
+source08/196、2.6.1/52最终三目标34s通过，APK e24e63322def2db7ea4e34783ae238ca5c35c6650703887de642b2f1bfac59b4已保数据安装并真机核同hash。独立实际Sol/high最终4项4PASS/0FAIL/0ERROR/0SKIP：crawl490ms、footer新划vessel398ms、手动apple+真实IME/显式提交、固定退出恢复悬浮条且题页主体3968025像素零差异；只3正常查询，0刷绿。父核全部2真实context、完整私有载荷hash/bytes及JSON/JUnit顺序，测试者已结束关闭，设备停留原页+悬浮条。source04独立原12逻辑复验12PASS另域保留，不合成16项全集全绿；source03原9PASS3FAIL、旧真机超时及源草稿编译失败均保留。未测真机非零位移/任意连续滚动、其它OEM、删除取消竞态、物理笔或长期功耗。最终私有载荷76份（清单自身不计）。所有设备私有产物/用户数据不入Git，原四草稿content/index与815B原件保持。只准确本批12路径提交并正常推现private origin/codex/android-mvp；此处不预填自身提交hash，最终Git结果见私有parent-final-commit-push与本轮回复。外部AI新规则在上节，本次0外部实现AI调用。
+
+## 2026-10-29 整屏划词直修进行中，尚未通过真机交付
+
+用户明确“这次你来修”并要求取消48px限制，本批父GPT直接修产品（仅此例外，不改长期总工程师默认）；正式逻辑验收仍实际Sol/high。基线4bcf54f/codex/android-mvp，原四草稿content/index与815B原件冻结，0本批Git提交/推送。父接管唯一平板，原设备代理已交回关闭；禁止并发设备UI。
+
+原2.6.0/51在真实crawl页复现verify_unproven，首调试另有30秒划词层超时，不能混为产品复现。已按整屏尺寸扩搜索，处理标题动画/稀疏字形/保护区与候选最终排歧；原source03独立有限12项9PASS/3FAIL保留。source04三目标35s通过，新实际Sol/high原12同body复验结果已产出12PASS/0FAIL（父最终准确收件尚进行），不是Android/全软件通过。旧代理resume实际xhigh在GO前拒收，仅只读0测试；用户两次中断导致两个新代理注册丢失均未GO，实际复验者为01a1886c-793f-7963-94b4-3b5f230d3e46，首context父已核。
+
+平板source04仍真实verify_timeout，同步日志显示单次stroke probe约3174ms/AMBIGUOUS_SHIFT堵住帧线程；未声称已修好。source05仅加无内容计数，三目标32s通过，诊断安装取证进行。每次install-r均备份旧APK/两次当前数据并核安装后启动前6常规文件全保持，0卸载/清库/恢复/自动无障碍。所有APK、数据、截图与精确回执仅忽略的artifacts/device-tests及.tools/validation/20261029-fullscreen-selection，不入Git。当前修复不冒称支持任意动态滚动，后续以真实词卡结果判定。旧195源manifest构建排除未完成OfflineDictionary草稿；根直接编译该草稿失败原日志保留，不能为通过修改用户草稿。
+
+
+## 2026-10-29 22:30 用户授权上平板：已保数据覆盖2.6.0/51，功能验收刚启动
+
+用户明确“上平板，测试一下”。唯一连接OPPO OPD2401/ebb42dc3/Android16、原2.4.2/49。父只停止com.shici.app，核相同签名、备份旧APK与全部6内部常规数据文件；重复两备份+临安装第三备份逐文件hash一致后一次install-r覆盖，Success、dumpsys版本2.6.0/51和设备APK SHA256069f8261fb176c4529b80ff8bc8a89f2d41e24f7a62681cdf0e18285590dc6a1均已核。首次打开前6文件全保持，0卸载/清库/降级/自动恢复，源码/原四草稿content/index/815B保持；这只证明覆盖安装与启动前保全，不当成功能/迁移通过。
+
+新独立验收者01a1880d-7ecc-7b11-ab3b-169e8e33290d首真实context父核Sol/high后GO，独占平板UI，父不并发操作；最多8有限实机检查/约5次正常查询，不跑旧80/宿主全集，不删除学习记录，不替用户系统启用无障碍。原生截图/手势/IME/双入口/退出与有限小移能测才报；未可靠覆盖项如实未测，0产品自修/新APK/服务器/购买/模型下载。必要仅本机fixture及单设备reverse需精确清理。当前host开始剩32%五小时/周75%，仅短范围验收，保15%余量不切号刷新。
+
+目前只安装完成、功能测试未交结果，不预报通过。私有忽略artifacts/device-tests/20261029-v2.6.0-ebb42dc3保旧包、数据备份、preflight/installation-receipt与functional-task/模型回执；不会把用户数据或截图进Git。Git本轮尚未新提交/推送，产品HEAD仍4bcf54f；后续只准确治理记录提交，不夹原草稿。安装前沙箱ADB端口禁止已正常审批重试，不假称设备断线或数据错误。
+
 ## 2026-10-29 21:48 本批在约定本地有限范围闭环；准确Git收尾
 
 source07/195、内部候选2.6.0/51，一次最终三目标31.885s/exit0/APK069f8261fb176c4529b80ff8bc8a89f2d41e24f7a62681cdf0e18285590dc6a1。新受影响域唯一12项12PASS/0FAIL/0ERROR/0SKIP：M07横/竖墨迹实际消费者与off-ink变字尾部、固定小移无doubleShift、静止快笔/已知doubt拒绝、空/点/边界/取消、A10原body正确key新夹具完整尾部、真实设置确认回调链和S01剩余静态控制均闭合。父逐核补验者全部2实际Solhigh context、273准确载荷、449锁输入/201class、60完整原源/宿主映射、9原case body逐字节和12ID JSON/JUnit同序；首轮全部3真实context/271载荷/410输入/55原块也已核，两测试者均完整结束关闭。

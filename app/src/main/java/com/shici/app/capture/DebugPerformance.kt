@@ -46,6 +46,12 @@ class DebugPerformance {
         if (!BuildConfig.DEBUG) return
         diagnostics.flush(result)
     }
+    /** Bounded frame-thread diagnostics; enums/timings only, no content or gesture coordinates. */
+    fun motionProbe(match: com.shici.app.core.FrameMatch?, elapsedMillis: Long) {
+        if (BuildConfig.DEBUG) Log.i("ShiciPerf", "stage=motion_probe reason=${match?.reason} duration_ms=$elapsedMillis " +
+            "context=${match?.contextSamples} changed=${match?.changedContextSamples} " +
+            "edges=${match?.edgeContextSamples} edge_changed=${match?.changedEdgeContextSamples}")
+    }
     fun end(status: String, stage: String) {
         if (BuildConfig.DEBUG) {
             diagnostics.stage(stage, status)
@@ -57,7 +63,7 @@ class DebugPerformance {
     private fun emit(stage: String, status: String, additional: String = "") {
         if (!BuildConfig.DEBUG) return
         operation?.let {
-            Log.d("ShiciPerf", "op=${it.id} stage=$stage status=$status elapsed_ms=${it.elapsed()} $additional".trim())
+            Log.i("ShiciPerf", "op=${it.id} stage=$stage status=$status elapsed_ms=${it.elapsed()} $additional".trim())
         }
     }
 }

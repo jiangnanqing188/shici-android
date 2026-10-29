@@ -81,17 +81,11 @@ class LiveFrameFingerprint private constructor(
     }
 
     /**
-     * Explicit bounded page-identity comparison against a same-size, same-body fingerprint.
-     *
-     * Zero displacement is still checked first with the original strict [matches] semantics. Only
-     * when that fails does [SelectionMotion] search the density-derived, hard-capped small shift
-     * range relative to **this** baseline; the result always carries the proven `(dx, dy)` and the
-     * compared overlap, and every accepted shift is re-verified pixel by pixel on the real visible
-     * overlap with the original colour-bucket tolerance. [protection] is the selected-word region
-     * in baseline coordinates; it may not be excluded or fall into newly exposed edge pixels.
-     * Anything that cannot be proven returns [FrameMatchKind.CHANGED] or
-     * [FrameMatchKind.UNAVAILABLE], never an optimistic match. This baseline is never rebased, so
-     * repeated calls cannot accumulate drift.
+     * Match against this fixed baseline across the captured screen. The selected protection is
+     * checked exhaustively within the original colour tolerance; only surrounding context is
+     * sampled with a small unrelated-animation allowance. A nonzero shift must be unique among
+     * the bounded candidate set and preserve the selected region. Results never rebase the entry.
+     * The original matches()/matchesPlane() APIs above retain their strict historical semantics.
      */
     fun matchBounded(
         other: LiveFrameFingerprint,
@@ -99,24 +93,11 @@ class LiveFrameFingerprint private constructor(
         density: Float,
         excluded: List<PixelBox> = emptyList()
     ): FrameMatch {
-        val maxOffset = SelectionMotion.maxOffsetPx(density)
+        val maxOffset = SelectionMotion.maxOffsetPx(density, body)
         SelectionMotion.validate(body, protection, excluded, density, maxOffset)?.let { return it }
         if (!sameShape(other.width, other.height, other.body)) {
             return SelectionMotion.rejected(FrameMatchKind.UNAVAILABLE,
                 FrameMatchReason.INVALID_GEOMETRY, protection, maxOffset)
-        }
-        if (matches(other, excluded)) {
-            // Two featureless frames (pure white/black or an empty page) are not page identity.
-            // A SAME result must carry enough contrast to distinguish this page from another.
-            // The baseline predates this app's ink/card, so identity is measured on the clean
-            // baseline: masking the selected word could erase the only page text and make a real
-            // page look blank. Candidate pixels are still masked by [excluded] above.
-            if (!SelectionMotion.hasIdentityInformation(body, emptyList(), encoded)) {
-                return SelectionMotion.rejected(FrameMatchKind.UNAVAILABLE,
-                    FrameMatchReason.INSUFFICIENT_ANCHORS, protection, maxOffset)
-            }
-            return FrameMatch(FrameMatchKind.SAME, 0, 0, body, body, protection,
-                FrameMatchReason.STRICT_ZERO_SHIFT, maxOffset)
         }
         return try {
             SelectionMotion.search(body, encoded,
@@ -137,22 +118,12 @@ class LiveFrameFingerprint private constructor(
         buffer: java.nio.ByteBuffer, protection: PixelBox, density: Float,
         excluded: List<PixelBox> = emptyList()
     ): FrameMatch {
-        val maxOffset = SelectionMotion.maxOffsetPx(density)
+        val maxOffset = SelectionMotion.maxOffsetPx(density, body)
         SelectionMotion.validate(body, protection, excluded, density, maxOffset)?.let { return it }
         if (!sameShape(width, height, body) ||
             !usablePlaneGeometry(width, height, body, rowStride, pixelStride, buffer.limit())) {
             return SelectionMotion.rejected(FrameMatchKind.UNAVAILABLE,
                 FrameMatchReason.INVALID_GEOMETRY, protection, maxOffset)
-        }
-        if (matchesPlane(width, height, body, rowStride, pixelStride, buffer, excluded)) {
-            // The candidate plane equals the retained baseline; require the baseline itself to be
-            // informative (the pure-white/blank SAME loophole).
-            if (!SelectionMotion.hasIdentityInformation(body, emptyList(), encoded)) {
-                return SelectionMotion.rejected(FrameMatchKind.UNAVAILABLE,
-                    FrameMatchReason.INSUFFICIENT_ANCHORS, protection, maxOffset)
-            }
-            return FrameMatch(FrameMatchKind.SAME, 0, 0, body, body, protection,
-                FrameMatchReason.STRICT_ZERO_SHIFT, maxOffset)
         }
         return try {
             SelectionMotion.search(body, encoded,
@@ -179,7 +150,7 @@ class LiveFrameFingerprint private constructor(
         width: Int, height: Int, body: PixelBox, rowStride: Int, pixelStride: Int,
         buffer: java.nio.ByteBuffer, density: Float, excluded: List<PixelBox> = emptyList()
     ): FrameMatch {
-        val maxOffset = SelectionMotion.maxOffsetPx(density)
+        val maxOffset = SelectionMotion.maxOffsetPx(density, body)
         if (!density.isFinite() || density <= 0f) {
             return SelectionMotion.rejected(FrameMatchKind.UNAVAILABLE,
                 FrameMatchReason.INVALID_DENSITY, null, maxOffset)
@@ -188,14 +159,6 @@ class LiveFrameFingerprint private constructor(
             !usablePlaneGeometry(width, height, body, rowStride, pixelStride, buffer.limit())) {
             return SelectionMotion.rejected(FrameMatchKind.UNAVAILABLE,
                 FrameMatchReason.INVALID_GEOMETRY, null, maxOffset)
-        }
-        if (matchesPlane(width, height, body, rowStride, pixelStride, buffer, excluded)) {
-            if (!SelectionMotion.hasIdentityInformation(body, emptyList(), encoded)) {
-                return SelectionMotion.rejected(FrameMatchKind.UNAVAILABLE,
-                    FrameMatchReason.INSUFFICIENT_ANCHORS, null, maxOffset)
-            }
-            return FrameMatch(FrameMatchKind.SAME, 0, 0, body, body, null,
-                FrameMatchReason.STRICT_ZERO_SHIFT, maxOffset)
         }
         return try {
             SelectionMotion.search(body, encoded,
@@ -369,7 +332,7 @@ class LivePageGuard(
         baseline.matchBounded(frame, protection, density, excluded)
     } else {
         SelectionMotion.rejected(FrameMatchKind.UNAVAILABLE, FrameMatchReason.GUARD_INVALID,
-            protection, SelectionMotion.maxOffsetPx(density))
+            protection, SelectionMotion.maxOffsetPx(density, body))
     }
 }
 
@@ -561,7 +524,7 @@ class LiveSelectionSession(
     ): FrameMatch {
         val protection = strokeProtection() ?: return SelectionMotion.rejected(
             FrameMatchKind.UNAVAILABLE, FrameMatchReason.PROTECTION_MISSING, null,
-            SelectionMotion.maxOffsetPx(density))
+            SelectionMotion.maxOffsetPx(density, body))
         return entryFingerprint.matchBounded(frame, protection.baseline, density, excluded)
     }
 
@@ -573,7 +536,7 @@ class LiveSelectionSession(
     ): FrameMatch {
         val protection = strokeProtection() ?: return SelectionMotion.rejected(
             FrameMatchKind.UNAVAILABLE, FrameMatchReason.PROTECTION_MISSING, null,
-            SelectionMotion.maxOffsetPx(density))
+            SelectionMotion.maxOffsetPx(density, body))
         return entryFingerprint.matchBoundedPlane(width, height, body, rowStride, pixelStride,
             buffer, protection.baseline, density, excluded)
     }

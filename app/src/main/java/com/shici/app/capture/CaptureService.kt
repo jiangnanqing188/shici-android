@@ -478,7 +478,8 @@ class CaptureService : Service() {
                                     // Until main delivery proves the stroke's selected crop (verify) or
                                     // the entry frame is consumed, the pending identity is compared
                                     // strictly: no whole-page movement is assumed.
-                                    pendingPageProtection = null
+                                    pendingPageProtection = if (purpose == FramePurpose.VERIFY)
+                                        live?.liftProtection() else null
                                     pendingStrictCoordinates = true
                                     pendingPageSourceNanos = image.timestamp
                                     pendingPageChanged = false
@@ -578,19 +579,16 @@ class CaptureService : Service() {
             val plane = image.planes.firstOrNull()
             when {
                 plane == null -> null
-                baseline.matchesPlane(image.width, image.height, body,
-                    plane.rowStride, plane.pixelStride, plane.buffer, excluded) ->
-                    // The baseline is the clean entry/lift frame, sampled before this app's
-                    // current card existed. Measure its identity without masking the card: if the
-                    // only page text lies under our own card, masking it would turn a real page
-                    // into a blank one and wrongly invalidate the lookup. Candidate pixels remain
-                    // masked; a card covering the necessary ink is still rejected below.
-                    baseline.hasIdentityInformation() && !protectionMasked()
-                !strict && protection != null -> !protectionMasked() && baseline.matchBoundedPlane(
-                    image.width, image.height, body, plane.rowStride, plane.pixelStride,
-                    plane.buffer, protection, resources.displayMetrics.density,
-                    excluded).accepted
-                else -> false
+                protection != null -> {
+                    val match = baseline.matchBoundedPlane(image.width, image.height, body,
+                        plane.rowStride, plane.pixelStride, plane.buffer, protection,
+                        resources.displayMetrics.density, excluded)
+                    !protectionMasked() && match.accepted &&
+                        (!strict || (match.dx == 0 && match.dy == 0))
+                }
+                else -> baseline.matchesPlane(image.width, image.height, body,
+                    plane.rowStride, plane.pixelStride, plane.buffer, excluded) &&
+                    baseline.hasIdentityInformation()
             }
         } catch (_: Exception) {
             null
@@ -642,6 +640,7 @@ class CaptureService : Service() {
             // Exclude only the ink and the two small chips. The page around the stroke remains
             // observable, and no accumulated or whole-page mask is used.
             val excluded = gesture.currentScreenExclusions()
+            val probeStarted = SystemClock.elapsedRealtime()
             val match = try {
                 stroke.baseline.probeBoundedPlane(image.width, image.height, stroke.body,
                     plane.rowStride, plane.pixelStride, plane.buffer,
@@ -649,6 +648,7 @@ class CaptureService : Service() {
             } catch (_: Exception) {
                 null
             }
+            perf.motionProbe(match, SystemClock.elapsedRealtime() - probeStarted)
             if (match == null) {
                 session.noteMotionUnavailable()
             } else when (match.kind) {
@@ -1135,8 +1135,14 @@ class CaptureService : Service() {
             main.postDelayed(timeout, (deadlineMillis - SystemClock.elapsedRealtime()).coerceAtLeast(0))
             published
         }
-        Choreographer.getInstance().postFrameCallback {
-            if (frameIsCurrent(request)) request.arm(System.nanoTime())
+        // Removing our bubble/ink surface and publishing a clean capture must not share the
+        // same compositor turn. Observe two traversal boundaries, not a fixed time delay; old
+        // callbacks still check request identity and can never arm a replacement request.
+        val choreographer = Choreographer.getInstance()
+        choreographer.postFrameCallback {
+            if (frameIsCurrent(request)) choreographer.postFrameCallback {
+                if (frameIsCurrent(request)) request.arm(System.nanoTime())
+            }
         }
         return request
     }
@@ -1322,7 +1328,10 @@ class CaptureService : Service() {
             failLiveLookup("已拿到抬笔画面但无法读取页面特征（采集异常，不是 OCR 或词库问题）。本次未查询、未收录。请点「重试取词」。", "verify_frame")
             return
         }
+        val matchStarted = SystemClock.elapsedRealtime()
         val match = session.matchLift(fingerprint, resources.displayMetrics.density)
+        perf.motionProbe(match, SystemClock.elapsedRealtime() - matchStarted)
+        perf.stage("page_match", match.reason.name.lowercase())
         if (!match.accepted) {
             bitmap.recycle()
             abortDirectRead(session)
@@ -1330,7 +1339,7 @@ class CaptureService : Service() {
                 val pageChanged = RecognitionFeedback.notice(RecognitionFailure.PAGE_CHANGED)
                 failLiveLookup(pageChanged.message, "page_changed", pageChanged.nextStep)
             } else {
-                failLiveLookup("已拿到抬笔画面，但无法证明它与划词前是同一页面（画面证据不足或超出允许的移动范围）。本次未查询、未收录；请在页面稳定后重新划词。", "verify_unproven")
+                failLiveLookup("本次划选未能与当前画面可靠对齐，未查询、未收录。请重新划词，或使用手动输入。", "verify_unproven")
             }
             return
         }
@@ -1608,6 +1617,7 @@ class CaptureService : Service() {
             PixelFormat.TRANSLUCENT).apply {
             gravity = Gravity.TOP or Gravity.START
             x = 0; y = 0
+            windowAnimations = 0
         }
         windows.addView(view, params)
         true
