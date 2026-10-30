@@ -317,14 +317,17 @@
       return;
     }
 
-    var downloadLink = element("a", "button", "下载安装包");
-    downloadLink.href = info.downloadUrl;
-    downloadLink.rel = "noopener";
-    downloadLink.setAttribute("aria-describedby", "release-action-note");
+    ["平板下载", "手机下载"].forEach(function (label) {
+      var downloadLink = element("a", "button", label);
+      downloadLink.href = info.downloadUrl;
+      downloadLink.rel = "noopener";
+      downloadLink.setAttribute("download", "");
+      downloadLink.setAttribute("aria-describedby", "release-action-note");
+      nodes.actions.appendChild(downloadLink);
+    });
 
-    var actionNote = element("p", "action-note", "将前往外部下载地址，不会自动开始下载。");
+    var actionNote = element("p", "action-note", "手机和平板共用同一个 APK，两个入口下载内容一致。");
     actionNote.id = "release-action-note";
-    nodes.actions.appendChild(downloadLink);
     nodes.actions.appendChild(actionNote);
     nodes.actions.hidden = false;
 
