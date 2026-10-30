@@ -164,6 +164,9 @@ class CaptureService : Service() {
     // removed on lift, cancel, resize, rotation, panel dismissal or service shutdown.
     private var live: LiveSelectionSession? = null
     private var liveView: LiveSelectionView? = null
+    // The layer is mounted before the ENTRY request. This bounds layout readiness so a permission
+    // or window failure cannot leave a transparent touch barrier on screen indefinitely.
+    private var liveReadyTimeout: Runnable? = null
     private var liveTimeout: Runnable? = null
     // After the clean lift frame has been accepted, this guard proves that later OCR/dictionary/
     // display/save/retry admissions still belong to the same page. It stores only the compact
@@ -1066,6 +1069,10 @@ class CaptureService : Service() {
         frameTimeout?.let { main.removeCallbacks(it) }
         frameTimeout = null
     }
+    private fun clearLiveReadyTimeout() {
+        liveReadyTimeout?.let { main.removeCallbacks(it) }
+        liveReadyTimeout = null
+    }
     private fun expireFrame(request: FreshFrameRequest, purpose: FramePurpose) {
         if (!frameIsCurrent(request) || !requestedFrame.compareAndSet(request, null)) return
         request.cancel(); gate.next(); clearFrameTimeout()
@@ -1148,9 +1155,11 @@ class CaptureService : Service() {
     }
 
     /**
-     * Entry of one live lookup. The bubble is removed and a clean entry frame is requested before
-     * the transparent gesture layer is mounted, so neither the entry chip nor ink can be captured;
-     * a lookup is never performed from a stale mode-entry picture.
+     * Entry of one live lookup. The transparent gesture layer is mounted and proven ready before
+     * the clean entry frame is requested, so the tap creates a real touch barrier immediately:
+     * no gesture can scroll the page underneath while the entry image is being acquired. Its
+     * preparation prompt is hidden for the ENTRY sample and no ink exists until the entry frame
+     * has been accepted. A lookup is never performed from a stale mode-entry picture.
      */
     private fun beginLiveSelection() {
         if (stopped || !sessionIsActive() || requestedFrame.get() != null || live != null || liveView != null) return
@@ -1164,7 +1173,71 @@ class CaptureService : Service() {
             deletionCredential = app.repository.deletions.capture()
             val body = frameBody()
             removeBubble()
-            armFrame(FramePurpose.ENTRY, body, SystemClock.elapsedRealtime() + ENTRY_FRAME_TIMEOUT_MS)
+            // The same view identity owns all four callbacks. A retired layer's late stroke,
+            // gesture start, too-short notice or cancel must be a complete no-op, even when a new
+            // live session happens to be current. Preparation cancellation is deliberately allowed
+            // while live is still null, but only for the origin view that is still mounted.
+            var origin: LiveSelectionView? = null
+            val view = LiveSelectionView(this, screenWidth, screenHeight,
+                { stroke ->
+                    val session = live
+                    if (origin != null && liveView === origin && session != null &&
+                        live === session && sessionIsActive()) {
+                        commitLiveStroke(session, stroke)
+                    }
+                },
+                {
+                    if (origin != null && liveView === origin && live != null && sessionIsActive()) {
+                        toast("请沿完整单词一笔划过；轻点不查询")
+                    }
+                },
+                { reason ->
+                    if (origin != null && liveView === origin && sessionIsActive()) {
+                        cancelLiveMode(reason)
+                    }
+                },
+                {
+                    val session = live
+                    if (origin != null && liveView === origin && session != null &&
+                        live === session && sessionIsActive()) {
+                        session.beginStrokeMotion()
+                        // The compositor timestamp of a frame must be at/after this point to count
+                        // as stroke-time evidence; a queued pre-stroke image is not reused. The
+                        // fixed entry identity (never a rebased one) is compared until the lift.
+                        strokeObservation = StrokeObservation(
+                            session, session.entryFingerprint, session.body, System.nanoTime())
+                    }
+                })
+            origin = view
+            if (!addLiveLayer(view)) return
+            liveView = view
+            val readyTimeout = Runnable {
+                if (liveView === view && live == null && requestedFrame.get() == null) {
+                    perf.stage("live_layer", "ready_timeout")
+                    failLiveLookup(
+                        "划词层未能就绪：透明触摸层没有完成可用布局（不是 OCR 或词库问题）。本次未查询、未收录。请点「重试取词」。",
+                        "live_ready_timeout")
+                }
+            }
+            liveReadyTimeout = readyTimeout
+            main.postDelayed(readyTimeout, ENTRY_FRAME_TIMEOUT_MS)
+            view.awaitWindowReady {
+                if (liveView === view && live == null && sessionIsActive() &&
+                    requestedFrame.get() == null) {
+                    // One real compositor boundary lets the preparation prompt become visible
+                    // before it is hidden. armFrame then waits its own two traversal boundaries,
+                    // so the prompt/cancel/ink cannot enter the entry bitmap.
+                    Choreographer.getInstance().postFrameCallback {
+                        if (liveView === view && live == null && sessionIsActive() &&
+                            requestedFrame.get() == null) {
+                            clearLiveReadyTimeout()
+                            view.beginCleanEntry()
+                            armFrame(FramePurpose.ENTRY, body,
+                                SystemClock.elapsedRealtime() + ENTRY_FRAME_TIMEOUT_MS)
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1201,6 +1274,11 @@ class CaptureService : Service() {
     }
 
     private fun onEntryFrame(request: FreshFrameRequest, bitmap: Bitmap) {
+        val view = liveView
+        if (!sessionIsActive() || !gate.accepts(request.token) || view == null || live != null) {
+            bitmap.recycle()
+            return
+        }
         // Consume the identity sampled when this entry image was accepted. It is the same image,
         // and must not linger as page evidence for the later lift request.
         val published = synchronized(pageLock) {
@@ -1213,7 +1291,6 @@ class CaptureService : Service() {
             pendingStrictCoordinates = false
             identity
         }
-        if (!sessionIsActive() || !gate.accepts(request.token)) { bitmap.recycle(); return }
         val fingerprint = published ?: runCatching {
             LiveFrameFingerprint.sample(bitmap.width, bitmap.height, request.body) { x, y, row ->
                 bitmap.getPixels(row, 0, row.size, x, y, row.size, 1)
@@ -1225,6 +1302,12 @@ class CaptureService : Service() {
             return
         }
         bitmap.recycle() // Only the compact fingerprint survives; the clean entry bitmap is released.
+        if (!view.isWindowReady()) {
+            // The barrier remained mounted through ENTRY, but it can no longer accept a gesture.
+            // Never present a stale "ready" state; retire it and leave a visible retry path.
+            failLiveLookup("透明划词层在入场画面到达前已不可用（不是 OCR 或词库问题）。本次未查询、未收录。请点「重试取词」。", "live_layer")
+            return
+        }
         perf.stage("frame_entry", "ok")
         val session = LiveSelectionSession(
             generation = CaptureStatus.generation,
@@ -1236,33 +1319,12 @@ class CaptureService : Service() {
             entryFingerprint = fingerprint
         )
         live = session
-        val view = LiveSelectionView(this, screenWidth, screenHeight,
-            { stroke -> commitLiveStroke(session, stroke) },
-            { toast("请沿完整单词一笔划过；轻点不查询") },
-            { reason -> cancelLiveMode(reason) },
-            {
-                if (live === session) {
-                    session.beginStrokeMotion()
-                    // The compositor timestamp of a frame must be at/after this point to count as
-                    // stroke-time evidence; a queued pre-stroke image is not reused. The fixed
-                    // entry identity (never a rebased one) is compared until the lift decision.
-                    strokeObservation = StrokeObservation(
-                        session, session.entryFingerprint, session.body, System.nanoTime())
-                }
-            })
-        if (!addLiveLayer(view)) return
-        liveView = view
+        // The same layer that owned touches during preparation is now allowed to draw ink and
+        // submit one complete stroke. A DOWN that happened before this point remains recorded in
+        // the view and is finished as an explicit redraw notice, never as a synthetic stroke.
+        view.arm()
         scheduleLiveTimeout()
-        // "可划" is reported only after the window is attached, laid out with a real size and
-        // visible. addView alone merely registers the window. The checks reject a late callback
-        // from a cancelled, superseded or stopped lookup.
-        view.awaitWindowReady {
-            if (liveView === view && live === session && sessionIsActive() &&
-                session.generation == CaptureStatus.generation && gate.accepts(session.entryToken)) {
-                view.arm()
-                perf.selectionReady()
-            }
-        }
+        perf.selectionReady()
     }
 
     /**
@@ -1631,6 +1693,7 @@ class CaptureService : Service() {
         // finger was down remain in the session for the lift decision; no frame captured after the
         // ink disappeared may be attributed to the stroke.
         strokeObservation = null
+        clearLiveReadyTimeout()
         liveTimeout?.let { main.removeCallbacks(it) }
         liveTimeout = null
         val view = liveView

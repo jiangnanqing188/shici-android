@@ -1,5 +1,14 @@
 # 项目协作规则
 
+## 2026-10-30 划词准备与重试：2.6.2/53仅本地有限验收通过
+
+用户本批指定DeepSeek Harness的Qoder DeepSeek Flash，实际独立路由`qoder/dfmodel`，请求max；没有调用Claude Code、切到Qoder CN/其它分组或修改全局模型配置。父仍总工程师，产品实现与静态补齐由同一Harness会话交齐，父仅治理/构建环境/收件。准确source03/196三目标35.127s通过，APK `3d7f5f51…702c95`，证书与既有52一致；source01环境编译失败、source02异签名构建原件保留，source02不得用于覆盖安装。
+
+改动为入口先挂同一透明触摸层、准备/干净采样/可划三状态、跨ready笔画不补造起点并提示重划、就绪超时/清理，以及四回调绑定来源View。旧页、gate/epoch、原credential和数据结构未削弱。独立实际gpt-6.1-sol/high全部2真实context已父核，唯一run01为14PASS（12生产代码宿主动态＋2源码接线）、0FAIL/ERROR/SKIP；原宿主准备错误保留，不叫准备一遍全绿。**未做原生触摸/合成/惯性滚动或用户三次故障链复验，不能称真机彻底修复。** 屏障不会主动停止已经发生的惯性滚动。
+
+平板与官网仍2.6.1/52，本批0安装/设备/服务器/发布，原四草稿content/index及815B保持，不把APK/原词库/私有证据/签名材料入Git。仅本批准确路径提交后普通推现private跟踪分支，实际Git以最终回执为准。唯一路线17.19.4续用；恢复见工作记录20261030-1及私有`.tools/validation/20261030-selection-readiness/parent-final-acceptance.json`。
+
+
 ## 2026-10-29 官网2.6.1/52测试包已开放，划词新问题只评估未修
 
 用户确认词库公开分发授权并明确“你直接做”，本次仅网站由父直接实施；不调用外部产品AI，不改变长期默认。源码基线803c4ea，直接复用已装平板source08 APK（110669521B、e24e6332…ac59b4），Debug测试包、不称正式版；当前仅固定/downloads/shici-2.6.1-52.apk公开，源码仓库继续private，无原词库文件/模型/用户数据公开。Netcatty官方私有暂存核hash后仅发布两静态、APK与80精确白名单nginx配置，备份保留、nginx-t及reload成功，443当前73240/start12920664/boot及unit/config/bin保持。新鲜config哈希与此前不同是在本次写入前已观测，不擅自还原。
