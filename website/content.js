@@ -1,8 +1,9 @@
 window.SHICI_SITE = {
   name: '拾词',
   tagline: '阅读不停，生词随手拾起',
-  description: '拾词是一款面向安卓平板和手机的阅读查词工具：开启悬浮查词后，在屏幕上划一笔，抬起即可查询；把生词、笔记和复习进度留在本机。本页不提供账号、云同步或上传功能。',
-  internalVersion: '2.6.1',
+  description: '拾词是一款面向安卓手机和平板的阅读查词工具：开启悬浮查词后，在屏幕上划一笔，抬起即可查询；把生词、笔记和复习进度留在本机。本站不提供账号、云同步或上传功能。',
+  internalVersion: '2.6.2',
+  internalVersionCode: 53,
   publicRelease: {
     version: '2.6.1',
     versionCode: 52,
@@ -12,6 +13,39 @@ window.SHICI_SITE = {
     channel: 'test'
   },
   repositoryUrl: null,
+  // 每个独立页面单独的标题与 meta 描述；app.js 只读取当前页对应的一项。
+  pages: {
+    home: {
+      title: '拾词｜阅读不停，生词随手拾起',
+      description: '拾词是一款面向安卓手机和平板的阅读查词工具：划一笔即可查词，把生词、笔记和复习进度留在本机。'
+    },
+    features: {
+      title: '功能介绍｜拾词',
+      description: '划词查词、个人补词、生词收藏、词书复习、本地备份与 PDF 导出：拾词当前已经具备的能力，以及明确的边界。'
+    },
+    guide: {
+      title: '使用指南与常见问题｜拾词',
+      description: '从开启悬浮查词、按系统提示授权，到复习与备份：拾词的使用步骤、常见问题与隐私说明。'
+    },
+    download: {
+      title: '下载｜拾词',
+      description: '拾词安卓手机与安卓平板下载入口，共用同一个通用测试包；以及 iPhone、iPad 当前的支持状态。'
+    }
+  },
+  // 安卓两个入口共用一个通用 APK；文案只描述事实，不按型号拆分版本。
+  platforms: {
+    android: {
+      phoneLabel: '安卓手机下载',
+      tabletLabel: '安卓平板下载',
+      shareNote: '安卓手机、安卓平板两个按钮指向同一个通用 APK，下载内容完全一致；没有单独的手机版或平板版，也不按型号区分。安装前请先备份学习数据。{version}只用于核对当前测试包，不代表按型号分版。',
+      shareNoteUnavailable: '安卓手机和安卓平板将来共用同一个通用 APK，不区分型号，也没有单独的手机版或平板版；当前暂未开放下载。'
+    },
+    apple: {
+      phoneStatus: 'iPhone 暂未提供',
+      tabletStatus: 'iPad 暂未提供',
+      note: 'iOS 与 iPadOS 版本尚未提供：这里没有 App Store 链接、没有安装包下载，也没有订阅、账号或信息收集入口。'
+    }
+  },
   releaseStatus: {
     preparing: {
       description: '当前处于内测阶段，尚无公开发行包。',
@@ -43,7 +77,7 @@ window.SHICI_SITE = {
       footerStatus: '公开测试版 {version} · 已开放下载',
       channel: '公开测试版',
       title: '{name} {version}',
-      copy: '2.6.1 公开测试包（Debug 签名），不是正式发行版。安装前请备份学习数据。已知问题：大幅滚屏后的再次划词可能失败或不显示笔迹，尚未修复，可先用手动输入。',
+      copy: '2.6.1 公开测试包（Debug 签名），不是正式发行版；安卓手机和安卓平板共用同一个通用包。安装前请备份学习数据。已知问题：大幅滚屏后的再次划词可能失败或不显示笔迹，尚未修复，可先用手动输入。',
       verify: '请核对下方版本、文件大小及 SHA-256。本站目前使用 HTTP 明文下载；校验值可检查文件是否一致，但同站 HTTP 校验不能替代 HTTPS 的传输保护。'
     }
   },

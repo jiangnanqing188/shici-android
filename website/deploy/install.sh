@@ -5,8 +5,10 @@
 #     bash install.sh
 #
 # bundle 需包含（由父侧打包）：
-#     index.html styles.css content.js app.js nginx.conf SHA256SUMS
-# SHA256SUMS 必须恰好覆盖上述五个文件，不接受其他文件名。
+#     index.html features.html guide.html download.html
+#     styles.css content.js app.js nginx.conf SHA256SUMS
+# SHA256SUMS 必须恰好覆盖上述八个文件，不接受其他文件名。
+# 四个 HTML 页面缺一不可；漏装任一页面会让已发布导航出现 404，因此列表固定。
 #
 # 本脚本执行的动作：
 #   1. 严格前置检查（root、bundle 完整性、哈希、无已有 nginx/apache/caddy、
@@ -16,7 +18,7 @@
 #   3. 通过 apt 安装本批已审版本 nginx 与 nginx-common 1.24.0-2ubuntu7.18
 #      （--no-install-recommends；版本不可用即失败，不降级、不替换）。
 #   4. 只移除本次 apt 新装且经包归属校验的标准 default 站点链接。
-#   5. 创建 /srv/shici-website/www，只复制四个静态文件。
+#   5. 创建 /srv/shici-website/www，只复制七个静态文件（四个页面＋三份共享资源）。
 #   6. 安装 /etc/nginx/sites-available/shici-website 与唯一启用链接。
 #   7. nginx -t 通过后先解除启动抑制，再 start/reload 并 enable 开机自启；
 #      这是本批 nginx 首次可能对公网提供页面的时刻。
@@ -55,8 +57,9 @@ readonly SUPPRESS_HOLD="${SUPPRESS_DIR}/${SUPPRESS_HOLD_NAME}"
 # 不降级、不替换。这是本批的版本锁定，不是永久更新策略。
 readonly NGINX_PKG_VERSION="1.24.0-2ubuntu7.18"
 
-STATIC_FILES=(index.html styles.css content.js app.js)
-BUNDLE_FILES=(index.html styles.css content.js app.js nginx.conf)
+# 四个独立 HTML 页面 + 三份共享资源；顺序即安装顺序，不随 bundle 内容变化。
+STATIC_FILES=(index.html features.html guide.html download.html styles.css content.js app.js)
+BUNDLE_FILES=(index.html features.html guide.html download.html styles.css content.js app.js nginx.conf)
 
 SUPPRESS_CONF_LINES=(
     '# 由拾词官网 install.sh 在本批首次部署期间创建，用于阻止本批新装 nginx'
@@ -135,7 +138,7 @@ cleanup() {
         warn "发现同路径站点配置但无法确认归属，保留不动：$NGINX_AVAILABLE"
     fi
 
-    # 4. 只清理本批创建的 www 中四个公开文件：逐文件哈希匹配本批内容才删除，
+    # 4. 只清理本批创建的 www 中七个公开文件：逐文件哈希匹配本批内容才删除，
     #    内容不匹配（可能被并发改动）或路径已非本批常规文件的一律保留并告警。
     if [ "$CREATED_WWW" -eq 1 ] && [ -d "$WWW_ROOT" ] && [ ! -L "$WWW_ROOT" ]; then
         for f in "${STATIC_FILES[@]}"; do
@@ -540,7 +543,7 @@ check_bundle_and_sums() {
         [[ "$line" =~ $re ]] || die "SHA256SUMS 行格式不合法：$line"
         name="${BASH_REMATCH[2]}"
         case "$name" in
-            index.html|styles.css|content.js|app.js|nginx.conf) ;;
+            index.html|features.html|guide.html|download.html|styles.css|content.js|app.js|nginx.conf) ;;
             *) die "SHA256SUMS 含未允许的文件名：$name" ;;
         esac
         [ -z "${seen[$name]:-}" ] || die "SHA256SUMS 含重复条目：$name"
@@ -549,7 +552,7 @@ check_bundle_and_sums() {
         sum_count=$((sum_count + 1))
     done < "$BUNDLE_DIR/$SUMS_FILE"
 
-    [ "$sum_count" -eq 5 ] || die "SHA256SUMS 应恰好包含 5 个条目，实际为 $sum_count。"
+    [ "$sum_count" -eq 8 ] || die "SHA256SUMS 应恰好包含 8 个条目，实际为 $sum_count。"
     for f in "${BUNDLE_FILES[@]}"; do
         [ -n "${seen[$f]:-}" ] || die "SHA256SUMS 缺少条目：$f"
     done
@@ -844,8 +847,8 @@ create_site_files() {
     done
 
     count="$(find "$WWW_ROOT" -mindepth 1 -maxdepth 1 | wc -l)"
-    [ "$count" -eq 4 ] || die "静态目录文件数量异常（应为 4，实际 $count）。"
-    ok "已创建 $WWW_ROOT，仅含四个静态文件（root:root，目录 755 / 文件 644）。"
+    [ "$count" -eq 7 ] || die "静态目录文件数量异常（应为 7，实际 $count）。"
+    ok "已创建 $WWW_ROOT，仅含七个静态文件（root:root，目录 755 / 文件 644）。"
 }
 
 install_site_config() {
@@ -960,7 +963,7 @@ main() {
         "  - 前置检查：通过" \
         "  - 装包前启动抑制：已建立，并在 nginx -t 通过后解除" \
         "  - nginx 软件包：本次由 apt 新装" \
-        "  - 静态文件：四个，位于 $WWW_ROOT（root:root，目录 755 / 文件 644）" \
+        "  - 静态文件：七个（四个页面＋三份共享资源），位于 $WWW_ROOT（root:root，目录 755 / 文件 644）" \
         "  - 站点配置：$NGINX_AVAILABLE" \
         "  - 启用链接：$NGINX_ENABLED" \
         "  - nginx -t：通过" \

@@ -1,5 +1,28 @@
 # 拾词官网（私有开发目录）
 
+## 多页面结构（2026-11-01，已上线）
+
+本批把原来的单个长滚动页拆成同一站点下的四个独立 HTML 页面，仍不买域名、不开子域、无新增后端。所有页面共用 `styles.css`、`content.js`、`app.js` 三份资源，没有重复副本。
+
+- 页面与用途：`/` 与 `/index.html` 是简洁首页（品牌、示意图、三个入口）；`/features.html` 功能介绍与能力边界；`/guide.html` 使用指南，页内包含 `#how` 使用步骤、`#faq` 常见问题、`#privacy` 隐私说明；`/download.html` 下载与校验。
+- 导航：四页顶部与页脚使用同一组四项导航，当前页在 HTML 里写死 `aria-current="page"`，`app.js` 再按解析后的实际路径校正一次；品牌与页脚品牌都明确返回首页。
+- 旧入口兼容：`/?v=d99743c4#download`、`#features`、`#how`、`#privacy`、`#faq` 只会在首页（`/`、空路径、`/index.html`）被 `app.js` 一次性转到对应独立页面或页内锚点；在 `guide.html#privacy`、`guide.html#faq` 等二级页自身锚点上不再改写，避免同 URL 循环。旧查询串不参与判定，`v=d99743c4` 只是历史版本标记。
+- 缓存一致性：四个页面统一引用 `styles.css?v=20261101a`、`content.js?v=20261101a`、`app.js?v=20261101a`；共享资源各只有一份，版本查询值相同且与页面同批更新。nginx 的三个精确 location 不包含查询串，带查询串的同一路径仍命中对应文件。
+- 发布事实：`content.js` 的 `publicRelease` 仍是唯一真实发布源，仍是 2.6.1 / 52（110,669,521 字节，SHA-256 `e24e63322def2db7ea4e34783ae238ca5c35c6650703887de642b2f1bfac59b4`，Debug 签名测试包）。三态校验（`null` 准备中 / 非空但不完整不开放 / 完整才开放）保持不变，同一结果驱动每一页的标题、`meta[name="description"]`、hero 提示、下载区与页脚。
+- 下载页平台事实：安卓区块分“安卓手机下载”“安卓平板下载”两个按钮，文案即按钮文字，二者指向同一个通用 APK，并在页面明确写出共包、不区分型号；苹果区块为“iPhone 暂未提供”“iPad 暂未提供”两段纯文字，没有 `href`、没有 `download`、没有 App Store 链接或占位跳转，也没有订阅、账号或信息收集入口。发布状态无效时，两个安卓按钮改为“暂未开放下载”文字，不渲染任何链接。
+- 局部容器容错：`app.js` 对下载区、功能列表、步骤、问答、隐私等区块逐个判空，任何一页缺少某个容器（例如首页和功能页没有下载区、下载页没有功能列表）都只跳过对应模块，其它渲染照常；`content.js` 整体缺失时仍是先前的整页提示行为。
+- 版本口径：`internalVersion` 为本地开发参考 2.6.2，`internalVersionCode` 为 53，仅作开发记录，不代表已发布；公开包仍固定为 2.6.1 / 52。页面把这两个值分开显示，不把 53 当作可下载版本。
+- 无 JS 与可访问性：四页都有 `<noscript>` 说明，且标题、导航、入口、平台事实与边界文字直接写在 HTML 里，不依赖脚本即可阅读；键盘焦点样式、跳过链接与 `prefers-reduced-motion` 处理沿用原样式。
+- 本批状态：**已实施、已上线**。官网已由原单页换成上述四页（统一导航、旧锚点兼容）；Android 手机与平板仍共用 2.6.1 / 52 通用 Debug 测试包，Apple iPhone / iPad 暂未提供且无链接；Android 源码与平板未改动，本地候选 2.6.2 / 53 未发布。
+- 实现链：Command Code Plan（`commandcode-plan/deepseek/deepseek-v4.1-flash-fast`，请求 max）完整交付，末尾三条语法命令均 exit 0。中途 Qoder 认证失败、Command 入口 max-tokens 中断与本通道两次 TRANSPORT 中断的原始过程保留，不称“一遍全成功”。
+- 本地有限验收：独立实际 `gpt-6.1-sol/high` 的 local01 唯一次 16 项原为 13 PASS / 2 FAIL / 1 ERROR，原结果保留，三处缺口均判定为夹具问题；新 local02 仅针对原未达尾部 3 PASS / 0 FAIL / 0 ERROR / 0 SKIP。只算本地有限闭环，不累计、不倒填原 16 项全绿。
+- 生产发布与验收：经 Netcatty 官方 H2 发布准确的七个静态文件与一份只新增三条精确路径的 nginx 配置，私有备份与候选 hash 核对保留；候选与生产 `nginx -t`、reload 均 exit 0，原 `duplicate MIME type "text/html"` warning 仍在；443 的 PID/start/boot 与 unit/config/binary、旧 APK hash/字节数保持不变；未执行首次安装 `install.sh`，未改 DNS、防火墙、域名、HTTPS 或其它服务器。新独立实际 `gpt-6.1-sol/high` 唯一 post01 五项为 **5 PASS / 0 FAIL / 0 ERROR / 0 SKIP**：准确生产字节与版本资源、HTML 与旧 APK 的 HEAD、360px 真实浏览器下旧链接与下载分类、私有路径 404 与方法 405、官方部署与 443 保护回执核对（P05 为静态核对，非测试者操作服务器），0 次真实 APK GET。这不代表全网、HTTPS、原用户浏览器 IAB 缓存或 Android 真机验收；Git 提交与推送由父侧最后收尾，本文不预填提交结果。
+
+### 本批部署工件同步（已发布）
+
+- `deploy/nginx.conf` 只新增 `location = /features.html`、`= /guide.html`、`= /download.html` 三个精确路径，原 `/`、`/index.html`、`/styles.css`、`/content.js`、`/app.js` 与固定 APK 路径、`GET/HEAD` 限制、`charset utf-8` 与两个安全头保持；没有目录级匹配、没有 SPA fallback、没有代理。该配置已随本批发布，`nginx -t` 与 reload 均 exit 0。
+- `deploy/install.sh` 的固定名单同步为四个页面加三份共享资源：`STATIC_FILES` 七项、`BUNDLE_FILES` 八项（多一个 `nginx.conf`），`SHA256SUMS` 白名单与条目数（8）、静态目录条目数（7）、回退逐文件哈希清理与结尾说明一并同步；脚本结构与首次部署语义不变。本批未执行该脚本（属首次安装工具，本次为既有站点的精确替换）。
+
 ## 平板 / 手机下载入口（2026-10-30，已上线）
 
 - 下载区分为“平板下载”和“手机下载”两个按钮，均从同一发布配置读取目标，并明确提示“手机和平板共用同一个 APK，两个入口下载内容一致。”当前仍为 2.6.1 / 52 通用 Debug 测试包，不是两个独立适配版本；未重新构建或改动 APK。
@@ -30,12 +53,15 @@
 
 网站是纯静态目录，没有构建步骤，不需要 npm，也不使用远程字体、CDN、分析追踪或网络请求。
 
-- `index.html`：页面入口和语义结构。
-- `styles.css`：页面样式与响应式布局，含纸张暖白、深墨绿主色和界面示意。
-- `content.js`：全部简体中文产品文案和发布配置，只声明 `window.SHICI_SITE`；稳定产品简介与分状态文案分开存放。
-- `app.js`：读取 `window.SHICI_SITE`，把 `publicRelease` 校验为唯一发布状态，并据此统一渲染简介状态句、运行要求、下载区、hero 提示、meta description 和页脚；`repositoryUrl` 仍按 `null` 处理。
+- `index.html`：简洁首页（品牌、界面示意、三个页面入口）。
+- `features.html`：功能介绍与能力边界。
+- `guide.html`：使用指南，页内含 `#how`、`#faq`、`#privacy` 三个章节锚点。
+- `download.html`：下载页，Android / 苹果两个平台区块与校验信息。
+- `styles.css`：四页共用的样式与响应式布局，含纸张暖白、深墨绿主色和界面示意。
+- `content.js`：全部简体中文产品文案和发布配置，只声明 `window.SHICI_SITE`；稳定产品简介、每页标题/meta、平台文案与分状态文案分开存放。
+- `app.js`：四页共用的渲染脚本，读取 `window.SHICI_SITE`，把 `publicRelease` 校验为唯一发布状态，并据此统一渲染每页标题/meta、运行要求、下载区、hero 提示和页脚；按 `data-page` 选择页面文案，并对不存在的容器逐块跳过；`repositoryUrl` 仍按 `null` 处理。
 
-入口按顺序先加载 `content.js`，再加载 `app.js`。修改文案时只改 `content.js` 中对应字段，不把事实写死在 HTML 或 JS 里。
+每页按顺序先加载 `content.js`，再加载 `app.js`，两者都带同一版本查询值。修改文案时只改 `content.js` 中对应字段，不把事实写死在 HTML 或 JS 里。2026-11-01 之前只有 `index.html` 单页，上述四页结构自本批起生效。
 
 ## Logo当前状态（2026-10-28）
 
@@ -66,21 +92,23 @@ python3 -m http.server 8000 --bind 127.0.0.1 --directory website
 
 然后打开 `http://127.0.0.1:8000/`（根 URL 就是网站首页）。也可以先进入本目录再运行 `python3 -m http.server 8000 --bind 127.0.0.1`，两种方式访问地址相同。
 
-不要在开发仓库根目录直接运行 `python3 -m http.server`：那会把整个私有开发仓库作为静态目录、默认绑定所有网络接口，可能意外暴露源码。上述命令只用于本地预览。公网侧只允许下述 H2 站点使用 `website` 中的四个静态文件；不要把开发仓库根目录、`website` 整个目录或任何运维工件交给 Web 服务器。
+不要在开发仓库根目录直接运行 `python3 -m http.server`：那会把整个私有开发仓库作为静态目录、默认绑定所有网络接口，可能意外暴露源码。上述命令只用于本地预览。公网侧只允许下述 H2 站点使用 `website` 中明确列入部署白名单的静态文件（2026-10-30 之前为四个单页文件，2026-11-01 起为四个页面加三份共享资源共七个，均已上线）；不要把开发仓库根目录、`website` 整个目录或任何运维工件交给 Web 服务器。
 
 ## 香港 H2 临时部署（HTTP + 公网 IP）
 
 ### 范围与现状
 
+> 时间范围提示：本节以下保留 2026-10-26 至 2026-10-30 单页版本的实际部署与验收证据（当时为五个 URL），原数字与含义不改、作为历史保留。2026-11-01 的四页结构与三处新增 nginx 精确路径已上线，最新当前状态见文首“多页面结构”一节。
+
 - 用户已授权在香港 H2（Ubuntu 24.04）部署现有静态官网。没有域名、暂无购买预算，本轮先通过服务器公网 IP 的 HTTP 80 访问；域名和 HTTPS 后续另做。
-- 只公开四个文件：`index.html`、`styles.css`、`content.js`、`app.js`。它们是网站唯一可公开内容，精确复制到 `/srv/shici-website/www`；不上传或服务开发仓库根目录，也不把 `website/README.md`、`website/deploy/`、`.git` 或任何其他文件放进站点根目录。
+- 截至 2026-10-30 那次发布，线上公开四个文件：`index.html`、`styles.css`、`content.js`、`app.js`（单页版本）。它们精确复制到 `/srv/shici-website/www`；2026-11-01 起已追加 `features.html`、`guide.html`、`download.html`，线上为七个静态文件，最新状态见文首。不上传或服务开发仓库根目录，也不把 `website/README.md`、`website/deploy/`、`.git` 或任何其他文件放进站点根目录。
 - 现有 443 端口由服务器上的其他服务（sing-box）占用，本轮不改动 443、不代理该服务、不改 DNS、不改防火墙或云安全组。
 - 不开放 APK、公开仓库、模型、词库或学习数据下载；`content.js` 的 `publicRelease` 与 `repositoryUrl` 继续保持 `null`，页面仍显示暂未开放下载。
 - 本轮已完成 HTTP 80 临时站的首次部署（2026-10-26 11:43 安装成功、exit 0），站点可通过服务器公网 IP 访问。原首次 POST 复验 9 PASS / 1 FAIL 保留；唯一失败的 `styles.css` 显式 charset 缺口已修正，并经 post-css-r1 受影响有界复验 6 PASS / 0 FAIL 闭环。`nginx -t` 存在非阻断的 `duplicate MIME type "text/html"` warning，真实 exit 0；本批如实记录，不额外改配置消警告。安装终端回执为 completed/exit 0 且未标记截断，但声明字符数与返回正文长度存在差异，因此不声称逐字节完整终端流。该有限闭环不等于全部验收通过，也不代表页面已经开放下载。
 
 ### 服务器路径
 
-- 站点根目录：`/srv/shici-website/www`（仅四个静态文件，root:root，目录 755、文件 644）。
+- 站点根目录：`/srv/shici-website/www`（线上现有七个静态文件：四个页面与三份共享资源，root:root，目录 755、文件 644）。
 - Nginx 站点配置：`/etc/nginx/sites-available/shici-website`。
 - 唯一启用链接：`/etc/nginx/sites-enabled/shici-website`。
 - 运维工件（本目录的 `README.md`、`deploy/nginx.conf`、`deploy/install.sh`）只用于打包和部署，不复制进站点根目录，Web 不可访问。
@@ -89,13 +117,16 @@ python3 -m http.server 8000 --bind 127.0.0.1 --directory website
 
 `website/deploy/` 只包含两个部署工件：
 
-- `nginx.conf`：HTTP 80 默认站的 Nginx 配置。`server_name _`，同时监听 IPv4/IPv6 的 80，不监听 443，不代理其他服务；`root` 只指向 `/srv/shici-website/www`；只允许 `GET`/`HEAD`，只公开 `/`、`/index.html`、`/styles.css`、`/content.js`、`/app.js` 五个 URL，其他路径返回 404，关闭目录列表；显式声明 HTML/CSS/JS 三种 Content-Type，并通过 `charset utf-8` 与 `charset_types text/html text/css application/javascript` 为这三种响应附加 `charset=utf-8`，不把 MIME 覆盖成同一类型。
+- `nginx.conf`：HTTP 80 默认站的 Nginx 配置。`server_name _`，同时监听 IPv4/IPv6 的 80，不监听 443，不代理其他服务；`root` 只指向 `/srv/shici-website/www`；只允许 `GET`/`HEAD`，只公开 `/`、`/index.html`、`/features.html`、`/guide.html`、`/download.html`、`/styles.css`、`/content.js`、`/app.js` 八个 URL 与一个固定 APK 路径，其他路径返回 404，关闭目录列表；显式声明 HTML/CSS/JS 三种 Content-Type，并通过 `charset utf-8` 与 `charset_types text/html text/css application/javascript` 为这三种响应附加 `charset=utf-8`，不把 MIME 覆盖成同一类型。
 - `install.sh`：供 root 在已上传的 bundle 目录内手动执行一次的首次部署脚本，不自带联网逻辑（安装 nginx 时由 `apt-get` 访问系统软件源），不读取密钥或代理凭据，不硬编码服务器 IP。装包前先建立仅针对 nginx.service 的可恢复启动抑制，`nginx -t` 通过后才解除并首次启动。本轮首部署把 nginx 与 nginx-common 固定为已审版本 `1.24.0-2ubuntu7.18`，版本不可用即明确失败，不降级、不替换。请用 `bash install.sh` 执行，不依赖可执行位。
 
 父侧打包 bundle 时必须包含且只校验以下文件：
 
 ```text
 index.html
+features.html
+guide.html
+download.html
 styles.css
 content.js
 app.js
@@ -105,10 +136,10 @@ SHA256SUMS
 
 `install.sh` 也需随 bundle 一同上传以供执行，但不进入 `SHA256SUMS`。
 
-`SHA256SUMS` 由父侧生成，必须恰好覆盖上述五个文件（不含 `install.sh` 自身），脚本会拒绝额外文件名、重复条目、非常规文件和哈希不匹配。可在 bundle 目录内这样生成：
+`SHA256SUMS` 由父侧生成，必须恰好覆盖上述八个文件（不含 `install.sh` 自身），脚本会拒绝额外文件名、重复条目、非常规文件和哈希不匹配。可在 bundle 目录内这样生成：
 
 ```bash
-sha256sum index.html styles.css content.js app.js nginx.conf > SHA256SUMS
+sha256sum index.html features.html guide.html download.html styles.css content.js app.js nginx.conf > SHA256SUMS
 ```
 
 bundle 通过安全通道上传到服务器后，在该目录内以 root 执行：
@@ -117,7 +148,7 @@ bundle 通过安全通道上传到服务器后，在该目录内以 root 执行�
 bash install.sh
 ```
 
-脚本前置检查包括：uid 为 0；系统为 Debian/Ubuntu 且 systemd 正在运行；bundle 五个文件与 `SHA256SUMS` 完整匹配；未安装 nginx/apache/caddy，`/etc/nginx`、nginx systemd 单元/`nginx.service.d` 抑制目录及同名部署路径均不存在；TCP 80 在 IPv4/IPv6 上均无监听。任一条件不满足即中止，不覆盖已有内容；无法确认能建立启动抑制时不安装 nginx。
+脚本前置检查包括：uid 为 0；系统为 Debian/Ubuntu 且 systemd 正在运行；bundle 八个文件与 `SHA256SUMS` 完整匹配；未安装 nginx/apache/caddy，`/etc/nginx`、nginx systemd 单元/`nginx.service.d` 抑制目录及同名部署路径均不存在；TCP 80 在 IPv4/IPv6 上均无监听。任一条件不满足即中止，不覆盖已有内容；无法确认能建立启动抑制时不安装 nginx。
 
 ### 脚本动作
 
@@ -125,11 +156,11 @@ bash install.sh
 2. 执行 `apt-get update`，再执行 `apt-get install -y --no-install-recommends nginx=1.24.0-2ubuntu7.18 nginx-common=1.24.0-2ubuntu7.18`。这两个版本是本轮首部署前已审的 Ubuntu 24.04 软件源版本：`apt-get update` 后候选即使漂移也只安装该准确版本，版本不可用即明确失败，不降级、不替换；这是本批的版本锁定，不是永久更新策略。该次 apt 调用仅在本进程内使用 `NEEDRESTART_MODE=l`，避免 needrestart 自动重启既有服务（含占用 443 的服务），不写全局策略。这是系统软件源中的现有软件包，不购买新服务；安装前会再次确认启动抑制仍在，安装后复核两个包的实际版本确为上述版本。
 3. 装包后复核抑制文件仍在、`nginx` 未被启动，且 80 监听（若已出现）只属于本次新装 nginx、`sites-enabled` 没有 `default` 以外的站点、`conf.d` 没有额外配置；否则中止。未知站点/配置保留不删。
 4. 仅当 `sites-enabled/default` 是指向标准 `/etc/nginx/sites-available/default`、且该文件属于 nginx 软件包的符号链接时，移除该链接，避免与本站的 `default_server` 冲突；不删除不明配置。
-5. 创建 `/srv/shici-website/www`，只复制四个静态文件并逐字节核对。
+5. 创建 `/srv/shici-website/www`，只复制七个静态文件（四个页面与三份共享资源）并逐字节核对。
 6. 安装 `sites-available/shici-website` 和唯一启用链接 `sites-enabled/shici-website`。
 7. 执行 `nginx -t`；通过后先删除本批启动抑制并 `daemon-reload`，再启动 nginx（这是本批首次可能公开页面的时刻），随后 `systemctl enable nginx`。最终用本机 `ss` 确认 80 由 nginx 监听。
 
-因此装包期间不会出现标准 `default` 站短暂公开的窗口：在站点只有四个静态文件、站点配置已就位且 `nginx -t` 通过之前，本批 nginx 不会被 systemd 启动。
+因此装包期间不会出现标准 `default` 站短暂公开的窗口：在站点只有七个静态文件、站点配置已就位且 `nginx -t` 通过之前，本批 nginx 不会被 systemd 启动。
 
 脚本不做外网 HTTP 请求测试、不测试页面功能、不修改 443/防火墙/云安全组、不绑定域名、不申请证书、不发布安装包或数据。
 
@@ -138,7 +169,7 @@ bash install.sh
 任何一步失败时脚本以非 0 退出，并只回退本批创建的对象：
 
 - **先停止并取消自启**：按实际安装结果（而非“安装成功”标记）判断本批是否引入了 nginx，包括 apt 部分失败。若已运行则 `systemctl stop nginx`，并对本批 nginx 主进程做兜底 TERM/KILL；随后 `systemctl disable nginx`，清理仅指向 nginx 软件包单元的启用链接，并复查 `is-active` 与 `is-enabled`。状态查询失败、空输出或未知取值不会被当成“已停止/未启用”，而是视为无法确认并保留启动抑制；`systemctl disable` 或 `daemon-reload` 执行失败同样不视为安全。不卸载软件包、不停止其他服务。
-- 移除本批创建的启用链接、站点配置和 `/srv/shici-website` 静态目录：启用链接需目标与创建时记录的 inode 均一致；站点配置与四个静态文件逐文件比对 `SHA256SUMS` 中的本批哈希，内容不一致、已被替换或不是常规文件的保留并告警；目录用 `rmdir` 且仅在为空时删除。
+- 移除本批创建的启用链接、站点配置和 `/srv/shici-website` 静态目录：启用链接需目标与创建时记录的 inode 均一致；站点配置与七个静态文件逐文件比对 `SHA256SUMS` 中的本批哈希，内容不一致、已被替换或不是常规文件的保留并告警；目录用 `rmdir` 且仅在为空时删除。
 - 只有在确认本批 nginx 已停止且未自启时，才恢复本批移除的标准 `default` 启用链接；否则不恢复，避免“default 链接 + 仍 enabled”在重启后公开默认站。
 - 启动抑制的撤除同样以“服务已停止且未自启”为前提；若无法确认，脚本按磁盘上真实的抑制状态处理：仍完整在位则保留；若已被部分删除（例如释放过程中 `rmdir` 或 `daemon-reload` 失败），则重建仅针对 nginx.service 的抑制，并明确提示人工检查；重建失败时提示人工恢复抑制文件。这样失败后本批新引入的 nginx 不运行、不自启，而已装软件包可以保留。
 - 不删除不明文件、不卸载软件、不停改既有服务。若发现其他站点/`conf.d` 配置、80 被非本批进程占用等未知并发内容，脚本保留这些内容并明确失败；回退只停止本批新引入的 nginx，不会为了强行回滚而删除他人内容。
@@ -153,6 +184,9 @@ systemctl disable nginx
 rm -f /etc/nginx/sites-enabled/shici-website
 rm -f /etc/nginx/sites-available/shici-website
 rm -f /srv/shici-website/www/index.html
+rm -f /srv/shici-website/www/features.html
+rm -f /srv/shici-website/www/guide.html
+rm -f /srv/shici-website/www/download.html
 rm -f /srv/shici-website/www/styles.css
 rm -f /srv/shici-website/www/content.js
 rm -f /srv/shici-website/www/app.js
@@ -176,7 +210,7 @@ systemctl daemon-reload
 - 本轮访问地址为 `http://<服务器公网IP>/`（真实 IP 只记录在父侧私有部署记录和交付报告中，不写入本文或仓库）。站点已部署；CSS 修正后的受限复验已通过当前本机线路的该 HTTP/IP 地址完成。HTTP 为明文传输，不是 HTTPS。
 - 域名、DNS、HTTPS/443、证书、防火墙/云安全组未在本轮完成；443 仍由现有服务占用，后续不得直接抢占。已完成的是原 POST 9 PASS / 1 FAIL 与 post-css-r1 6 PASS / 0 FAIL 的有界结果，未覆盖浏览器视觉/交互、国内各网络与全网线路、HTTPS、动态故障回退或重启实测，故不得表述为全站或全网验收通过。原 PRE 的错误/失败记录保持原样，未倒填为通过。
 - 本批只做官网事实收尾：`publicRelease` 与 `repositoryUrl` 仍为 `null`，未开放下载/APK/模型/源码/词库/学习数据，Android 与平板侧未改动。
-- 服务器资源有限，本方案使用系统 nginx 直接服务四个静态文件，不引入 Docker、Node、数据库、CDN 或额外运行时。
+- 服务器资源有限，本方案使用系统 nginx 直接服务静态文件（线上现为七个：四个页面与三份共享资源），不引入 Docker、Node、数据库、CDN 或额外运行时。
 
 ## 发布状态与文案
 
@@ -186,7 +220,7 @@ systemctl daemon-reload
 - `publicRelease` 非空但任一条件不满足：配置不完整，显示“发布信息待确认 / 暂未开放下载”，不渲染下载链接。
 - `publicRelease` 全部条件满足：有效公开测试版，下载区、hero 提示和页脚统一显示已开放。
 
-`content.js` 的 `releaseStatus.preparing`、`releaseStatus.incomplete`、`releaseStatus.open` 只是上述三种状态的中文文案来源，不参与状态判定。`app.js` 先校验 `publicRelease`，再用同一个状态选择文案，并同时更新稳定简介后的状态句、运行要求末项、下载区、hero 下载提示、`meta[name="description"]` 和页脚说明，避免同页出现“已开放下载”与“尚无公开发行包／暂未开放下载”并存。不要把 `open` 文案当作已发布的证据，也不要通过只改状态文案来制造可下载状态。
+`content.js` 的 `releaseStatus.preparing`、`releaseStatus.incomplete`、`releaseStatus.open` 只是上述三种状态的中文文案来源，不参与状态判定。`app.js` 先校验 `publicRelease`，再用同一个状态选择文案，并在四页同时更新每页标题、`meta[name="description"]`、运行要求末项、下载区（页面存在时）、hero 下载提示和页脚说明，避免同一页出现“已开放下载”与“尚无公开发行包／暂未开放下载”并存。不要把 `open` 文案当作已发布的证据，也不要通过只改状态文案来制造可下载状态。
 
 `description` 只写稳定产品简介，不写发布状态；状态句放在 `releaseStatus` 中。运行要求的前三项是稳定内容，第四项由当前状态的 `requirement` 生成。状态文案中的 `{name}`、`{version}` 会由页面替换为站点名和已校验的版本号。
 
@@ -194,10 +228,10 @@ systemctl daemon-reload
 
 目前 `content.js` 中：
 
-- `publicRelease` 必须保持 `null`，页面会显示“公开测试版准备中 / 暂未开放下载”，不出现空链接或假下载。
+- `publicRelease` 当前为已校验通过的 2.6.1 / 52 测试包配置（2026-10-29 起公开）；若改为 `null` 则回到“公开测试版准备中 / 暂未开放下载”，不出现空链接或假下载。
 - `repositoryUrl` 必须保持 `null`，页面不渲染公开仓库入口；只有公开下载仓库真正创建并获批准后才填写真实地址。
-- `internalVersion` 当前为 `2.2.1`，只是内部版本参考，不代表已有公开发行包。
-- `description` 只写稳定产品简介；三个状态的状态句、运行要求末项和页脚说明都在 `releaseStatus` 中维护。
+- `internalVersion` 当前为 `2.6.2`、`internalVersionCode` 为 `53`，只是本地开发参考，不代表已有公开发行包；公开可下载版本仍是 `publicRelease` 里的 2.6.1 / 52。
+- `description` 只写稳定产品简介；每页标题与 meta 描述在 `pages` 中维护，状态句、运行要求末项和页脚说明在 `releaseStatus` 中维护，平台按钮文案与共包说明在 `platforms` 中维护。
 
 将来有经过确认的公开测试包时，只改 `content.js` 的发布配置字段；三种状态的文案已在 `releaseStatus` 中准备好，不需要改 `app.js` 或逐处追改页面文案：
 

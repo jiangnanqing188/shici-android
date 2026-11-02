@@ -3,12 +3,21 @@
 
   var HERO_PHRASE = "阅读不停，生词随手拾起";
   var site = window.SHICI_SITE;
+  var pageName = document.documentElement.getAttribute("data-page") || "";
+  var LEGACY_HASH_TARGETS = {
+    "#features": "features.html",
+    "#how": "guide.html#how",
+    "#guide": "guide.html",
+    "#download": "download.html",
+    "#privacy": "guide.html#privacy",
+    "#faq": "guide.html#faq"
+  };
 
   function text(value) {
     if (value === null || value === undefined) {
       return "";
     }
-    return String(value).replace(/ /g, " ").trim();
+    return String(value).replace(/\u00a0/g, " ").trim();
   }
 
   function asArray(value) {
@@ -68,7 +77,6 @@
     } catch (error) {
       return "";
     }
-    return "";
   }
 
   function isPositiveInteger(value) {
@@ -148,16 +156,29 @@
     };
   }
 
-  function renderSiteText(description) {
+  function pageMeta() {
+    var table = site.pages && typeof site.pages === "object" ? site.pages : {};
+    var entry = pageName && table[pageName] && typeof table[pageName] === "object" ? table[pageName] : {};
+    return {
+      title: text(entry.title),
+      description: text(entry.description)
+    };
+  }
+
+  // 只改本页的标题与 meta 描述；页面名缺失时回落到站点名，不影响其它渲染。
+  // meta 描述仍由同一发布状态追加状态句，避免各页出现互相矛盾的事实。
+  function renderSiteText(statusDescription) {
     var siteName = text(site.name) || "拾词";
     var tagline = text(site.tagline);
-    var descriptionText = text(description);
+    var meta = pageMeta();
+    var descriptionText = meta.description || text(site.description);
+    var metaText = joinSentences(descriptionText, statusDescription);
     var taglineNode = document.querySelector("[data-tagline]");
     var descriptionNode = document.querySelector("[data-description]");
     var metaDescription = document.querySelector('meta[name="description"]');
 
     setAllText("site-name", siteName);
-    document.title = siteName + "｜" + HERO_PHRASE;
+    document.title = meta.title || (siteName + "｜" + HERO_PHRASE);
 
     if (taglineNode) {
       if (!tagline || normalisePhrase(tagline) === normalisePhrase(HERO_PHRASE)) {
@@ -175,8 +196,8 @@
       }
     }
 
-    if (metaDescription && descriptionText) {
-      metaDescription.setAttribute("content", descriptionText);
+    if (metaDescription && metaText) {
+      metaDescription.setAttribute("content", metaText);
     }
   }
 
@@ -298,48 +319,82 @@
   }
 
   function applyReleaseCopy(nodes, copy) {
-    nodes.channel.textContent = copy.channel;
-    nodes.title.textContent = copy.title;
-    nodes.copy.textContent = copy.copy;
-    nodes.verify.textContent = copy.verify;
-    nodes.actions.replaceChildren();
-    nodes.actions.hidden = true;
-    nodes.meta.replaceChildren();
-    nodes.meta.hidden = true;
-    nodes.notes.replaceChildren();
-    nodes.notes.hidden = true;
+    if (nodes.channel) {
+      nodes.channel.textContent = copy.channel;
+    }
+    if (nodes.title) {
+      nodes.title.textContent = copy.title;
+    }
+    if (nodes.copy) {
+      nodes.copy.textContent = copy.copy;
+    }
+    if (nodes.verify) {
+      nodes.verify.textContent = copy.verify;
+    }
+    if (nodes.meta) {
+      nodes.meta.replaceChildren();
+      nodes.meta.hidden = true;
+    }
+    if (nodes.notes) {
+      nodes.notes.replaceChildren();
+      nodes.notes.hidden = true;
+    }
+  }
+
+  function androidShareNote(info, available) {
+    var platforms = site.platforms && typeof site.platforms === "object" ? site.platforms : {};
+    var android = platforms.android && typeof platforms.android === "object" ? platforms.android : {};
+    var template = text(available ? android.shareNote : android.shareNoteUnavailable);
+    if (!template) {
+      return "";
+    }
+    return substitute(template, { version: info.version || "" });
+  }
+
+  // 单个平台槽位：仅在发布配置有效时放一个真实 <a download>，否则只显示文字状态。
+  function renderPlatformSlot(slot, label, info, describedBy) {
+    if (!slot) {
+      return;
+    }
+    slot.replaceChildren();
+    if (info.state === "open" && info.downloadUrl) {
+      var downloadLink = element("a", "button button-primary", label);
+      downloadLink.href = info.downloadUrl;
+      downloadLink.rel = "noopener";
+      downloadLink.setAttribute("download", "");
+      if (describedBy) {
+        downloadLink.setAttribute("aria-describedby", describedBy);
+      }
+      slot.appendChild(downloadLink);
+    } else {
+      slot.appendChild(element("p", "platform-unavailable", "暂未开放下载"));
+    }
+    slot.hidden = false;
   }
 
   function renderRelease(nodes, info, copy) {
     applyReleaseCopy(nodes, copy);
+    renderPlatformSlot(nodes.phoneSlot, nodes.phoneLabel, info, "android-share-note");
+    renderPlatformSlot(nodes.tabletSlot, nodes.tabletLabel, info, "android-share-note");
+    if (nodes.shareNote) {
+      nodes.shareNote.textContent = androidShareNote(info, info.state === "open");
+    }
 
     if (info.state !== "open") {
       return;
     }
 
-    ["平板下载", "手机下载"].forEach(function (label) {
-      var downloadLink = element("a", "button", label);
-      downloadLink.href = info.downloadUrl;
-      downloadLink.rel = "noopener";
-      downloadLink.setAttribute("download", "");
-      downloadLink.setAttribute("aria-describedby", "release-action-note");
-      nodes.actions.appendChild(downloadLink);
-    });
+    if (nodes.meta) {
+      var meta = document.createDocumentFragment();
+      appendMetaRow(meta, "版本", info.version);
+      appendMetaRow(meta, "版本代码", info.versionCode);
+      appendMetaRow(meta, "文件大小", info.sizeLabel);
+      appendMetaRow(meta, "SHA-256", info.checksum, true);
+      nodes.meta.replaceChildren(meta);
+      nodes.meta.hidden = !nodes.meta.childElementCount;
+    }
 
-    var actionNote = element("p", "action-note", "手机和平板共用同一个 APK，两个入口下载内容一致。");
-    actionNote.id = "release-action-note";
-    nodes.actions.appendChild(actionNote);
-    nodes.actions.hidden = false;
-
-    var meta = document.createDocumentFragment();
-    appendMetaRow(meta, "版本", info.version);
-    appendMetaRow(meta, "版本代码", info.versionCode);
-    appendMetaRow(meta, "文件大小", info.sizeLabel);
-    appendMetaRow(meta, "SHA-256", info.checksum, true);
-    nodes.meta.replaceChildren(meta);
-    nodes.meta.hidden = !nodes.meta.childElementCount;
-
-    if (info.notesUrl) {
+    if (nodes.notes && info.notesUrl) {
       var notesText = document.createTextNode("更新说明：");
       var notesLink = element("a", "", "查看本版更新说明");
       notesLink.href = info.notesUrl;
@@ -349,37 +404,56 @@
     }
   }
 
+  // 苹果区块只更新文字：这里永远不生成 <a>、download 或商店链接。
+  function renderApple(platforms) {
+    var apple = platforms.apple && typeof platforms.apple === "object" ? platforms.apple : {};
+    var phone = text(apple.phoneStatus);
+    var tablet = text(apple.tabletStatus);
+    var note = text(apple.note);
+    if (phone) {
+      setAllText("apple-phone", phone);
+    }
+    if (tablet) {
+      setAllText("apple-tablet", tablet);
+    }
+    if (note) {
+      setAllText("apple-note", note);
+    }
+  }
+
+  // 只渲染本页实际存在的节点；缺少下载区任一局部节点时其它模块照常渲染。
   function renderDownload(info, copy) {
-    var channel = document.querySelector("[data-release-channel]");
-    var title = document.querySelector("[data-release-title]");
-    var copyNode = document.querySelector("[data-release-copy]");
-    var actions = document.querySelector("[data-release-actions]");
-    var requirements = document.querySelector("[data-requirements]");
-    var verify = document.querySelector("[data-verify-copy]");
-    var meta = document.querySelector("[data-release-meta]");
-    var notes = document.querySelector("[data-release-notes]");
+    var platforms = site.platforms && typeof site.platforms === "object" ? site.platforms : {};
+    var android = platforms.android && typeof platforms.android === "object" ? platforms.android : {};
     var internalVersion = text(site.internalVersion);
+    var internalCode = text(site.internalVersionCode);
     var footerStatus = document.querySelector("[data-footer-status]");
     var heroStatus = document.querySelector("[data-hero-status]");
-
-    if (!channel || !title || !copyNode || !actions || !requirements || !verify || !meta || !notes) {
-      return;
-    }
-
-    var nodes = {
-      channel: channel,
-      title: title,
-      copy: copyNode,
-      actions: actions,
-      verify: verify,
-      meta: meta,
-      notes: notes
-    };
+    var requirements = document.querySelector("[data-requirements]");
 
     setAllText("internal-version", internalVersion || "未提供");
+    setAllText("internal-version-code", internalCode || "未提供");
     setAllText("footer-version", internalVersion || "未提供");
-    renderRequirements(requirements, copy.requirement);
-    renderRelease(nodes, info, copy);
+
+    if (requirements) {
+      renderRequirements(requirements, copy.requirement);
+    }
+
+    renderRelease({
+      channel: document.querySelector("[data-release-channel]"),
+      title: document.querySelector("[data-release-title]"),
+      copy: document.querySelector("[data-release-copy]"),
+      phoneSlot: document.querySelector("[data-android-phone]"),
+      tabletSlot: document.querySelector("[data-android-tablet]"),
+      phoneLabel: text(android.phoneLabel) || "安卓手机下载",
+      tabletLabel: text(android.tabletLabel) || "安卓平板下载",
+      shareNote: document.querySelector("[data-android-share-note]"),
+      verify: document.querySelector("[data-verify-copy]"),
+      meta: document.querySelector("[data-release-meta]"),
+      notes: document.querySelector("[data-release-notes]")
+    }, info, copy);
+
+    renderApple(platforms);
 
     if (footerStatus) {
       footerStatus.textContent = copy.footerStatus;
@@ -487,6 +561,49 @@
     renderRepository();
   }
 
+  // 导航当前项：静态 HTML 已写好 aria-current，这里按解析后的实际路径校正一次。
+  // 若当前环境无法把任何链接解析成本页（例如本地 file:// 预览），保留 HTML 原值，
+  // 不把全部 aria-current 清空。
+  function markCurrentNav() {
+    function normalise(path) {
+      var value = String(path || "").replace(/\/+$/, "");
+      if (!value || value === "/index.html") {
+        return "/";
+      }
+      return value;
+    }
+    var currentPath = normalise(window.location.pathname);
+    var links = Array.prototype.slice.call(document.querySelectorAll("[data-nav] a[href]"));
+    var matched = links.some(function (link) {
+      return normalise(link.pathname) === currentPath;
+    });
+    if (!matched) {
+      return;
+    }
+    links.forEach(function (link) {
+      if (normalise(link.pathname) === currentPath) {
+        link.setAttribute("aria-current", "page");
+      } else {
+        link.removeAttribute("aria-current");
+      }
+    });
+  }
+
+  // 旧单页入口 /?v=...#features 等只在首页/缺省路径转一次到对应独立页面。
+  // 指南页自身的 #privacy/#faq 或功能页自身锚点不参与改写，避免同 URL 循环。
+  function redirectLegacyHash() {
+    var hash = window.location.hash;
+    if (!hash || !Object.prototype.hasOwnProperty.call(LEGACY_HASH_TARGETS, hash)) {
+      return false;
+    }
+    var path = window.location.pathname;
+    if (path !== "/" && path !== "" && path !== "/index.html") {
+      return false;
+    }
+    window.location.replace(LEGACY_HASH_TARGETS[hash]);
+    return true;
+  }
+
   function showLoadNotice() {
     var main = document.getElementById("main");
     if (!main || document.querySelector(".load-notice")) {
@@ -498,6 +615,10 @@
   }
 
   function init() {
+    markCurrentNav();
+    if (redirectLegacyHash()) {
+      return;
+    }
     if (!site || typeof site !== "object") {
       showLoadNotice();
       return;
@@ -507,10 +628,10 @@
     var releaseInfo = resolveReleaseStatus(site.publicRelease);
     var statusCopy = releaseCopy(releaseInfo, siteName);
 
-    renderSiteText(joinSentences(site.description, statusCopy.description));
+    renderSiteText(statusCopy.description);
+    renderDownload(releaseInfo, statusCopy);
     renderFeatures();
     renderSteps();
-    renderDownload(releaseInfo, statusCopy);
     renderPrivacy();
     renderFaq();
     renderFooter(statusCopy);

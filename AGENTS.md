@@ -1,5 +1,14 @@
 # 项目协作规则
 
+## 2026-11-01 官网四独立页面与系统/设备下载：有限验收闭环并已上线
+
+用户确认网站拆为首页、功能、指南、下载四独立HTML页，同站点二级路径，不买域名/子域或新增后端；下载页Android手机/平板两入口仍同2.6.1/52通用Debug APK，iPhone/iPad纯文字暂未提供、无假链接。旧首页锚点兼容、统一资源版本、发布配置三态与精确nginx白名单保留。源码Android仍本地2.6.2/53，平板/公开包不升级，不因本次网站通过撤下大幅滚屏已知问题。
+
+执行者仅DeepSeek Harness Flash：原Qoder AUTH登录过期0产品写，用户明确换Command Code Plan，独立`commandcode-plan/deepseek/deepseek-v4.1-flash-fast`请求max；首max-tokens、两次TRANSPORT中断及最后完整交付均保原记录，不称一遍全成功。父仍总工程师，不调用Claude Code或改全局模型。最后三语法均exit0；准确source-01/10网站文件。独立实际gpt-6.1-sol/high全部4真实context父核；原local01为13PASS/2FAIL/1ERROR（16控制含截图复核），三夹具缺口仅新local02补尾3PASS，原结果不倒填、不重跑全集。新post01唯一5PASS/0FAIL/ERROR/SKIP，38载荷父核，范围为本线路HTTP/IP、准确静态/HEAD/360浏览器与保护回执，不代表HTTPS/全网/Android或iOS验收。nginx及初装名单本地仅静态；初装install.sh未执行。
+
+父经Netcatty官方仅H2发布7静态+精确页面配置，旧4静态/配置私有备份保留，候选与生产nginx-t/reload成功，既有duplicate MIME warning保留；443PID/start/boot/unit/config/bin与原APK完整hash/bytes保持。不动DNS/防火墙/其它服务器、无新APK/设备/模型/用户数据操作。复用用户连接不关闭，仅适配器与独立测试者已收件关闭。原四草稿content/index及815B原件保持；只准确本批路径提交并正常推已确认private跟踪分支，最终Git以真实回执为准。恢复入口 `.tools/validation/20261101-website-pages/` 与工作记录20261101-1；唯一路线17.19.4续用，不另造重复计划。
+
+
 ## 2026-10-30 划词准备与重试：2.6.2/53仅本地有限验收通过
 
 用户本批指定DeepSeek Harness的Qoder DeepSeek Flash，实际独立路由`qoder/dfmodel`，请求max；没有调用Claude Code、切到Qoder CN/其它分组或修改全局模型配置。父仍总工程师，产品实现与静态补齐由同一Harness会话交齐，父仅治理/构建环境/收件。准确source03/196三目标35.127s通过，APK `3d7f5f51…702c95`，证书与既有52一致；source01环境编译失败、source02异签名构建原件保留，source02不得用于覆盖安装。
