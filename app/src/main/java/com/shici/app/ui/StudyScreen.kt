@@ -245,7 +245,7 @@ class StudyScreen(
         val primary = runCatching {
             candidateEntries(card.entryKey, card.token, personalKeys, BOOK_CANDIDATES, MAX_CANDIDATES)
         }.getOrElse { emptyList() }
-        if (primary.isEmpty() && app.dictionary.isFailure) {
+        if (primary.isEmpty() && app.lookupDictionary.isFailure && app.dictionary.isFailure) {
             return ReviewQuestion.Unavailable(ReviewUnavailableReason.NO_READABLE_DICTIONARY)
         }
         val first = runCatching { ReviewChoices.build(card.entry, primary, card.token) }

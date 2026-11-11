@@ -44,7 +44,8 @@ private data class LookupRead(
     val result: LookupResult,
     val user: UserDictionaryEntry?,
     val revision: Long,
-    val stable: Boolean
+    val stable: Boolean,
+    val users: Map<String, UserDictionaryEntry?> = emptyMap()
 ) {
     fun isCurrent(now: Long): Boolean = stable && revision == now
 }
@@ -2453,9 +2454,11 @@ class CaptureService : Service() {
                 // revision is compared immediately around the actual dictionary+user read.
                 val before = app.repository.changes.version
                 val result = app.lookupWord(tap.word)
-                val user = (result as? LookupResult.Match)?.let { app.repository.userEntry(it.form) }
+                val users = (result as? LookupResult.Match)?.entries.orEmpty()
+                    .associate { it.key to app.repository.userEntry(it.key) }
+                val user = (result as? LookupResult.Match)?.entries?.singleOrNull()?.let { users[it.key] }
                 val after = app.repository.changes.version
-                LookupRead(result, user, after, before == after)
+                LookupRead(result, user, after, before == after, users)
             }
             main.post {
                 if (!inlineWordIsCurrent(guard)) return@post
@@ -2500,37 +2503,46 @@ class CaptureService : Service() {
                         }
                     }
                     is LookupResult.Match -> {
-                        val entry = result.entries.single()
-                        if (app.repository.deletions.isStale(entry.key, guard.credential)) {
-                            dropInlineWord(guard)
-                            screen.showWordMessage(tap.requestId,
-                                "查询已失效（词条已删除或数据已恢复），本次未查询、未收录。",
-                                retryable = true)
-                            return@post
+                        fun deliver(entry: DictionaryEntry) {
+                            if (!inlineWordIsCurrent(guard) || guard.saveAlreadyAdmitted()) return
+                            if (!readValue.isCurrent(app.repository.changes.version)) {
+                                dropInlineWord(guard)
+                                screen.showWordMessage(tap.requestId, "词义已更新，请重新点词；本次未收录。", retryable = true)
+                                return
+                            }
+                            if (app.repository.deletions.isStale(entry.key, guard.credential)) {
+                                dropInlineWord(guard)
+                                screen.showWordMessage(tap.requestId,
+                                    "查询已失效（词条已删除或数据已恢复），本次未查询、未收录。",
+                                    retryable = true)
+                                return
+                            }
+                            // Publish the entry key before the save so the deletion observer can bind a
+                            // later delete/restore to this exact displayed word. Never recapture. The
+                            // immutable read revision is bound to this request for the save admission.
+                            guard.key = entry.key
+                            guard.revision = readValue.revision
+                            screen.showWordFound(TranslationScreen.WordDisplay(
+                                requestId = tap.requestId,
+                                queried = result.form,
+                                headword = entry.headword,
+                                partOfSpeech = entry.partOfSpeech,
+                                meaning = entry.meaning,
+                                sourceNote = PersonalDictionary.label(entry) + "\n" +
+                                    PersonalDictionary.provenance(entry)
+                            ))
+                            // Only the first success delivery of this guard may enqueue the write. The
+                            // event identity is created once per accepted tap, so a hostile duplicate
+                            // closure cannot add a second event even if it runs before the first save.
+                            if (guard.admitSave()) {
+                                saveInlineWord(guard, QueryEvent(
+                                    guard.eventId, entry.key, guard.source, entry.key,
+                                    System.currentTimeMillis()
+                                ), entry)
+                            }
                         }
-                        // Publish the entry key before the save so the deletion observer can bind a
-                        // later delete/restore to this exact displayed word. Never recapture. The
-                        // immutable read revision is bound to this request for the save admission.
-                        guard.key = entry.key
-                        guard.revision = readValue.revision
-                        screen.showWordFound(TranslationScreen.WordDisplay(
-                            requestId = tap.requestId,
-                            queried = result.form,
-                            headword = entry.headword,
-                            partOfSpeech = entry.partOfSpeech,
-                            meaning = entry.meaning,
-                            sourceNote = PersonalDictionary.label(entry) + "\n" +
-                                PersonalDictionary.provenance(entry)
-                        ))
-                        // Only the first success delivery of this guard may enqueue the write. The
-                        // event identity is created once per accepted tap, so a hostile duplicate
-                        // closure cannot add a second event even if it runs before the first save.
-                        if (guard.admitSave()) {
-                            saveInlineWord(guard, QueryEvent(
-                                guard.eventId, entry.key, guard.source, result.form,
-                                System.currentTimeMillis()
-                            ), entry)
-                        }
+                        if (result.entries.size == 1) deliver(result.entries.first())
+                        else screen.showWordChoices(tap.requestId, result.form, result.entries, ::deliver)
                     }
                 }
             }
@@ -2691,9 +2703,11 @@ class CaptureService : Service() {
                 // snapshots; such a read is rejected rather than mixed or relabelled later.
                 val before = app.repository.changes.version
                 val result = app.lookupWord(form)
-                val user = (result as? LookupResult.Match)?.let { app.repository.userEntry(it.form) }
+                val users = (result as? LookupResult.Match)?.entries.orEmpty()
+                    .associate { it.key to app.repository.userEntry(it.key) }
+                val user = (result as? LookupResult.Match)?.entries?.singleOrNull()?.let { users[it.key] }
                 val after = app.repository.changes.version
-                LookupRead(result, user, after, before == after)
+                LookupRead(result, user, after, before == after, users)
             }
             main.post {
                 if (!sessionIsActive() || !gate.accepts(token)) return@post
@@ -2715,13 +2729,28 @@ class CaptureService : Service() {
                             } else showMissing(result.form, raw, replaces, credential)
                         }
                         is LookupResult.Match -> {
-                            val entry = result.entries.single()
-                            if (app.repository.deletions.isStale(entry.key, credential))
-                                showMessage("查询已失效（词条已删除或数据已恢复），本次未查询、未收录，请重新查询。", raw, replaces)
-                            else if (!read.isCurrent(app.repository.changes.version)) {
-                                perf.stage("dictionary", "stale")
-                                showMessage("查询已失效（词条或本机补充已更新），本次未查询、未收录，请重新查询。", raw, replaces)
-                            } else showDefinition(result.form, raw, entry, read.user, replaces, credential, manual)
+                            fun deliver(entry: DictionaryEntry) {
+                                if (!sessionIsActive() || !gate.accepts(token)) return
+                                if (app.repository.deletions.isStale(entry.key, credential))
+                                    showMessage("查询已失效（词条已删除或数据已恢复），本次未查询、未收录，请重新查询。", raw, replaces)
+                                else if (!read.isCurrent(app.repository.changes.version))
+                                    showMessage("查询已失效（词条或本机补充已更新），本次未查询、未收录，请重新查询。", raw, replaces)
+                                else showDefinition(result.form, raw, entry, read.users[entry.key], replaces, credential, manual, read.revision)
+                            }
+                            if (!read.isCurrent(app.repository.changes.version))
+                                showMessage("词义已更新，请重新查询；本次未收录。", raw, replaces)
+                            else if (result.entries.size == 1) deliver(result.entries.first())
+                            else {
+                                val card = compactCard("「${result.form}」请选择词义")
+                                card.body.addView(text("原词条与原型分别保留；选择前不收录。", 15f, Paper.secondary))
+                                var chosen = false
+                                for (entry in result.entries) card.body.addView(compactButton(
+                                    (if (entry.key == result.form) "原词条：" else "词形原型：") + entry.headword +
+                                        "\n" + entry.meaning.lineSequence().first().take(64)) {
+                                    if (!chosen && panel === card) { chosen = true; deliver(entry) }
+                                })
+                                mountCompactCard(card)
+                            }
                         }
                     }
                 }.onFailure {
@@ -2909,7 +2938,7 @@ class CaptureService : Service() {
     private fun submitManualInput(session: ManualInputSession, input: EditText, status: TextView) {
         if (stopped || !sessionIsActive() || session.closed || manualInputSession !== session) return
         val raw = input.text?.toString()?.trim().orEmpty()
-        val form = RawKajwebDictionary.normalize(raw)
+        val form = DictionaryKeys.normalize(raw)
         if (form == null || !RecognitionFeedback.hasLatinLetter(form)) {
             status.text = "请输入一个有效英文词头；空内容或无效输入不会查询或新增记录"
             status.setTextColor(Paper.error)
@@ -3179,12 +3208,13 @@ class CaptureService : Service() {
 
     private fun showDefinition(form: String, raw: String, entry: DictionaryEntry,
                                initialUser: UserDictionaryEntry?, replaces: String?,
-                               credential: Long, manual: Boolean = false) {
+                               credential: Long, manual: Boolean = false, readRevision: Long) {
         val token = gate.next()
         // The authority may be either the pixel lift guard or the direct-read text guard. Binding
         // only pageGuard would silently drop the text guard's save admission for direct-read words.
         val page = currentPageGuard()
-        val event = QueryEvent(UUID.randomUUID().toString(), entry.key, raw, form, System.currentTimeMillis())
+        val event = QueryEvent(UUID.randomUUID().toString(), entry.key, raw, entry.key, System.currentTimeMillis())
+        val saveCommitted = AtomicBoolean(false)
         val card = compactCard(entry.headword)
         // The save/undo status is the core feedback of this card, so it stays in the fixed header
         // (directly under the headword) and cannot be scrolled out of sight by a long meaning or an
@@ -3259,6 +3289,7 @@ class CaptureService : Service() {
         }
         content.viewTreeObserver.addOnDrawListener(drawListener)
         fun save() {
+            if (saveCommitted.get()) return
             // A stale card (word deleted after this query started) must not start/retry a save.
             if (definitionCardStale(guard)) { invalidateDefinition(guard); return }
             // Retry/initial save from an automatic OCR lookup may only run while the page accepted
@@ -3274,10 +3305,15 @@ class CaptureService : Service() {
                 // The page/card admission is re-read at the worker boundary and again inside the
                 // repository's pre-transaction predicate, so an invalidation on another thread
                 // cannot be lost between the main-thread comparison and the commit.
-                fun admittedNow(): Boolean = sessionIsActive() && gate.accepts(token) &&
+                if (saveCommitted.get()) return@execute
+                fun admittedNow(): Boolean = sessionIsActive() && gate.accepts(token) && !guard.invalid &&
+                    readRevision == app.repository.changes.version &&
+                    !app.repository.deletions.isStale(entry.key, credential) &&
                     (guard.manual || guard.page?.isValid == true)
-                if (!admittedNow()) return@execute
                 val result = runCatching { app.repository.record(event, entry, replaces, credential) { admittedNow() } }
+                // A queued duplicate must not invalidate the first successful commit after its
+                // own revision publication. Once committed this exact event is never re-submitted.
+                if (result.getOrNull() == true) saveCommitted.set(true)
                 main.post {
                     if (sessionIsActive() && gate.accepts(token) && definitionGuard === guard && !guard.invalid) {
                         val error = result.exceptionOrNull()

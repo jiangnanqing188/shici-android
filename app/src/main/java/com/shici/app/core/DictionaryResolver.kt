@@ -13,19 +13,35 @@ object DictionaryResolver {
      * so a real dotted headword (including a user-only one) never loses to an original undotted
      * fallback. Only when both sources miss that complete form may exactly one trailing sentence
      * stop be removed, and the same original+user exact rule is applied once to the stripped form.
-     * There is no recursion, stemming, plural, phrase or multi-word joining.
+     * Word forms come only from the source index; there is no suffix guessing or recursive joining.
      */
     fun lookup(
-        dictionary: RawKajwebDictionary,
+        dictionary: DictionaryStore,
         raw: String,
         userFor: (String) -> UserDictionaryEntry?
-    ): LookupResult {
-        val form = RawKajwebDictionary.normalize(raw) ?: return LookupResult.Invalid
-        exact(form, dictionary, userFor)?.let { return it }
-        if (form.endsWith('.')) {
-            val withoutStop = form.dropLast(1)
-            exact(withoutStop, dictionary, userFor)?.let { return it }
+    ): LookupResult = lookupWithForms(dictionary, raw, true, userFor)
+
+    /** Supplement editing binds to the typed key, never silently to an inflection's lemma. */
+    fun lookupExact(dictionary: DictionaryStore, raw: String,
+                    userFor: (String) -> UserDictionaryEntry?): LookupResult =
+        lookupWithForms(dictionary, raw, false, userFor)
+
+    private fun lookupWithForms(dictionary: DictionaryStore, raw: String, includeForms: Boolean,
+                                userFor: (String) -> UserDictionaryEntry?): LookupResult {
+        val form = DictionaryKeys.normalize(raw) ?: return LookupResult.Invalid
+        fun candidates(key: String): LookupResult.Match? {
+            val entries = linkedMapOf<String, DictionaryEntry>()
+            exact(key, dictionary, userFor)?.entries?.forEach { entries[it.key] = it }
+            for (lemma in if (includeForms) dictionary.lemmas(key) else emptyList()) {
+                exact(lemma, dictionary, userFor)?.entries?.forEach { entries[it.key] = it }
+            }
+            return entries.values.toList().takeIf { it.isNotEmpty() }?.let { LookupResult.Match(key, it) }
         }
+        candidates(form)?.let { return it }
+        // Full dotted headwords win, including a personal-only exact entry.
+        if (form.endsWith('.')) candidates(form.dropLast(1))?.let { return it }
+        val unquoted = form.trim { it in " \"'“”()[]{}<>,;:!?«»" }
+        if (unquoted != form && unquoted.isNotEmpty()) candidates(unquoted)?.let { return it }
         return LookupResult.Missing(form)
     }
 
@@ -35,12 +51,12 @@ object DictionaryResolver {
      * always merged on top, so editing a supplement instantly affects the next study display.
      */
     fun resolve(
-        dictionary: RawKajwebDictionary?,
+        dictionary: DictionaryStore?,
         original: DictionaryEntry?,
         key: String,
         userFor: (String) -> UserDictionaryEntry?
     ): DictionaryEntry? {
-        val normalized = RawKajwebDictionary.normalize(key) ?: key
+        val normalized = DictionaryKeys.normalize(key) ?: key
         // The pinned original asset wins for a current headword; the saved row is the fallback for
         // historical entries that no longer exist in the current asset. This keeps lookup and study
         // resolution on the same original meaning.
@@ -57,7 +73,7 @@ object DictionaryResolver {
      */
     private fun exact(
         form: String,
-        dictionary: RawKajwebDictionary,
+        dictionary: DictionaryStore,
         userFor: (String) -> UserDictionaryEntry?
     ): LookupResult.Match? {
         val original = dictionary.entry(form)

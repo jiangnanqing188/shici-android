@@ -49,7 +49,8 @@ private data class LookupRead(
     val result: LookupResult,
     val user: UserDictionaryEntry?,
     val revision: Long,
-    val stable: Boolean
+    val stable: Boolean,
+    val users: Map<String, UserDictionaryEntry?> = emptyMap()
 ) {
     fun isCurrent(now: Long): Boolean = stable && revision == now
 }
@@ -725,16 +726,16 @@ class MainActivity : Activity() {
 
     private fun loadDictionaryStatus() {
         app.worker.execute {
-            val result = app.dictionary
+            val result = app.lookupDictionary
             main.post {
                 if (isDestroyed) return@post
                 // The first screen shows one short status; the full counts stay available in the
                 // collapsed "词库校验详情" next to it. A failure stays fully visible, never hidden.
                 dictionarySummary = result.fold(
-                    { "原始词库已校验可用" },
+                    { "ECDICT 大词库已校验可用" },
                     { "词库不可用：${it.message}；不会生成释义或新增查询记录" })
                 dictionaryDetail = result.fold(
-                    { "已校验 ${it.entryCount} 个原始词头 · ${it.aliasCount} 个词形别名（仅格式与完整性校验）" },
+                    { "已校验 ${it.entryCount} 个可检索词头 · ${it.aliasCount} 组词形关系（仅格式与完整性校验）" },
                     { "词库不可用：${it.message}；不会生成释义或新增查询记录" })
                 dictionaryStatusView?.text = dictionarySummary
                 dictionaryDetailView?.text = dictionaryDetail
@@ -1606,10 +1607,12 @@ class MainActivity : Activity() {
             if (!personalGate.accepts(token)) return@execute
             val read = runCatching {
                 val before = app.repository.changes.version
-                val result = app.lookupWord(text)
-                val user = (result as? LookupResult.Match)?.let { app.repository.userEntry(it.form) }
+                val result = app.lookupExactWord(text)
+                val users = (result as? LookupResult.Match)?.entries.orEmpty()
+                    .associate { it.key to app.repository.userEntry(it.key) }
+                val user = (result as? LookupResult.Match)?.entries?.singleOrNull()?.let { users[it.key] }
                 val after = app.repository.changes.version
-                LookupRead(result, user, after, before == after)
+                LookupRead(result, user, after, before == after, users)
             }
             main.post {
                 if (isDestroyed || page != MainPage.PERSONAL_ENTRY || personalSession !== session ||
@@ -1638,7 +1641,7 @@ class MainActivity : Activity() {
                             }
                         }
                         is LookupResult.Match -> {
-                            val entry = result.entries.single()
+                            val entry = result.entries.first()
                             if (app.repository.deletions.isStale(entry.key, credential)) {
                                 personalStatusText = "读取已失效（词条已删除或数据已恢复），请重新读取"
                                 render()
@@ -2654,7 +2657,7 @@ class MainActivity : Activity() {
             // Short, honest display: an internal experience build, not an official release.
             versionText = "体验版 ${BuildConfig.VERSION_NAME}（${BuildConfig.VERSION_CODE}）",
             provenanceText = RawKajwebDictionary.provenance(
-                RawKajwebDictionary.SOURCE, RawKajwebDictionary.VERSION
+                EcdictDictionary.SOURCE, EcdictDictionary.VERSION
             ),
             onOpenOverlayPermission = { openOverlayPermissionSettings() },
             onOpenNotificationSettings = { openNotificationSettings() },
@@ -2900,9 +2903,11 @@ class MainActivity : Activity() {
                 // snapshots; such a read is rejected rather than mixed or relabelled later.
                 val before = app.repository.changes.version
                 val result = app.lookupWord(raw)
-                val user = (result as? LookupResult.Match)?.let { app.repository.userEntry(it.form) }
+                val users = (result as? LookupResult.Match)?.entries.orEmpty()
+                    .associate { it.key to app.repository.userEntry(it.key) }
+                val user = (result as? LookupResult.Match)?.entries?.singleOrNull()?.let { users[it.key] }
                 val after = app.repository.changes.version
-                LookupRead(result, user, after, before == after)
+                LookupRead(result, user, after, before == after, users)
             }
             main.post {
                 if (isDestroyed || page != MainPage.LOOKUP || !manualGate.accepts(token)) return@post
@@ -2923,13 +2928,36 @@ class MainActivity : Activity() {
                             } else showManualMissing(result.form, raw, replaces, deletionCredential, read.revision)
                         }
                         is LookupResult.Match -> {
-                            val entry = result.entries.single()
-                            if (app.repository.deletions.isStale(entry.key, deletionCredential)) {
-                                toast("查询已失效（词条已删除或数据已恢复），请重新查询")
-                            } else if (!read.isCurrent(app.repository.changes.version)) {
-                                showManualLookupExpired()
-                            } else showManualDefinition(originalRaw, result.form, entry, read.user, replaces,
-                                deletionCredential, read.revision)
+                            fun deliver(entry: DictionaryEntry) {
+                                if (isDestroyed || page != MainPage.LOOKUP || !manualGate.accepts(token)) return
+                                if (app.repository.deletions.isStale(entry.key, deletionCredential)) {
+                                    toast("查询已失效（词条已删除或数据已恢复），请重新查询")
+                                } else if (!read.isCurrent(app.repository.changes.version)) {
+                                    showManualLookupExpired()
+                                } else showManualDefinition(originalRaw, result.form, entry, read.users[entry.key],
+                                    replaces, deletionCredential, read.revision)
+                            }
+                            if (!read.isCurrent(app.repository.changes.version)) showManualLookupExpired()
+                            else if (result.entries.size == 1) deliver(result.entries.first())
+                            else {
+                                val content = panel()
+                                content.addView(text("「${result.form}」请选择词义", 22f, bold = true))
+                                content.addView(text("原词条与词形原型分别保留；选择前不收录。", 15f, Paper.secondary))
+                                lateinit var choices: AlertDialog
+                                var selected = false
+                                for (entry in result.entries) content.addView(button(
+                                    (if (entry.key == result.form) "原词条：" else "词形原型：") + entry.headword +
+                                        "\n" + entry.meaning.lineSequence().first().take(64)) {
+                                    if (!selected && activeDialog === choices && choices.isShowing) {
+                                        selected = true
+                                        choices.dismiss()
+                                        deliver(entry)
+                                    }
+                                })
+                                content.addView(button("取消") { choices.dismiss() })
+                                choices = paperDialog(content)
+                                showPaperDialog(choices, 640)
+                            }
                         }
                     }
                 }.onFailure { toast("词库不可用：${it.message}；未生成释义或新增记录") }
@@ -3131,14 +3159,25 @@ class MainActivity : Activity() {
         }
         dialog.show()
         manualGuard = guard
-        val event = QueryEvent(UUID.randomUUID().toString(), entry.key, raw, form, System.currentTimeMillis())
+        val event = QueryEvent(UUID.randomUUID().toString(), entry.key, raw, entry.key, System.currentTimeMillis())
+        val saveCommitted = java.util.concurrent.atomic.AtomicBoolean(false)
         fun save() {
+            if (saveCommitted.get()) return
             // A stale card (word deleted after this query started) must not start/retry a save.
             if (manualCardStale(guard)) { invalidateManualCard(guard); return }
             retry.visibility = View.GONE; status.text = "保存中…"
             app.worker.execute {
-                if (!manualGate.accepts(token)) return@execute
-                val result = runCatching { app.repository.record(event, entry, replaces, deletionCredential) { manualGate.accepts(token) } }
+                if (saveCommitted.get()) return@execute
+                val result = runCatching {
+                    app.repository.record(event, entry, replaces, deletionCredential) {
+                        manualGate.accepts(token) && !guard.invalid &&
+                            readRevision == app.repository.changes.version &&
+                            !app.repository.deletions.isStale(entry.key, deletionCredential)
+                    }
+                }
+                // Ignore queued duplicate submissions after this event committed, rather than
+                // treating its own published revision as a stale failed query.
+                if (result.getOrNull() == true) saveCommitted.set(true)
                 main.post {
                     if (!isDestroyed && manualGate.accepts(token) && dialog.isShowing && manualGuard === guard && !guard.invalid) {
                         val error = result.exceptionOrNull()

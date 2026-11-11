@@ -25,6 +25,7 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import com.shici.app.core.DictionaryEntry
 import com.shici.app.core.SentenceWord
 import com.shici.app.core.SentenceWords
 import com.shici.app.translation.OfflineTranslation
@@ -157,6 +158,7 @@ class TranslationScreen(
     private lateinit var wordTokens: TextView
     private lateinit var wordStatus: TextView
     private lateinit var wordMeaning: TextView
+    private lateinit var wordChoices: LinearLayout
     private lateinit var wordSource: TextView
     private var wordSourceGeneration = 0L
     private var wordRequestId = 0L
@@ -237,6 +239,8 @@ class TranslationScreen(
             wordBody.addView(wordMeaning)
             wordSource = context.text("", 13f, Paper.warning).apply { visibility = View.GONE }
             wordBody.addView(wordSource)
+            wordChoices = context.column()
+            wordBody.addView(wordChoices)
             wordCard.addView(wordBody)
             content.addView(wordCard)
             content.space(16)
@@ -438,6 +442,24 @@ class TranslationScreen(
         }
     }
 
+    /** Candidate selection stays in the current source/request and does not record a query. */
+    fun showWordChoices(requestId: Long, queried: String, entries: List<DictionaryEntry>,
+                        onSelected: (DictionaryEntry) -> Unit) {
+        if (closing || !inlineWordLookup || requestId != wordRequestId) return
+        wordChoices.removeAllViews()
+        wordStatus.text = "「$queried」请选择原词条或词形原型（选择前不收录）"
+        var selected = false
+        for (entry in entries) wordChoices.addView(context.button(
+            (if (entry.key == queried) "原词条：" else "词形原型：") + entry.headword +
+                "\n" + entry.meaning.lineSequence().first().take(64)) {
+            if (!closing && requestId == wordRequestId && !selected) {
+                selected = true
+                wordChoices.removeAllViews()
+                onSelected(entry)
+            }
+        })
+    }
+
     /**
      * Shows one successfully resolved meaning for the still-current tap. [WordDisplay.requestId]
      * must be the id most recently handed to [onWordRequested]; a duplicate delivery for the same
@@ -452,6 +474,7 @@ class TranslationScreen(
         if (display.requestId == wordRejectedId) return
         // Duplicate callback delivery for one tap is inert; the host owns the single save attempt.
         if (wordDelivered) return
+        wordChoices.removeAllViews()
         wordDelivered = true
         wordBusy = false
         wordDisplayed = wordActive
@@ -503,6 +526,7 @@ class TranslationScreen(
         wordDelivered = false
         wordRejectedId = requestId
         wordDisplayed = if (retryable) null else wordActive
+        wordChoices.removeAllViews()
         wordMeaning.visibility = View.GONE
         wordSource.visibility = View.GONE
         wordStatus.text = message
@@ -563,6 +587,7 @@ class TranslationScreen(
         wordBusy = true
         wordStatus.text = "正在查「${word.text}」…"
         wordStatus.setTextColor(Paper.secondary)
+        wordChoices.removeAllViews()
         wordMeaning.visibility = View.GONE
         wordSource.visibility = View.GONE
         val request = onWordRequested
@@ -586,6 +611,7 @@ class TranslationScreen(
         wordDelivered = false
         if (hadWork) onWordRequestRetired?.invoke(retired)
         rebuildWordTokens()
+        wordChoices.removeAllViews()
         wordMeaning.visibility = View.GONE
         wordSource.visibility = View.GONE
         wordStatus.text = if (hadWork) {
