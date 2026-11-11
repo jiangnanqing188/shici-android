@@ -11,8 +11,8 @@ android {
         applicationId = "com.shici.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 53
-        versionName = "2.6.2"
+        versionCode = 54
+        versionName = "2.7.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
     buildFeatures { buildConfig = true }

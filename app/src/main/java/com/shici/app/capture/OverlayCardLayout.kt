@@ -2,6 +2,10 @@ package com.shici.app.capture
 
 import android.content.Context
 import android.text.TextUtils
+import android.text.SpannableString
+import android.text.Spanned
+import android.text.style.RelativeSizeSpan
+import android.text.style.ForegroundColorSpan
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.ViewConfiguration
@@ -93,6 +97,20 @@ internal class OverlayCardLayout(context: Context) : LinearLayout(context) {
     fun setTitle(title: String) {
         titleView.text = title
         titleView.contentDescription = title
+    }
+
+    /** Called by compactCard before measuring; independent manual input keeps its old title. */
+    fun showTitleDragHint() {
+        val title = titleView.text.toString()
+        titleView.text = SpannableString("$title  ⠿\n按住标题拖动").apply {
+            val hintStart = title.length + 4
+            setSpan(RelativeSizeSpan(0.62f), hintStart, length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            setSpan(ForegroundColorSpan(Paper.secondary), hintStart, length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        }
+        titleView.textSize = 21f
+        titleView.maxLines = 3
+        titleView.setPadding(context.dp(10), context.dp(8), context.dp(10), context.dp(8))
+        titleView.background = context.shape(Paper.lightGreen, 10)
     }
 
     private var stopTitleDrag: () -> Unit = {}

@@ -97,7 +97,7 @@ class UsageGuideScreen(
         // Default body: page title, the current scene (title + one prompt + demo + progress),
         // one compact scene entry and the collapsed long help. No intro paragraph competes with
         // the demonstration; the necessary boundaries live in the demo line and the long help.
-        content.addView(context.text(UsageGuide.TITLE, 26f, Paper.ink, true))
+        content.addView(context.text(UsageGuide.TITLE, 28f, Paper.ink, true))
         content.space(6)
 
         if (firstRun) {
@@ -157,7 +157,7 @@ class UsageGuideScreen(
     private fun demoSection(): View {
         val card = context.column().apply {
             setPadding(context.dp(16), context.dp(12), context.dp(16), context.dp(12))
-            background = context.shape(Paper.surface, 12, true)
+            background = context.shape(Paper.surface, 16, true)
         }
 
         demoTitle = context.text(selectedDemo.title, 20f, Paper.ink, true)
@@ -411,6 +411,7 @@ class UsageGuideScreen(
     private fun controlFooter(): View {
         val footer = context.column().apply {
             setPadding(0, context.dp(8), 0, 0)
+            setBackgroundColor(Paper.background)
         }
         footer.addView(
             View(context).apply { setBackgroundColor(Paper.line) },

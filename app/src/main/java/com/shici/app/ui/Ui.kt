@@ -44,7 +44,7 @@ fun LinearLayout.space(height: Int = 16) { addView(View(context), LinearLayout.L
 fun LinearLayout.divider() { addView(View(context).apply { setBackgroundColor(Paper.line) },
     LinearLayout.LayoutParams(-1, context.dp(1)).apply { topMargin = context.dp(12); bottomMargin = context.dp(12) }) }
 
-fun Context.badge(label: String): TextView = text(label, 16f, Paper.green).apply {
+fun Context.badge(label: String): TextView = text(label, 14f, Paper.green).apply {
     setPadding(dp(12), dp(4), dp(12), dp(4)); background = shape(Paper.lightGreen, 8)
 }
 fun Context.inputField(hintText: String, singleLine: Boolean = false): EditText = EditText(this).apply {

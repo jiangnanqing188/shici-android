@@ -1,132 +1,188 @@
 package com.shici.app.ui
 
 import android.content.Context
+import android.graphics.Canvas
+import android.graphics.ColorFilter
+import android.graphics.Paint
+import android.graphics.Path
+import android.graphics.PixelFormat
 import android.graphics.Typeface
+import android.graphics.drawable.Drawable
+import android.view.Gravity
 import android.view.View
-import android.view.ViewGroup
 import android.widget.Button
-import android.widget.HorizontalScrollView
+import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.PopupMenu
 import android.widget.ScrollView
+import com.shici.app.R
 
-/**
- * App-shell navigation with a fixed settings entry.
- *
- * The component owns only presentation: it never reads the repository, never gates a page and never
- * keeps page state. Stable ids are opaque strings supplied by the caller (page enum names); the
- * caller decides what a selection means. [setSelected] restyles the existing buttons in place, so
- * it cannot reset the scroll position of either navigation region.
- *
- * Wide layout: a 216dp sidebar whose seven main entries scroll in the weighted region above a
- * divider; settings sits in its own fixed area below the divider. Narrow layout: a fixed bottom
- * bar whose main entries scroll horizontally, with settings on a separate full-width row that the
- * main row can never push off screen. Insets stay with the shell root; this view adds none.
- *
- * Ids must be unique across [items] and [settings]; the caller keeps one stable id per page.
- */
+/** Presentation only. Route ids and every page-leave admission remain owned by the Activity. */
 class MainNavigation(
     private val context: Context,
-    wide: Boolean,
-    items: List<Item>,
-    settings: Item,
+    private val wide: Boolean,
+    private val items: List<Item>,
+    private val settings: Item,
     selectedId: String,
     private val onSelect: (String) -> Unit
 ) {
     data class Item(val id: String, val label: String)
 
     private val buttons = LinkedHashMap<String, Button>()
+    private var moreMenu: PopupMenu? = null
+    private val primaryIds = listOf("LOOKUP", "VOCABULARY", "STUDY")
+    private val moreId = "navigation_more"
+    private val secondary get() = items.filter { it.id !in primaryIds } + settings
+    val view: View = if (wide) wideView() else compactView()
 
-    /** Root navigation view. It already carries wide/narrow layout params for a LinearLayout shell. */
-    val view: View = if (wide) wideView(items, settings) else compactView(items, settings)
+    init { setSelected(selectedId) }
 
-    init {
-        setSelected(selectedId)
-    }
-
-    /** Updates every button's selected background/typeface without rebuilding the view tree. */
+    /** No posted scrolling or deferred selection: a late navigation callback cannot select a tab. */
     fun setSelected(id: String) {
-        buttons.forEach { (buttonId, entryButton) ->
-            val selected = buttonId == id
-            entryButton.background =
-                context.shape(if (selected) Paper.lightGreen else Paper.background, 8)
-            entryButton.setTypeface(
-                entryButton.typeface, if (selected) Typeface.BOLD else Typeface.NORMAL
-            )
-            entryButton.isSelected = selected
+        retireMoreMenu()
+        buttons.forEach { (buttonId, button) ->
+            val selected = buttonId == id ||
+                (buttonId == moreId && buttons[id] == null && secondary.any { it.id == id })
+            button.background = context.shape(if (selected) Paper.lightGreen else Paper.background, 10)
+            button.setTextColor(if (selected) Paper.green else Paper.secondary)
+            button.setTypeface(Typeface.DEFAULT, if (selected) Typeface.BOLD else Typeface.NORMAL)
+            button.isSelected = selected
+            button.compoundDrawables.filterNotNull().forEach { it.setTint(if (selected) Paper.green else Paper.secondary) }
+            button.contentDescription = if (buttonId == moreId && selected)
+                "更多，当前为${secondary.firstOrNull { it.id == id }?.label.orEmpty()}" else
+                "${button.text}${if (selected) "，当前页面" else "，点按打开"}"
         }
     }
 
-    private fun wideView(items: List<Item>, settings: Item): View {
+    private fun wideView(): View {
         val sidebar = context.column().apply {
+            setPadding(context.dp(12), context.dp(20), context.dp(12), context.dp(12))
             setBackgroundColor(Paper.background)
-            setPadding(context.dp(16), context.dp(20), context.dp(16), context.dp(16))
-            layoutParams = LinearLayout.LayoutParams(context.dp(216), ViewGroup.LayoutParams.MATCH_PARENT)
+            layoutParams = LinearLayout.LayoutParams(context.dp(184), -1)
         }
-        sidebar.addView(context.text("拾词", 30f, Paper.green, true))
-        sidebar.addView(context.text("专注阅读\n随手拾词", 15f, Paper.secondary))
-        sidebar.space(16)
-
+        val brand = context.row().apply { gravity = Gravity.CENTER_VERTICAL }
+        brand.addView(ImageView(context).apply {
+            setImageResource(R.mipmap.ic_launcher)
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+        }, LinearLayout.LayoutParams(context.dp(36), context.dp(36)).apply { marginEnd = context.dp(10) })
+        brand.addView(context.text("拾词", 25f, Paper.ink, true))
+        sidebar.addView(brand)
+        sidebar.space(24)
         val main = context.column()
-        items.forEach { item ->
-            main.addView(navButton(item), LinearLayout.LayoutParams(-1, -2).apply {
-                bottomMargin = context.dp(6)
-            })
+        primaryIds.mapNotNull { id -> items.firstOrNull { it.id == id } }.forEach {
+            main.addView(navButton(it), LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = context.dp(6) })
         }
-        // Only the main entries scroll; settings is a separate child below this weighted region.
-        sidebar.addView(ScrollView(context).apply {
-            isFillViewport = false
-            addView(main)
-        }, LinearLayout.LayoutParams(-1, 0, 1f))
-
-        sidebar.addView(separator(), LinearLayout.LayoutParams(-1, context.dp(1)).apply {
-            topMargin = context.dp(20)
-            bottomMargin = context.dp(16)
-        })
+        items.firstOrNull { it.id == "TRANSLATION" }?.let {
+            main.space(8)
+            main.addView(navButton(it), LinearLayout.LayoutParams(-1, -2))
+        }
+        main.space(8)
+        val moreItems = items.filter { it.id !in primaryIds && it.id != "TRANSLATION" && it.id != "GUIDE" }
+        main.addView(moreButton(moreItems), LinearLayout.LayoutParams(-1, -2))
+        sidebar.addView(ScrollView(context).apply { addView(main) }, LinearLayout.LayoutParams(-1, 0, 1f))
+        sidebar.divider()
+        items.firstOrNull { it.id == "GUIDE" }?.let {
+            sidebar.addView(navButton(it), LinearLayout.LayoutParams(-1, -2))
+        }
+        // Help is secondary; settings remains a separate, always-mounted lower-left entry.
         sidebar.addView(navButton(settings), LinearLayout.LayoutParams(-1, -2))
         return sidebar
     }
 
-    private fun compactView(items: List<Item>, settings: Item): View {
-        val wrapper = context.column().apply {
-            setBackgroundColor(Paper.background)
-            setPadding(context.dp(8), context.dp(6), context.dp(8), context.dp(8))
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
-            )
+    private fun compactView(): View = context.row().apply {
+        gravity = Gravity.CENTER_VERTICAL
+        setPadding(context.dp(4), context.dp(6), context.dp(4), context.dp(6))
+        setBackgroundColor(Paper.background)
+        primaryIds.mapNotNull { id -> items.firstOrNull { it.id == id } }.forEach {
+            addView(navButton(it), LinearLayout.LayoutParams(0, -2, 1f))
         }
+        // Exactly four fixed entries. Every other original route, including settings, is here.
+        addView(moreButton(secondary), LinearLayout.LayoutParams(0, -2, 1f))
+    }
 
-        val rowHost = context.row()
-        items.forEach { item ->
-            rowHost.addView(navButton(item), LinearLayout.LayoutParams(-2, -2).apply {
-                marginEnd = context.dp(6)
-            })
-        }
-        wrapper.addView(HorizontalScrollView(context).apply {
-            isHorizontalScrollBarEnabled = false
-            isFillViewport = false
-            addView(rowHost)
-        }, LinearLayout.LayoutParams(-1, -2))
+    private fun retireMoreMenu() {
+        val retired = moreMenu
+        moreMenu = null // Retire the callback identity before dismiss can deliver anything.
+        retired?.dismiss()
+    }
 
-        wrapper.addView(separator(), LinearLayout.LayoutParams(-1, context.dp(1)).apply {
-            topMargin = context.dp(8)
-            bottomMargin = context.dp(6)
+    private fun moreButton(destinations: List<Item>): Button = navButton(Item(moreId, "更多")).apply {
+        addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
+            override fun onViewAttachedToWindow(v: View) {}
+            override fun onViewDetachedFromWindow(v: View) { retireMoreMenu() }
         })
-        // Settings is a separate full-width row, always visible without horizontal scrolling.
-        wrapper.addView(navButton(settings), LinearLayout.LayoutParams(-1, -2))
-        return wrapper
+        setOnClickListener { anchor ->
+            retireMoreMenu()
+            if (!anchor.isAttachedToWindow) return@setOnClickListener
+            val chooser = PopupMenu(context, anchor)
+            moreMenu = chooser
+            destinations.forEachIndexed { index, item -> chooser.menu.add(0, index, index, item.label) }
+            chooser.setOnDismissListener { dismissed ->
+                if (moreMenu === dismissed) moreMenu = null
+            }
+            chooser.setOnMenuItemClickListener { choice ->
+                if (moreMenu !== chooser || !anchor.isAttachedToWindow) {
+                    false
+                } else {
+                    val destination = destinations.getOrNull(choice.itemId)
+                    retireMoreMenu()
+                    if (destination != null) onSelect(destination.id)
+                    destination != null
+                }
+            }
+            chooser.show()
+        }
     }
 
     private fun navButton(item: Item): Button = context.button(item.label) { onSelect(item.id) }.apply {
-        textSize = 15f
-        isAllCaps = false
-        // Keep at least a 48dp touch target while still letting the label wrap and grow with the
-        // user's font scale. Neither width nor height is fixed, so no label is clipped.
-        minHeight = context.dp(48)
-        minimumWidth = context.dp(64)
-        setPadding(context.dp(10), context.dp(8), context.dp(10), context.dp(8))
-        contentDescription = "打开${item.label}页"
+        textSize = if (wide) 15f else 13f
+        minWidth = 0; minimumWidth = 0
+        minHeight = context.dp(52)
+        gravity = if (wide) Gravity.START or Gravity.CENTER_VERTICAL else Gravity.CENTER
+        setPadding(context.dp(if (wide) 10 else 2), context.dp(8), context.dp(if (wide) 10 else 2), context.dp(8))
+        val icon = NavigationIcon(item.id).apply { setBounds(0, 0, context.dp(22), context.dp(22)) }
+        compoundDrawablePadding = context.dp(8)
+        if (wide) setCompoundDrawables(icon, null, null, null) else setCompoundDrawables(null, icon, null, null)
         buttons[item.id] = this
     }
 
-    private fun separator(): View = View(context).apply { setBackgroundColor(Paper.line) }
+    /** Small native line icons; no font glyph dependency, asset download or new UI framework. */
+    private class NavigationIcon(private val id: String) : Drawable() {
+        private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Paper.secondary; style = Paint.Style.STROKE; strokeWidth = 1.8f
+            strokeCap = Paint.Cap.ROUND; strokeJoin = Paint.Join.ROUND
+        }
+        override fun draw(canvas: Canvas) {
+            val saved = canvas.save()
+            canvas.translate(bounds.left.toFloat(), bounds.top.toFloat())
+            canvas.scale(bounds.width() / 24f, bounds.height() / 24f)
+            when (id) {
+                "LOOKUP" -> { canvas.drawCircle(10f, 10f, 6.5f, paint); canvas.drawLine(15f, 15f, 21f, 21f, paint) }
+                "VOCABULARY" -> {
+                    val path = Path().apply {
+                        moveTo(12f, 5f); cubicTo(8f, 2f, 4f, 3f, 2f, 4f); lineTo(2f, 20f)
+                        cubicTo(6f, 18f, 9f, 19f, 12f, 21f); cubicTo(15f, 19f, 18f, 18f, 22f, 20f)
+                        lineTo(22f, 4f); cubicTo(18f, 2f, 15f, 3f, 12f, 5f); lineTo(12f, 21f)
+                    }
+                    canvas.drawPath(path, paint)
+                }
+                "STUDY" -> {
+                    canvas.drawRoundRect(3f, 4f, 21f, 22f, 2f, 2f, paint)
+                    canvas.drawLine(7f, 2f, 7f, 7f, paint); canvas.drawLine(17f, 2f, 17f, 7f, paint)
+                    val path = Path().apply { moveTo(7f, 14f); lineTo(11f, 18f); lineTo(17f, 11f) }
+                    canvas.drawPath(path, paint)
+                }
+                "SETTINGS" -> { canvas.drawCircle(12f, 12f, 7f, paint); canvas.drawCircle(12f, 12f, 2.5f, paint)
+                    for (i in 0..7) { canvas.save(); canvas.rotate(i * 45f, 12f, 12f); canvas.drawLine(12f, 2f, 12f, 5f, paint); canvas.restore() } }
+                "GUIDE" -> { canvas.drawCircle(12f, 12f, 9f, paint); canvas.drawLine(12f, 11f, 12f, 17f, paint); canvas.drawPoint(12f, 7f, paint) }
+                "TRANSLATION" -> { canvas.drawRoundRect(2f, 2f, 16f, 16f, 2f, 2f, paint); canvas.drawRoundRect(9f, 9f, 22f, 22f, 2f, 2f, paint) }
+                else -> for (x in listOf(3f, 14f)) for (y in listOf(3f, 14f)) canvas.drawRoundRect(x, y, x + 7f, y + 7f, 1f, 1f, paint)
+            }
+            canvas.restoreToCount(saved)
+        }
+        override fun setTint(tintColor: Int) { paint.color = tintColor; invalidateSelf() }
+        override fun setAlpha(alpha: Int) { paint.alpha = alpha; invalidateSelf() }
+        override fun setColorFilter(colorFilter: ColorFilter?) { paint.colorFilter = colorFilter; invalidateSelf() }
+        @Suppress("DEPRECATION") override fun getOpacity(): Int = PixelFormat.TRANSLUCENT
+    }
 }

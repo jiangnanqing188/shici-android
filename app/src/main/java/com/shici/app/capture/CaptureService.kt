@@ -3458,10 +3458,11 @@ class CaptureService : Service() {
      */
     private fun compactCard(title: String): OverlayCardLayout {
         val card = OverlayCardLayout(this)
-        card.setPadding(dp(18), dp(14), dp(18), dp(12))
+        card.setPadding(dp(16), dp(12), dp(16), dp(12))
         card.background = shape(Paper.surface, border = true)
         card.setTitle(title)
-        card.body.setPadding(0, dp(4), 0, dp(4))
+        card.showTitleDragHint()
+        card.body.setPadding(0, dp(10), 0, dp(8))
         card.footer.setPadding(0, dp(10), 0, 0)
         return card
     }

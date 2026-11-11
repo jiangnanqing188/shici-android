@@ -94,7 +94,8 @@ class SettingsScreen(
     init {
         val content = context.column()
         content.addView(context.text("设置", 28f, Paper.ink, true))
-        content.space(16)
+        content.addView(context.text("权限与本机数据", 15f, Paper.secondary))
+        content.space(12)
 
         // 高频优先：正在进行的查词会话和停止动作最先可见，其次才是两个权限入口。
         val session = section(context, "查词与权限")
@@ -386,6 +387,7 @@ class SettingsScreen(
             setPadding(context.dp(20), context.dp(20), context.dp(20), context.dp(20))
             background = context.shape(Paper.surface, border = true)
             addView(context.text(title, 20f, Paper.ink, true))
+            divider()
             space(8)
         }
 }

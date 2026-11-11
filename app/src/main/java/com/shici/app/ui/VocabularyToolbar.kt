@@ -1,7 +1,6 @@
 package com.shici.app.ui
 
 import android.content.Context
-import android.view.Gravity
 import android.widget.LinearLayout
 import com.shici.app.core.VocabularySort
 
@@ -16,7 +15,7 @@ import com.shici.app.core.VocabularySort
  * real user tap on a different value. The programmatic [setState] never notifies, so restoring the
  * host's state or reacting to a manage toggle cannot loop back into another list rebuild.
  *
- * The layout uses two rows (filter + manage, then the sort chips) so a narrow screen never has to
+ * The layout uses two rows (filter, then the sort menu + manage) so a narrow screen never has to
  * fit every control on one line. Every control keeps the shared >=48dp minimum touch height.
  */
 class VocabularyToolbar(context: Context) : LinearLayout(context) {
@@ -60,20 +59,11 @@ class VocabularyToolbar(context: Context) : LinearLayout(context) {
             setPadding(context.dp(10), context.dp(8), context.dp(10), context.dp(8))
         }
 
-        val filterRow = context.row().apply { gravity = Gravity.CENTER_VERTICAL }
-        filterRow.addView(
-            filterView,
-            LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
-                marginEnd = context.dp(6)
-            }
-        )
-        filterRow.addView(
-            manageButton,
-            LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-        )
-        addView(filterRow, LinearLayout.LayoutParams(-1, LinearLayout.LayoutParams.WRAP_CONTENT))
-
-        addView(sortView, LinearLayout.LayoutParams(-1, LinearLayout.LayoutParams.WRAP_CONTENT))
+        addView(filterView, LinearLayout.LayoutParams(-1, -2))
+        val actions = context.row()
+        actions.addView(sortView, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = context.dp(6) })
+        actions.addView(manageButton, LinearLayout.LayoutParams(0, -2, 1f))
+        addView(actions, LinearLayout.LayoutParams(-1, -2))
         render()
     }
 

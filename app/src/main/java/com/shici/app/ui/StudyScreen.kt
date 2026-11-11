@@ -111,7 +111,7 @@ class StudyScreen(
         }
         pendingResult = null
         resultVersion = -1L
-        content.addView(context.text("复习", 26f, Paper.ink, true))
+        content.addView(context.text("复习", 28f, Paper.ink, true))
         content.addView(context.text("正在读取学习进度…", 16f, Paper.secondary))
         load(content)
     }
@@ -305,7 +305,7 @@ class StudyScreen(
                      question: ReviewQuestion?, questionVersion: Long) {
         content.removeAllViews()
         optionButtons = mutableListOf()
-        content.addView(context.text("复习", 26f, Paper.ink, true))
+        content.addView(context.text("复习", 28f, Paper.ink, true))
         content.addView(context.text(summaryLine(overview), 15f, Paper.secondary))
         content.space(12)
         val card = view.card
@@ -332,8 +332,8 @@ class StudyScreen(
     private fun questionCard(content: LinearLayout, card: StudyCard, credential: Long,
                              question: ReviewQuestion?, questionVersion: Long): LinearLayout = context.column().apply {
         setPadding(context.dp(20), context.dp(20), context.dp(20), context.dp(20))
-        background = context.shape(Paper.surface, 14, true)
-        addView(context.text(caption(card), 15f, Paper.green))
+        background = context.shape(Paper.surface, 16, true)
+        addView(context.badge(caption(card)), LinearLayout.LayoutParams(-2, -2))
         addView(context.text(card.entry.headword, 32f, Paper.ink, true))
         addView(context.text(card.entry.partOfSpeech.ifBlank { "—" }, 15f, Paper.secondary))
         space(8)
@@ -373,7 +373,7 @@ class StudyScreen(
     private fun showResult(content: LinearLayout, result: AnswerResult) {
         content.removeAllViews()
         optionButtons = mutableListOf()
-        content.addView(context.text("复习", 26f, Paper.ink, true))
+        content.addView(context.text("复习", 28f, Paper.ink, true))
         content.addView(context.text(
             if (result.correct) "回答正确" else "回答错误",
             22f, if (result.correct) Paper.green else Paper.error, true
@@ -381,7 +381,7 @@ class StudyScreen(
         content.space(12)
         val panel = context.column().apply {
             setPadding(context.dp(20), context.dp(20), context.dp(20), context.dp(20))
-            background = context.shape(Paper.surface, 14, true)
+            background = context.shape(Paper.surface, 16, true)
             addView(context.text(result.headword, 30f, Paper.ink, true))
             addView(context.text(
                 if (result.correct) "回答正确，下次到期时间已更新。"
@@ -409,7 +409,7 @@ class StudyScreen(
                 // mount the next real round instead of writing into a detached tree.
                 if (content.isAttachedToWindow) {
                     content.removeAllViews()
-                    content.addView(context.text("复习", 26f, Paper.ink, true))
+                    content.addView(context.text("复习", 28f, Paper.ink, true))
                     content.addView(context.text("正在读取学习进度…", 16f, Paper.secondary))
                     load(content)
                 } else {

@@ -181,7 +181,7 @@ class TranslationScreen(
         val content = context.column()
 
         content.addView(context.text("离线翻译", 28f, bold = true))
-        content.addView(context.text("Google ML Kit · 英译中", 16f, Paper.secondary))
+        content.addView(context.text("Google ML Kit · 英译中（可选组件）", 15f, Paper.secondary))
         content.space(12)
 
         // One short line for the current state. Long explanations live in the collapsed
@@ -312,7 +312,7 @@ class TranslationScreen(
 
         resultCard = context.column().apply {
             setPadding(context.dp(20), context.dp(20), context.dp(20), context.dp(20))
-            background = context.shape(Paper.lightGreen, 12)
+            background = context.shape(Paper.surface, 16, true)
             visibility = View.GONE
         }
         resultCard.addView(context.text("中文译文", 16f, bold = true))

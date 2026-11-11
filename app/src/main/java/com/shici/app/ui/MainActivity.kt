@@ -337,9 +337,10 @@ class MainActivity : Activity() {
     }
     @Volatile private var deleteFlow: DeleteFlow? = null
     private var stopCaptureButton: Button? = null
-    private val wide get() = resources.configuration.screenWidthDp >= 840
-    private val contentWidthDp get() = resources.configuration.screenWidthDp - (if (wide) 216 + 64 else 40)
-    private val splitContent get() = contentWidthDp >= 840 && resources.configuration.fontScale <= 1.3f
+    private val wide get() = resources.configuration.screenWidthDp >= 840 &&
+        resources.configuration.screenWidthDp / resources.configuration.fontScale >= 650
+    private val contentWidthDp get() = resources.configuration.screenWidthDp - (if (wide) 184 + 48 else 32)
+    private val splitContent get() = wide && contentWidthDp >= 660 * resources.configuration.fontScale
     private fun inlineAt(widthDp: Int) = widthDp >= 440 * resources.configuration.fontScale
     private val statusListener: (CaptureState) -> Unit = { state ->
         syncSwitch = true
@@ -640,7 +641,7 @@ class MainActivity : Activity() {
             }
             insets
         }
-        body = column().apply { setPadding(dp(if (wide) 32 else 20), dp(24), dp(if (wide) 32 else 20), dp(12)) }
+        body = column().apply { setPadding(dp(if (wide) 24 else 16), dp(20), dp(if (wide) 24 else 16), dp(12)) }
         // One navigation component owns both layouts. Its ids are the stable MainPage names, so a
         // restored/legacy selection never depends on display order or a child index.
         navigation = MainNavigation(
@@ -652,7 +653,7 @@ class MainActivity : Activity() {
             onSelect = { id -> MainPage.fromStableName(id)?.let { selectPage(it) } }
         )
         if (wide) {
-            root.addView(navigation.view, LinearLayout.LayoutParams(dp(216), -1))
+            root.addView(navigation.view, LinearLayout.LayoutParams(dp(184), -1))
             root.addView(body, LinearLayout.LayoutParams(0, -1, 1f))
         } else {
             root.addView(body, LinearLayout.LayoutParams(-1, 0, 1f))
@@ -799,8 +800,10 @@ class MainActivity : Activity() {
     }
     private fun home() {
         val content = scrolled()
-        content.addView(text("专注阅读，随手拾词", 16f, Paper.secondary))
-        content.addView(text("让生词停在这里", if (wide) 36f else 28f, Paper.ink, true)); content.space(24)
+        content.addView(text("拾词 · 阅读工作台", 26f, Paper.ink, true))
+        content.addView(text("查词、积累、复习，都留在本机。", 15f, Paper.secondary)); content.space(12)
+        content.addView(button("输入单词查词", true) { selectPage(MainPage.LOOKUP) }, LinearLayout.LayoutParams(-1, -2))
+        content.space(12)
         // Non-blocking first-use recommendation. It never opens by itself, never steals focus and
         // only writes the independent guide preference when the user taps "跳过，不再提示".
         if (!guideSeen()) {
@@ -832,27 +835,27 @@ class MainActivity : Activity() {
             addView(text("开启后，点悬浮「词」，直接在题目页面上划一笔查词。", 15f, Paper.secondary))
             addView(text("不需要悬浮权限时，也可以到「查词」页手动输入。", 15f, Paper.secondary))
         })
-        content.addView(session); content.space(24)
-        content.addView(text("主要功能", 22f, bold = true)); content.space(8)
-        content.addView(entryCard("查词", "输入或划词查询；缺词可新增词义。") { selectPage(MainPage.LOOKUP) })
-        content.space(8)
-        // Optional-component privacy details live on the translation page and in Settings, not here.
-        content.addView(entryCard("离线 AI 翻译（可选组件）", "可选组件，确认后才下载模型；其他功能不依赖它。") { selectPage(MainPage.TRANSLATION) })
-        content.space(8)
-        content.addView(entryCard("添加/补词", "只维护本机个人词义，不产生查询或复习记录。") { selectPage(MainPage.PERSONAL_ENTRY) })
-        content.space(8)
-        content.addView(entryCard("生词本", "查看和管理已收录的生词。") { selectPage(MainPage.VOCABULARY) })
-        content.space(8)
-        content.addView(entryCard("复习", "看英文词，从四个中文释义中选一个。") { selectPage(MainPage.STUDY) })
-        content.space(8)
-        content.addView(entryCard("统计", "查看真实查询与复习进度。") { selectPage(MainPage.STATISTICS) })
-        content.space()
-        content.addView(text("打开悬浮查词 → 点「词」→ 划一笔 → 抬笔即查", 16f, Paper.secondary))
+        content.addView(session); content.space(16)
+        content.addView(text("学习与工具", 20f, bold = true)); content.space(8)
+        // Small pairs are shortcuts only; every destination keeps its original route and owner.
+        content.addView(pair(
+            entryCard("生词本", "释义、笔记与收藏") { selectPage(MainPage.VOCABULARY) },
+            entryCard("复习", "四选一，继续今日计划") { selectPage(MainPage.STUDY) },
+            inlineAt(contentWidthDp), 12))
+        content.space(10)
+        content.addView(pair(
+            entryCard("添加/补词", "只维护本机个人词义") { selectPage(MainPage.PERSONAL_ENTRY) },
+            entryCard("离线翻译（可选）", "确认后才下载模型") { selectPage(MainPage.TRANSLATION) },
+            inlineAt(contentWidthDp), 12))
+        content.space(10)
+        content.addView(entryCard("统计", "查看真实查询与复习进度") { selectPage(MainPage.STATISTICS) })
+        content.space(12)
+        content.addView(text("打开悬浮查词 → 点「词」→ 划一笔 → 抬笔即查", 14f, Paper.secondary))
         statusListener(CaptureStatus.state)
     }
     private fun entryCard(title: String, description: String, action: () -> Unit): View = column().apply {
-        setPadding(dp(20), dp(14), dp(20), dp(14)); background = shape(Paper.surface, border = true)
-        addView(text(title, 20f, bold = true))
+        setPadding(dp(16), dp(10), dp(16), dp(10)); background = shape(Paper.surface, border = true)
+        addView(text(title, 18f, bold = true))
         addView(text(description, 15f, Paper.secondary))
         isClickable = true; isFocusable = true; minimumHeight = dp(64)
         contentDescription = "打开$title"
@@ -900,12 +903,10 @@ class MainActivity : Activity() {
     }
 
     private fun vocabulary() {
-        // First screen: title + count, one search line, a compact filter/sort/manage strip, then the
-        // word list. Everything export-related — row checkboxes, select all, clear, restore *and*
+        // List panel: title + count, search, filter/sort/manage, then the word list. Everything export-related — row checkboxes, select all, clear, restore *and*
         // the "导出 PDF" action — lives only in the explicit "管理与导出" panel, so the reading screen
         // stays a reading screen and the export scope is always read next to the action that uses
-        // it. The title line and the search line stay fixed; the strip, panel and list share one
-        // scroll, so a narrow screen or a large font scrolls instead of cramming.
+        // it. The whole list panel scrolls independently of the detail, including on short windows.
         //
         // The panel is built eagerly and only hidden while not managing, so the page always owns a
         // live [exportButton]. Existing device flows that look the button up right after the
@@ -941,29 +942,33 @@ class MainActivity : Activity() {
         selectionCard.visibility = if (vocabularyManaging) View.VISIBLE else View.GONE
         selectionPanel = selectionCard
         val input = inputField("搜索单词、释义或笔记", true).apply { setText(search) }
-        // Fixed top: the title/count line, then the one search line — those are the key operations,
-        // so they never scroll away at any width or font scale. Everything below — the
-        // filter/sort/manage strip, the manage panel and the word list — shares one scroll, so a
-        // narrow screen or a large font simply scrolls that content instead of pretending it fits.
+        // The title/search belong to the list column, never stretched across the detail column.
+        // Keep them inside its scroll so large fonts and the IME cannot strand the row controls.
         val rowList = column()
         searchList = rowList
-        val scrolledList = column()
+        val scrolledList = column().apply {
+            setPadding(dp(16), dp(12), dp(16), dp(16))
+            background = shape(Paper.surface, border = true)
+        }
+        // The list owns its search/filter header, not the full workspace width. It all scrolls on
+        // short windows/IME/large fonts; the detail has its own independent vertical scroll.
+        scrolledList.addView(header)
+        scrolledList.space(8)
+        scrolledList.addView(input, LinearLayout.LayoutParams(-1, -2))
+        scrolledList.space(8)
         scrolledList.addView(toolbar)
         scrolledList.space(8)
         scrolledList.addView(selectionCard, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
         scrolledList.addView(rowList)
-        body.addView(header); body.space(8)
-        body.addView(input); body.space(8)
         val listScroll = ScrollView(this).apply { isFillViewport = true; addView(scrolledList) }
         vocabularyScroll = listScroll
         if (splitContent) {
             val container = row()
-            // Only the two columns scroll, below the fixed title/search lines.
-            container.addView(listScroll, LinearLayout.LayoutParams(0, -1, 0.44f))
-            val detail = column().apply { setPadding(dp(24), 0, 0, 0) }
+            container.addView(listScroll, LinearLayout.LayoutParams(0, -1, 0.40f))
+            val detail = column().apply { setPadding(dp(16), 0, 0, dp(12)) }
             detailPanel = detail
-            container.addView(ScrollView(this).apply { addView(detail) },
-                LinearLayout.LayoutParams(0, -1, 0.56f))
+            container.addView(ScrollView(this).apply { isFillViewport = true; addView(detail) },
+                LinearLayout.LayoutParams(0, -1, 0.60f))
             body.addView(container, LinearLayout.LayoutParams(-1, 0, 1f))
         } else {
             body.addView(listScroll, LinearLayout.LayoutParams(-1, 0, 1f))
@@ -1190,7 +1195,7 @@ class MainActivity : Activity() {
     }
     /**
      * One compact vocabulary row: the word, a one-line meaning, a light query/time line and the
-     * favorite state; the whole row opens the detail. In the explicit "管理与导出" state a leading
+     * favorite state; the text opens the detail. In the explicit "管理与导出" state a leading
      * checkbox edits only the in-memory export allow-list (never the database). Every destructive or
      * favorite action stays in the row menu, which only invokes the existing exact-key flows
      * ([toggleListFavorite] and [openListRemoval] → scope chooser + second confirmation).
@@ -1230,9 +1235,7 @@ class MainActivity : Activity() {
         }.joinToString(" · ")
         val body = column().apply {
             setPadding(dp(4), dp(8), dp(4), dp(8)); isClickable = true; isFocusable = true
-            addView(text(word.entry.headword, 21f, bold = true).apply {
-                typeface = Typeface.create("serif", Typeface.BOLD)
-            })
+            addView(text(word.entry.headword, 21f, bold = true))
             addView(text("${word.entry.partOfSpeech} ${word.entry.meaning}", 15f, Paper.secondary).apply {
                 maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END
             })
@@ -1242,19 +1245,19 @@ class MainActivity : Activity() {
                 "$meta，${if (word.favorite) "已收藏" else "未收藏"}，点按查看详情"
         }
         container.addView(body, LinearLayout.LayoutParams(0, -2, 1f))
-        // One 48dp overflow entry per row; removal and favorite stay discoverable without a row of
-        // large buttons or a repeated explanation.
-        val more = Button(this).apply {
-            text = "⋮"
-            textSize = 20f
-            isAllCaps = false
-            minWidth = dp(48); minHeight = dp(48)
-            setTextColor(Paper.secondary)
-            background = shape(Paper.lightGreen, 8)
-            contentDescription = "更多操作 ${word.entry.headword}"
-            setOnClickListener { showVocabularyRowMenu(this, word) }
+        val favorite = button(if (word.favorite) "★" else "☆") { toggleListFavorite(word) }.apply {
+            textSize = 23f
+            setTextColor(if (word.favorite) Paper.warning else Paper.secondary)
+            background = shape(Paper.surface, 8)
+            contentDescription = "${if (word.favorite) "取消收藏" else "收藏"} ${word.entry.headword}"
         }
-        container.addView(more)
+        container.addView(favorite, LinearLayout.LayoutParams(dp(48), -2))
+        // Explicit removal entry reuses the original exact-key scope/confirmation flow.
+        // Favorite is the adjacent star; neither action directly edits a database here.
+        val remove = VocabularyActions.listRemoveButton(this, word.entry.headword) {
+            openListRemoval(word.entry.key)
+        }.apply { background = shape(Paper.surface, 8, true) }
+        container.addView(remove)
         return container
     }
     /** Row menu: only the existing exact flows, chosen per row; it never deletes or edits by itself. */
@@ -1933,8 +1936,8 @@ class MainActivity : Activity() {
     }
     private fun wordDetail(content: LinearLayout, word: LearnedWord, deletionCredential: Long, snapshotVersion: Long, close: (() -> Unit)? = null): WordDetailBinding {
         val detailWidth = if (close != null) minOf(resources.configuration.screenWidthDp - 32, 640)
-            else (contentWidthDp * 0.56f).toInt() - 24
-        content.addView(text(word.entry.headword, 30f, bold = true).apply { typeface = Typeface.create("serif", Typeface.BOLD) })
+            else (contentWidthDp * 0.60f).toInt() - 16
+        content.addView(text(word.entry.headword, 32f, bold = true))
         val definition = text("${word.entry.partOfSpeech} ${word.entry.meaning}", 18f)
         content.addView(definition); content.space(8)
         val sourceBadge = badge(PersonalDictionary.label(word.source, word.version))
@@ -1946,6 +1949,11 @@ class MainActivity : Activity() {
         val removeSection = VocabularyActions.detailSection(this, word.entry.headword) {
             removeBinding?.let { openDeleteScope(it, word, close) }
         }
+        removeSection.removeButton.apply {
+            textSize = 15f
+            gravity = Gravity.START or Gravity.CENTER_VERTICAL
+            background = shape(Paper.surface, 8, true)
+        }
         content.addView(removeSection.view)
         content.space(8)
         content.divider()
@@ -1955,7 +1963,7 @@ class MainActivity : Activity() {
         // collapsed detail explanation below, next to the other reference text.
         val source = text(PersonalDictionary.provenance(word.source, word.version), 16f, Paper.secondary)
         content.space(16)
-        val count = text("${word.queryCount} 次", 28f, bold = true)
+        val count = text("${word.queryCount} 次", 20f, bold = true)
         val queries = column().apply {
             addView(text("查询次数", 16f, Paper.secondary)); addView(count)
         }

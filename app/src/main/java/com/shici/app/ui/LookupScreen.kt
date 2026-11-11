@@ -7,6 +7,7 @@ import android.view.KeyEvent
 import android.view.View
 import android.view.inputmethod.EditorInfo
 import android.widget.EditText
+import android.widget.LinearLayout
 import android.widget.ScrollView
 
 /**
@@ -53,7 +54,7 @@ class LookupScreen(
         // Order is deliberate: title, input, the two main actions, then only the two short boundary
         // lines a user needs before acting. Everything explanatory is folded below.
         val card = context.column().apply {
-            setPadding(context.dp(24), context.dp(24), context.dp(24), context.dp(24))
+            setPadding(context.dp(20), context.dp(20), context.dp(20), context.dp(20))
             background = context.shape(Paper.surface, border = true)
         }
 
@@ -85,15 +86,21 @@ class LookupScreen(
             override fun afterTextChanged(s: Editable?) {}
         })
 
-        card.addView(input)
-        card.space(8)
-        card.addView(context.button("查询", true) { submit() })
-        card.addView(context.button("清空") {
+        val editorRow = context.row().apply { gravity = android.view.Gravity.CENTER_VERTICAL }
+        editorRow.addView(input, LinearLayout.LayoutParams(0, -2, 1f))
+        val clear = context.button("清空") {
             // Clearing only empties the field. The text watcher forwards the empty draft, and no
             // lookup, record or query count is created here.
             input.setText("")
             input.setSelection(0)
-        })
+        }.apply {
+            textSize = 14f
+            contentDescription = "清空输入，不查询"
+        }
+        editorRow.addView(clear, LinearLayout.LayoutParams(-2, -2).apply { marginStart = context.dp(6) })
+        card.addView(editorRow, LinearLayout.LayoutParams(-1, -2))
+        card.space(8)
+        card.addView(context.button("查询", true) { submit() }, LinearLayout.LayoutParams(-1, -2))
         card.space(4)
         // Kept visible next to the primary action: a query is a real recording action.
         card.addView(context.text("查询会收录到生词本。", 15f, Paper.secondary))
@@ -101,9 +108,10 @@ class LookupScreen(
         content.space(12)
 
         val supplement = context.column().apply {
-            setPadding(context.dp(24), context.dp(24), context.dp(24), context.dp(24))
+            setPadding(context.dp(20), context.dp(20), context.dp(20), context.dp(20))
             background = context.shape(Paper.surface, border = true)
         }
+        supplement.addView(context.text("本机词义", 18f, bold = true))
         supplement.addView(context.button("添加/补词") { onOpenPersonalEntry() })
         supplement.addView(context.text("仅保存词义，不加入生词本。", 15f, Paper.secondary))
         content.addView(supplement)
