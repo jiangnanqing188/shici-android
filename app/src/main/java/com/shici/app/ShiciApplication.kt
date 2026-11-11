@@ -5,6 +5,8 @@ import com.shici.app.data.LearningRepository
 import com.shici.app.core.DictionaryEntry
 import com.shici.app.core.DictionaryResolver
 import com.shici.app.core.LookupResult
+import com.shici.app.core.EcdictDictionary
+import com.shici.app.core.DictionaryStore
 import com.shici.app.core.RawKajwebDictionary
 import com.shici.app.core.StudyBook
 import com.shici.app.core.StudyBooks
@@ -15,6 +17,8 @@ class ShiciApplication : Application() {
     val worker = Executors.newSingleThreadExecutor()
     val repository by lazy { LearningRepository(this) }
     // Access only from worker: cache both a fully validated dictionary and an explicit load failure.
+    val lookupDictionary: Result<DictionaryStore> by lazy { runCatching { EcdictDictionary.open(this) } }
+    // Original fixed exam-book entries are retained only for study membership fallback.
     val dictionary: Result<RawKajwebDictionary> by lazy {
         runCatching {
             val json = assets.open(RawKajwebDictionary.MANIFEST_ASSET).use {
@@ -58,7 +62,10 @@ class ShiciApplication : Application() {
      * same repository worker and must not be called from the UI thread.
      */
     fun lookupWord(raw: String): LookupResult =
-        DictionaryResolver.lookup(dictionary.getOrThrow(), raw) { repository.userEntry(it) }
+        DictionaryResolver.lookup(lookupDictionary.getOrThrow(), raw) { repository.userEntry(it) }
+
+    fun lookupExactWord(raw: String): LookupResult =
+        DictionaryResolver.lookupExact(lookupDictionary.getOrThrow(), raw) { repository.userEntry(it) }
 
     /**
      * Unified entry resolution used by study membership/display. The saved original snapshot keeps
@@ -66,7 +73,7 @@ class ShiciApplication : Application() {
      * so an older word snapshot never swallows a newer supplement. Worker-only.
      */
     fun resolveEntry(key: String): DictionaryEntry? =
-        DictionaryResolver.resolve(dictionary.getOrNull(), repository.storedEntry(key), key) {
+        DictionaryResolver.resolve(lookupDictionary.getOrNull(), repository.storedEntry(key) ?: dictionary.getOrNull()?.entry(key), key) {
             repository.userEntry(it)
         }
 }

@@ -35,8 +35,9 @@ fun Context.shape(color: Int, radius: Int = 16, border: Boolean = false) = Gradi
 }
 fun Context.button(label: String, primary: Boolean = false, action: () -> Unit): Button = Button(this).apply {
     text = label; textSize = 16f; isAllCaps = false; minHeight = dp(48)
+    minWidth = 0; minimumWidth = 0
     setTextColor(if (primary) Color.WHITE else Paper.green)
-    background = shape(if (primary) Paper.green else Paper.lightGreen, 8)
+    background = shape(if (primary) Paper.green else Paper.surface, 12, border = !primary)
     setPadding(dp(12), dp(8), dp(12), dp(8))
     setOnClickListener { action() }
 }
@@ -58,6 +59,32 @@ fun Context.pair(first: View, second: View, horizontal: Boolean, gap: Int = 16):
             else LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(gap) })
         addView(second, if (horizontal) LinearLayout.LayoutParams(0, -2, 1f) else LinearLayout.LayoutParams(-1, -2))
     }
+
+/**
+ * Explicit, small thresholds shared by the phone-adaptation screens.
+ *
+ * They only answer "does this dense horizontal row still fit readably?" and never change a page, a
+ * callback, a selection or any stored state. Layout at or above these thresholds is unchanged.
+ */
+object PaperLayout {
+    /** Windows narrower than this are phone-width portraits (320/360/393/412dp are typical). */
+    const val COMPACT_MAX_WIDTH_DP = 600
+
+    /** At or above this user font scale, a dense row is stacked even in a wide window. */
+    const val LARGE_FONT_SCALE = 1.3f
+}
+
+/** True when [widthDp] is a phone-width window instead of the 216dp sidebar window. */
+fun Context.compactWidth(widthDp: Int = resources.configuration.screenWidthDp): Boolean =
+    widthDp < PaperLayout.COMPACT_MAX_WIDTH_DP
+
+/**
+ * True when a dense row (a label plus several buttons, or several actions side by side) has to
+ * become a stacked or vertical layout: a phone-width window, or enlarged text that would squeeze
+ * every label at any width. No font is shrunk and no content is hidden by this decision.
+ */
+fun Context.stackedActions(widthDp: Int = resources.configuration.screenWidthDp): Boolean =
+    compactWidth(widthDp) || resources.configuration.fontScale >= PaperLayout.LARGE_FONT_SCALE
 
 /**
  * Collapsed, purely presentational help block.
@@ -82,7 +109,7 @@ fun Context.helpDisclosure(title: String, buildContent: LinearLayout.() -> Unit)
         minHeight = dp(48)
         gravity = Gravity.START or Gravity.CENTER_VERTICAL
         setTextColor(Paper.green)
-        background = shape(Paper.lightGreen, 8)
+        background = shape(Paper.background, 12, true)
         setPadding(dp(12), dp(8), dp(12), dp(8))
         text = "$title ▾"
         contentDescription = "$title，当前已收起，点按展开"

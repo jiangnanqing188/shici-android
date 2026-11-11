@@ -33,6 +33,7 @@ class LiveSelectionView(
     private val onCancel: (String) -> Unit,
     private val onGestureStart: () -> Unit = {}
 ) : View(context) {
+    private enum class Stage { PREPARING, SAMPLING, READY }
     private val density = resources.displayMetrics.density
     private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
     private val ink = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -57,7 +58,18 @@ class LiveSelectionView(
     private var cancelPressed = false
     private var downX = 0f
     private var downY = 0f
+    @Volatile private var stage = Stage.PREPARING
     @Volatile private var armed = false
+    // A gesture that began before this layer was ready is never turned into a synthetic stroke.
+    // Its final UP/CANCEL only produces a clear redraw notice; a later DOWN starts a full stroke.
+    private var preparationGesture = false
+    private var preparationCancel = false
+    private var preparationMulti = false
+    private var preparationDownX = 0f
+    private var preparationDownY = 0f
+    // A redraw notice is painted by this layer, never a Toast: the entry/verify samples contain no
+    // app-owned notice window, and the next DOWN clears it before the new stroke starts.
+    private var notice: String? = null
     // Screen-coordinate rectangles occupied by this overlay's own ink and chips. The capture
     // thread reads this list while comparing the page during a stroke; it is replaced atomically
     // and never contains a whole-page mask, so the page pixels around the ink stay observable.
@@ -73,22 +85,57 @@ class LiveSelectionView(
         isFocusable = true
     }
 
-    /** The clean entry frame is ready; ink feedback and one-stroke submission may start. */
+    /**
+     * The clean entry frame is ready; ink feedback and one-stroke submission may start. A gesture
+     * already in progress from [Stage.PREPARING]/[Stage.SAMPLING] is not revived by this call.
+     */
     fun arm() {
+        stage = Stage.READY
         armed = true
         updateScreenExclusions()
         invalidate()
     }
 
     /**
-     * The exact screen rectangles this overlay currently covers with opaque pixels: the stroke
-     * path (inflated by the brush) and the two chips. A frame observer excludes only these and
-     * compares the rest of the page; an empty list before arming is intentional (nothing is drawn).
+     * Hides the preparation prompt/cancel chips immediately before the clean entry frame is armed.
+     * The layer remains mounted and continues to own every touch, but draws no pixels until [arm].
+     */
+    fun beginCleanEntry() {
+        if (stage != Stage.PREPARING) return
+        stage = Stage.SAMPLING
+        updateScreenExclusions()
+        invalidate()
+    }
+
+    /** True only after the window is attached, laid out with a real size, and visible. */
+    fun isWindowReady(): Boolean = isAttachedToWindow && isShown && width > 0 && height > 0
+
+    /** Paints the redraw notice inside the transparent layer, avoiding a Toast in either sample. */
+    private fun showNotice(message: String) {
+        notice = message
+        updateScreenExclusions()
+        invalidate()
+    }
+
+    private fun clearNotice() {
+        if (notice == null) return
+        notice = null
+        updateScreenExclusions()
+        invalidate()
+    }
+
+    /**
+     * The exact screen rectangles this overlay covers with opaque pixels while READY: the stroke
+     * path (inflated by the brush), the two chips and any redraw notice. A frame observer excludes
+     * only these and compares the rest of the page; preparation/sampling return an empty list
+     * because their prompt is hidden before the clean ENTRY frame and never joins a stroke.
      */
     fun currentScreenExclusions(): List<PixelBox> = screenExclusions
 
     private fun updateScreenExclusions() {
-        if (!armed) {
+        // Preparation chips are never part of a stroke-time comparison. Sampling hides them before
+        // the clean entry frame; only the READY layer publishes actual ink/chip exclusions.
+        if (stage != Stage.READY || !armed) {
             screenExclusions = emptyList()
             return
         }
@@ -145,6 +192,7 @@ class LiveSelectionView(
         if (hasInk) add(inkBounds, ink.strokeWidth / 2f + 4f * density)
         add(hintRect(), 3f * density)
         add(cancelRect(), 3f * density)
+        if (notice != null) add(noticeRect(), 3f * density)
         screenExclusions = boxes
     }
 
@@ -160,7 +208,7 @@ class LiveSelectionView(
             return
         }
         windowReadyCallback = callback
-        if (isAttachedToWindow && isShown && width > 0 && height > 0) {
+        if (isWindowReady()) {
             // A post runs after the current traversal in case layout already completed.
             post { reportWindowReady() }
         }
@@ -182,7 +230,7 @@ class LiveSelectionView(
 
     private fun reportWindowReady() {
         val callback = windowReadyCallback ?: return
-        if (windowReadyReported || !isAttachedToWindow || !isShown || width <= 0 || height <= 0) return
+        if (windowReadyReported || !isWindowReady()) return
         windowReadyReported = true
         windowReadyCallback = null
         runCatching { viewTreeObserver.removeOnGlobalLayoutListener(globalLayoutListener) }
@@ -224,12 +272,35 @@ class LiveSelectionView(
         return RectF(centerX - halfWidth, top, centerX + halfWidth, top + height)
     }
 
+    private fun noticeRect(): RectF {
+        val text = notice ?: return RectF()
+        val maxWidth = (width - 32f * density).coerceAtLeast(1f)
+        val halfWidth = (minOf(hintText.measureText(text) + 28f * density, maxWidth)) / 2f
+        val top = hintRect().bottom + 8f * density
+        return RectF(width / 2f - halfWidth, top, width / 2f + halfWidth, top + 34f * density)
+    }
+
     override fun onDraw(canvas: Canvas) {
-        if (!armed) return
-        updateScreenExclusions()
-        currentPath?.let { canvas.drawPath(it, ink) }
-        drawChip(canvas, hintRect(), "沿完整单词一笔划过 · 抬笔即查", hintText, 34f * density)
-        drawChip(canvas, cancelRect(), "取消取词", chipText, 44f * density)
+        when (stage) {
+            Stage.PREPARING -> {
+                drawChip(canvas, hintRect(), "正在准备划词…", hintText, 34f * density)
+                drawChip(canvas, cancelRect(), "取消取词", chipText, 44f * density)
+                notice?.let {
+                    drawChip(canvas, noticeRect(), it, hintText, 34f * density)
+                }
+            }
+            Stage.SAMPLING -> Unit
+            Stage.READY -> {
+                if (!armed) return
+                updateScreenExclusions()
+                currentPath?.let { canvas.drawPath(it, ink) }
+                drawChip(canvas, hintRect(), "沿完整单词一笔划过 · 抬笔即查", hintText, 34f * density)
+                drawChip(canvas, cancelRect(), "取消取词", chipText, 44f * density)
+                notice?.let {
+                    drawChip(canvas, noticeRect(), it, hintText, 34f * density)
+                }
+            }
+        }
     }
 
     private fun drawChip(canvas: Canvas, box: RectF, text: String, paint: Paint, height: Float) {
@@ -287,11 +358,31 @@ class LiveSelectionView(
         points.zipWithNext().sumOf { (a, b) -> hypot((b.x - a.x).toDouble(), (b.y - a.y).toDouble()) }.toFloat()
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
-        // While the clean entry frame is still being acquired the layer only swallows touches: it
-        // neither draws ink (which would pollute the frame) nor lets the tap reach the app below.
-        if (!armed) return true
+        // While preparing/sampling, the mounted layer is a real touch barrier but never starts a
+        // stroke or lets a gesture reach the page below. The preparation prompt is the only thing
+        // drawn before sampling; it is hidden before the clean ENTRY frame.
+        val currentStage = stage
+        if (currentStage != Stage.READY || !armed) {
+            handlePreReadyTouch(event, currentStage)
+            invalidate()
+            return true
+        }
+        // A DOWN that happened before arm must not be completed with a synthetic start point or a
+        // half stroke after arm. Consume its remaining events through the real lift/cancel, report
+        // one clear redraw notice, then let the next DOWN start normally.
+        if (preparationGesture) {
+            if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+                // The system dropped the old stream; the new DOWN is a complete new gesture.
+                resetPreparationGesture()
+            } else {
+                handleCrossReadyTouch(event)
+                invalidate()
+                return true
+            }
+        }
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
+                clearNotice()
                 interrupted = false
                 cancelPressed = cancelRect().contains(event.x, event.y)
                 downX = event.x
@@ -360,6 +451,81 @@ class LiveSelectionView(
         }
         invalidate()
         return true
+    }
+
+    private fun resetPreparationGesture() {
+        preparationGesture = false
+        preparationCancel = false
+        preparationMulti = false
+        preparationDownX = 0f
+        preparationDownY = 0f
+    }
+
+    private fun isCancelTap(event: MotionEvent): Boolean =
+        preparationCancel && !preparationMulti &&
+            abs(event.x - preparationDownX) <= touchSlop &&
+            abs(event.y - preparationDownY) <= touchSlop &&
+            cancelRect().contains(event.x, event.y)
+
+    /** Swallows a gesture that starts before this layer is ready and explains why it was not used. */
+    private fun handlePreReadyTouch(event: MotionEvent, currentStage: Stage) {
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                clearNotice()
+                resetPreparationGesture()
+                preparationGesture = true
+                if (currentStage == Stage.PREPARING) {
+                    preparationCancel = cancelRect().contains(event.x, event.y)
+                    preparationDownX = event.x
+                    preparationDownY = event.y
+                }
+            }
+            MotionEvent.ACTION_POINTER_DOWN, MotionEvent.ACTION_POINTER_UP -> {
+                if (preparationGesture) {
+                    preparationMulti = true
+                    preparationCancel = false
+                }
+            }
+            MotionEvent.ACTION_UP -> {
+                val cancel = isCancelTap(event)
+                val multi = preparationMulti
+                resetPreparationGesture()
+                when {
+                    cancel -> onCancel("已取消取词")
+                    multi -> showNotice("多指未提交，请重新完整划一笔")
+                    else -> showNotice("划词层尚未就绪，请就绪后重新划一笔")
+                }
+            }
+            MotionEvent.ACTION_CANCEL -> {
+                resetPreparationGesture()
+                onCancel("取词准备已中断，本次未查询")
+            }
+        }
+    }
+
+    /** Finishes a gesture whose DOWN crossed into READY without inventing a stroke. */
+    private fun handleCrossReadyTouch(event: MotionEvent) {
+        when (event.actionMasked) {
+            MotionEvent.ACTION_MOVE -> Unit
+            MotionEvent.ACTION_POINTER_DOWN, MotionEvent.ACTION_POINTER_UP -> {
+                preparationMulti = true
+                preparationCancel = false
+            }
+            MotionEvent.ACTION_UP -> {
+                val cancel = isCancelTap(event)
+                val multi = preparationMulti
+                resetPreparationGesture()
+                when {
+                    cancel -> onCancel("已取消取词")
+                    multi -> showNotice("多指未提交，请用单指重新划一笔")
+                    else -> showNotice("本次触摸开始于准备期，请重新划一笔")
+                }
+            }
+            MotionEvent.ACTION_CANCEL -> {
+                resetPreparationGesture()
+                showNotice("手势在准备切换时中断，请重划")
+            }
+        }
     }
 
     override fun performClick(): Boolean { super.performClick(); return true }

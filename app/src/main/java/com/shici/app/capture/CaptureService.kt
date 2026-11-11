@@ -32,6 +32,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.ceil
 import kotlin.math.floor
+import kotlin.math.roundToInt
 
 /**
  * One dictionary read plus the committed revision observed on the worker immediately around it.
@@ -44,7 +45,8 @@ private data class LookupRead(
     val result: LookupResult,
     val user: UserDictionaryEntry?,
     val revision: Long,
-    val stable: Boolean
+    val stable: Boolean,
+    val users: Map<String, UserDictionaryEntry?> = emptyMap()
 ) {
     fun isCurrent(now: Long): Boolean = stable && revision == now
 }
@@ -164,6 +166,9 @@ class CaptureService : Service() {
     // removed on lift, cancel, resize, rotation, panel dismissal or service shutdown.
     private var live: LiveSelectionSession? = null
     private var liveView: LiveSelectionView? = null
+    // The layer is mounted before the ENTRY request. This bounds layout readiness so a permission
+    // or window failure cannot leave a transparent touch barrier on screen indefinitely.
+    private var liveReadyTimeout: Runnable? = null
     private var liveTimeout: Runnable? = null
     // After the clean lift frame has been accepted, this guard proves that later OCR/dictionary/
     // display/save/retry admissions still belong to the same page. It stores only the compact
@@ -1066,6 +1071,10 @@ class CaptureService : Service() {
         frameTimeout?.let { main.removeCallbacks(it) }
         frameTimeout = null
     }
+    private fun clearLiveReadyTimeout() {
+        liveReadyTimeout?.let { main.removeCallbacks(it) }
+        liveReadyTimeout = null
+    }
     private fun expireFrame(request: FreshFrameRequest, purpose: FramePurpose) {
         if (!frameIsCurrent(request) || !requestedFrame.compareAndSet(request, null)) return
         request.cancel(); gate.next(); clearFrameTimeout()
@@ -1148,9 +1157,11 @@ class CaptureService : Service() {
     }
 
     /**
-     * Entry of one live lookup. The bubble is removed and a clean entry frame is requested before
-     * the transparent gesture layer is mounted, so neither the entry chip nor ink can be captured;
-     * a lookup is never performed from a stale mode-entry picture.
+     * Entry of one live lookup. The transparent gesture layer is mounted and proven ready before
+     * the clean entry frame is requested, so the tap creates a real touch barrier immediately:
+     * no gesture can scroll the page underneath while the entry image is being acquired. Its
+     * preparation prompt is hidden for the ENTRY sample and no ink exists until the entry frame
+     * has been accepted. A lookup is never performed from a stale mode-entry picture.
      */
     private fun beginLiveSelection() {
         if (stopped || !sessionIsActive() || requestedFrame.get() != null || live != null || liveView != null) return
@@ -1164,7 +1175,71 @@ class CaptureService : Service() {
             deletionCredential = app.repository.deletions.capture()
             val body = frameBody()
             removeBubble()
-            armFrame(FramePurpose.ENTRY, body, SystemClock.elapsedRealtime() + ENTRY_FRAME_TIMEOUT_MS)
+            // The same view identity owns all four callbacks. A retired layer's late stroke,
+            // gesture start, too-short notice or cancel must be a complete no-op, even when a new
+            // live session happens to be current. Preparation cancellation is deliberately allowed
+            // while live is still null, but only for the origin view that is still mounted.
+            var origin: LiveSelectionView? = null
+            val view = LiveSelectionView(this, screenWidth, screenHeight,
+                { stroke ->
+                    val session = live
+                    if (origin != null && liveView === origin && session != null &&
+                        live === session && sessionIsActive()) {
+                        commitLiveStroke(session, stroke)
+                    }
+                },
+                {
+                    if (origin != null && liveView === origin && live != null && sessionIsActive()) {
+                        toast("请沿完整单词一笔划过；轻点不查询")
+                    }
+                },
+                { reason ->
+                    if (origin != null && liveView === origin && sessionIsActive()) {
+                        cancelLiveMode(reason)
+                    }
+                },
+                {
+                    val session = live
+                    if (origin != null && liveView === origin && session != null &&
+                        live === session && sessionIsActive()) {
+                        session.beginStrokeMotion()
+                        // The compositor timestamp of a frame must be at/after this point to count
+                        // as stroke-time evidence; a queued pre-stroke image is not reused. The
+                        // fixed entry identity (never a rebased one) is compared until the lift.
+                        strokeObservation = StrokeObservation(
+                            session, session.entryFingerprint, session.body, System.nanoTime())
+                    }
+                })
+            origin = view
+            if (!addLiveLayer(view)) return
+            liveView = view
+            val readyTimeout = Runnable {
+                if (liveView === view && live == null && requestedFrame.get() == null) {
+                    perf.stage("live_layer", "ready_timeout")
+                    failLiveLookup(
+                        "划词层未能就绪：透明触摸层没有完成可用布局（不是 OCR 或词库问题）。本次未查询、未收录。请点「重试取词」。",
+                        "live_ready_timeout")
+                }
+            }
+            liveReadyTimeout = readyTimeout
+            main.postDelayed(readyTimeout, ENTRY_FRAME_TIMEOUT_MS)
+            view.awaitWindowReady {
+                if (liveView === view && live == null && sessionIsActive() &&
+                    requestedFrame.get() == null) {
+                    // One real compositor boundary lets the preparation prompt become visible
+                    // before it is hidden. armFrame then waits its own two traversal boundaries,
+                    // so the prompt/cancel/ink cannot enter the entry bitmap.
+                    Choreographer.getInstance().postFrameCallback {
+                        if (liveView === view && live == null && sessionIsActive() &&
+                            requestedFrame.get() == null) {
+                            clearLiveReadyTimeout()
+                            view.beginCleanEntry()
+                            armFrame(FramePurpose.ENTRY, body,
+                                SystemClock.elapsedRealtime() + ENTRY_FRAME_TIMEOUT_MS)
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1201,6 +1276,11 @@ class CaptureService : Service() {
     }
 
     private fun onEntryFrame(request: FreshFrameRequest, bitmap: Bitmap) {
+        val view = liveView
+        if (!sessionIsActive() || !gate.accepts(request.token) || view == null || live != null) {
+            bitmap.recycle()
+            return
+        }
         // Consume the identity sampled when this entry image was accepted. It is the same image,
         // and must not linger as page evidence for the later lift request.
         val published = synchronized(pageLock) {
@@ -1213,7 +1293,6 @@ class CaptureService : Service() {
             pendingStrictCoordinates = false
             identity
         }
-        if (!sessionIsActive() || !gate.accepts(request.token)) { bitmap.recycle(); return }
         val fingerprint = published ?: runCatching {
             LiveFrameFingerprint.sample(bitmap.width, bitmap.height, request.body) { x, y, row ->
                 bitmap.getPixels(row, 0, row.size, x, y, row.size, 1)
@@ -1225,6 +1304,12 @@ class CaptureService : Service() {
             return
         }
         bitmap.recycle() // Only the compact fingerprint survives; the clean entry bitmap is released.
+        if (!view.isWindowReady()) {
+            // The barrier remained mounted through ENTRY, but it can no longer accept a gesture.
+            // Never present a stale "ready" state; retire it and leave a visible retry path.
+            failLiveLookup("透明划词层在入场画面到达前已不可用（不是 OCR 或词库问题）。本次未查询、未收录。请点「重试取词」。", "live_layer")
+            return
+        }
         perf.stage("frame_entry", "ok")
         val session = LiveSelectionSession(
             generation = CaptureStatus.generation,
@@ -1236,33 +1321,12 @@ class CaptureService : Service() {
             entryFingerprint = fingerprint
         )
         live = session
-        val view = LiveSelectionView(this, screenWidth, screenHeight,
-            { stroke -> commitLiveStroke(session, stroke) },
-            { toast("请沿完整单词一笔划过；轻点不查询") },
-            { reason -> cancelLiveMode(reason) },
-            {
-                if (live === session) {
-                    session.beginStrokeMotion()
-                    // The compositor timestamp of a frame must be at/after this point to count as
-                    // stroke-time evidence; a queued pre-stroke image is not reused. The fixed
-                    // entry identity (never a rebased one) is compared until the lift decision.
-                    strokeObservation = StrokeObservation(
-                        session, session.entryFingerprint, session.body, System.nanoTime())
-                }
-            })
-        if (!addLiveLayer(view)) return
-        liveView = view
+        // The same layer that owned touches during preparation is now allowed to draw ink and
+        // submit one complete stroke. A DOWN that happened before this point remains recorded in
+        // the view and is finished as an explicit redraw notice, never as a synthetic stroke.
+        view.arm()
         scheduleLiveTimeout()
-        // "可划" is reported only after the window is attached, laid out with a real size and
-        // visible. addView alone merely registers the window. The checks reject a late callback
-        // from a cancelled, superseded or stopped lookup.
-        view.awaitWindowReady {
-            if (liveView === view && live === session && sessionIsActive() &&
-                session.generation == CaptureStatus.generation && gate.accepts(session.entryToken)) {
-                view.arm()
-                perf.selectionReady()
-            }
-        }
+        perf.selectionReady()
     }
 
     /**
@@ -1631,6 +1695,7 @@ class CaptureService : Service() {
         // finger was down remain in the session for the lift decision; no frame captured after the
         // ink disappeared may be attributed to the stroke.
         strokeObservation = null
+        clearLiveReadyTimeout()
         liveTimeout?.let { main.removeCallbacks(it) }
         liveTimeout = null
         val view = liveView
@@ -1700,7 +1765,7 @@ class CaptureService : Service() {
      */
     private fun addPanel(view: View, focusable: Boolean = true) {
         removePanelView()
-        val width = minOf(dp(440), (screenWidth - dp(24)).coerceAtLeast(dp(200)))
+        val width = minOf(dp(440), (frameBody().width - dp(24)).coerceAtLeast(1))
         // A long definition scrolls inside a card that never grows into a full-screen surface. The
         // cap already excludes the system bars, so the pinned footer is not placed under them.
         val maxHeight = panelMaxHeight()
@@ -1731,6 +1796,42 @@ class CaptureService : Service() {
         // and returns to the bubble; the service keeps running, and the manual/translation windows
         // keep their own separate listeners.
         val owner = panelOwner
+        var usable = frameBody()
+        var dragLeft = 0.0
+        var dragTop = 0.0
+        var dragOffsetX = 0
+        var dragOffsetY = 0
+        if (view is OverlayCardLayout) view.setOnTitleDrag(onStart = {
+            val current = !stopped && owner == panelOwner && panel === view &&
+                view.isAttachedToWindow && view.width > 0 && view.height > 0
+            if (current) {
+                val location = IntArray(2)
+                view.getLocationOnScreen(location)
+                dragLeft = location[0].toDouble(); dragTop = location[1].toDouble()
+                dragOffsetX = params.x - location[0]; dragOffsetY = params.y - location[1]
+            }
+            current
+        }, onDrag = { dx, dy ->
+            if (!stopped && owner == panelOwner && panel === view && view.isAttachedToWindow) {
+                dragLeft = (dragLeft + dx).coerceIn(usable.left.toDouble(),
+                    maxOf(usable.left, usable.right - view.width).toDouble())
+                dragTop = (dragTop + dy).coerceIn(usable.top.toDouble(),
+                    maxOf(usable.top, usable.bottom - view.height).toDouble())
+                // Absolute requests from this gesture's real origin. Rapid MOVE events may arrive
+                // before native relayout: do not add each correction to an already-pending x/y.
+                movePanel(view, owner, params, (dragOffsetX + dragLeft).roundToInt(),
+                    (dragOffsetY + dragTop).roundToInt())
+            }
+        })
+        // Window-only moves need not change the View's local layout rectangle. Read the real
+        // screen coordinates before drawing too, not just in onLayoutChange or from requested x/y.
+        view.viewTreeObserver.addOnPreDrawListener {
+            if (!stopped && owner == panelOwner && panel === view && view.isAttachedToWindow) {
+                fitPanelBounds(view, owner, params, usable)
+                updatePanelOverlayBox(view, owner)
+            }
+            true
+        }
         // A waiting direct-read card is deliberately non-focusable: the external application must
         // keep window focus while the accessibility service is still reading it. Its footer buttons
         // remain touchable, so 划词 / 手动输入 / 退出 are still reachable; only Back is unavailable.
@@ -1745,25 +1846,38 @@ class CaptureService : Service() {
         view.addOnLayoutChangeListener { v, _, _, _, _, _, _, _, _ ->
             updatePanelOverlayBox(v, owner)
         }
-        // The IME (inline supplement/correction editors) and a rotation can shrink the usable region
-        // after the card is mounted. Re-cap the same card in a posted pass so the pinned footer is
-        // never clipped; only the body shrinks. The window stays centred (ADJUST_RESIZE already
-        // re-centres it inside the reduced display frame), so no manual y shift is applied twice.
+        // Keep CENTER gravity: positions below are corrections from the actual screen location,
+        // using the observed frame rather than hard-coded status-bar / IME offsets. A display-size
+        // change still retires the old card through resize().
         view.setOnApplyWindowInsetsListener { v, insets ->
+            val leftInset: Int
             val topInset: Int
+            val rightInset: Int
             val bottomInset: Int
             if (Build.VERSION.SDK_INT >= 30) {
-                val bars = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.ime())
-                topInset = bars.top; bottomInset = bars.bottom
+                val bars = insets.getInsets(WindowInsets.Type.systemBars() or
+                    WindowInsets.Type.displayCutout() or WindowInsets.Type.ime())
+                leftInset = bars.left; topInset = bars.top
+                rightInset = bars.right; bottomInset = bars.bottom
             } else {
+                @Suppress("DEPRECATION") leftInset = insets.systemWindowInsetLeft
                 @Suppress("DEPRECATION") topInset = insets.systemWindowInsetTop
+                @Suppress("DEPRECATION") rightInset = insets.systemWindowInsetRight
                 @Suppress("DEPRECATION") bottomInset = insets.systemWindowInsetBottom
             }
             v.post {
-                fitPanelHeight(v, width, params, topInset, bottomInset)
-                // fitPanelHeight can only republish a pre-layout centred estimate. Read the real
-                // window bounds after the inset pass so the frame mask follows what is covered.
-                updatePanelOverlayBox(v, owner)
+                if (!stopped && owner == panelOwner && panel === v) {
+                    val bars = frameBody()
+                    val next = PixelBox(maxOf(bars.left, leftInset), maxOf(bars.top, topInset),
+                        minOf(bars.right, screenWidth - rightInset),
+                        minOf(bars.bottom, screenHeight - bottomInset))
+                    if (next.width > 0 && next.height > 0 && next != usable) {
+                        (v as? OverlayCardLayout)?.cancelTitleDrag()
+                        usable = next
+                    }
+                    fitPanelBounds(v, owner, params, usable)
+                    updatePanelOverlayBox(v, owner)
+                }
             }
             insets
         }
@@ -1863,32 +1977,51 @@ class CaptureService : Service() {
         }
     }
 
-    /**
-     * Shrinks the mounted card to the region actually left by the IME / system bars.
-     *
-     * Only the body loses height: [OverlayCardLayout] measures the header and footer first, so the
-     * "划词 | 手动输入 | 退出" row stays laid out at every font scale and in landscape. The page-exclusion
-     * rectangle is updated to the window that is really covered, never to a larger one.
-     * Idempotent: a pass that would not change the height does nothing, so insets arriving in a
-     * burst cannot loop through relayout.
-     */
-    private fun fitPanelHeight(view: View, width: Int, params: WindowManager.LayoutParams,
-                               topInset: Int, bottomInset: Int) {
-        if (panel !== view || stopped) return
-        val usable = (screenHeight - topInset - bottomInset).coerceAtLeast(dp(200))
-        val cap = minOf(panelMaxHeight(), usable)
-        if (params.height <= cap) return
-        view.measure(View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
-            View.MeasureSpec.makeMeasureSpec(cap, View.MeasureSpec.AT_MOST))
-        val height = view.measuredHeight.coerceIn(1, cap)
-        if (height >= params.height) return
-        params.height = height
-        // Keep the chosen horizontal/vertical position; only the body's height shrinks. The real
-        // bounds are republished by updatePanelOverlayBox after this layout pass.
-        pageOverlayBoxes = listOf(PixelBox(panelLeft, panelTop,
-            (panelLeft + width).coerceAtMost(screenWidth),
-            (panelTop + height).coerceAtMost(screenHeight)))
-        runCatching { windows.updateViewLayout(view, params) }
+    /** Apply an absolute window request; page masks are published only from real screen bounds. */
+    private fun movePanel(view: View, owner: Long, params: WindowManager.LayoutParams,
+                          x: Int, y: Int) {
+        if (stopped || owner != panelOwner || panel !== view || !view.isAttachedToWindow) return
+        if (params.x == x && params.y == y) return
+        val oldX = params.x; val oldY = params.y
+        params.x = x; params.y = y
+        try {
+            windows.updateViewLayout(view, params)
+            view.post { updatePanelOverlayBox(view, owner) }
+        } catch (_: IllegalArgumentException) {
+            // A detached window cannot move; do not publish a requested rectangle as a real one.
+            params.x = oldX; params.y = oldY
+            (view as? OverlayCardLayout)?.cancelTitleDrag()
+        }
+    }
+
+    /** Shrink only if needed, then keep the entire real card inside system bars / the IME. */
+    private fun fitPanelBounds(view: View, owner: Long, params: WindowManager.LayoutParams,
+                               usable: PixelBox) {
+        if (stopped || owner != panelOwner || panel !== view || !view.isAttachedToWindow) return
+        val width = minOf(params.width, usable.width).coerceAtLeast(1)
+        val height = minOf(params.height, usable.height, panelMaxHeight()).coerceAtLeast(1)
+        if (width != params.width || height != params.height) {
+            (view as? OverlayCardLayout)?.cancelTitleDrag()
+            val oldWidth = params.width; val oldHeight = params.height
+            params.width = width; params.height = height
+            try {
+                windows.updateViewLayout(view, params)
+            } catch (_: IllegalArgumentException) {
+                params.width = oldWidth; params.height = oldHeight
+            }
+            // The size change also changes CENTER's origin. Clamp only after the next layout,
+            // against its real coordinates, rather than shifting twice using the old dimensions.
+            return
+        }
+        if (view.width <= 0 || view.height <= 0) return
+        val location = IntArray(2)
+        view.getLocationOnScreen(location)
+        val left = location[0].coerceIn(usable.left, maxOf(usable.left, usable.right - view.width))
+        val top = location[1].coerceIn(usable.top, maxOf(usable.top, usable.bottom - view.height))
+        if (left != location[0] || top != location[1]) {
+            (view as? OverlayCardLayout)?.cancelTitleDrag()
+            movePanel(view, owner, params, params.x + left - location[0], params.y + top - location[1])
+        }
     }
     private fun removePanelView() {
         // Every removal retires the old card owner, including replacement by a newer success card,
@@ -2390,9 +2523,11 @@ class CaptureService : Service() {
                 // revision is compared immediately around the actual dictionary+user read.
                 val before = app.repository.changes.version
                 val result = app.lookupWord(tap.word)
-                val user = (result as? LookupResult.Match)?.let { app.repository.userEntry(it.form) }
+                val users = (result as? LookupResult.Match)?.entries.orEmpty()
+                    .associate { it.key to app.repository.userEntry(it.key) }
+                val user = (result as? LookupResult.Match)?.entries?.singleOrNull()?.let { users[it.key] }
                 val after = app.repository.changes.version
-                LookupRead(result, user, after, before == after)
+                LookupRead(result, user, after, before == after, users)
             }
             main.post {
                 if (!inlineWordIsCurrent(guard)) return@post
@@ -2437,37 +2572,46 @@ class CaptureService : Service() {
                         }
                     }
                     is LookupResult.Match -> {
-                        val entry = result.entries.single()
-                        if (app.repository.deletions.isStale(entry.key, guard.credential)) {
-                            dropInlineWord(guard)
-                            screen.showWordMessage(tap.requestId,
-                                "查询已失效（词条已删除或数据已恢复），本次未查询、未收录。",
-                                retryable = true)
-                            return@post
+                        fun deliver(entry: DictionaryEntry) {
+                            if (!inlineWordIsCurrent(guard) || guard.saveAlreadyAdmitted()) return
+                            if (!readValue.isCurrent(app.repository.changes.version)) {
+                                dropInlineWord(guard)
+                                screen.showWordMessage(tap.requestId, "词义已更新，请重新点词；本次未收录。", retryable = true)
+                                return
+                            }
+                            if (app.repository.deletions.isStale(entry.key, guard.credential)) {
+                                dropInlineWord(guard)
+                                screen.showWordMessage(tap.requestId,
+                                    "查询已失效（词条已删除或数据已恢复），本次未查询、未收录。",
+                                    retryable = true)
+                                return
+                            }
+                            // Publish the entry key before the save so the deletion observer can bind a
+                            // later delete/restore to this exact displayed word. Never recapture. The
+                            // immutable read revision is bound to this request for the save admission.
+                            guard.key = entry.key
+                            guard.revision = readValue.revision
+                            screen.showWordFound(TranslationScreen.WordDisplay(
+                                requestId = tap.requestId,
+                                queried = result.form,
+                                headword = entry.headword,
+                                partOfSpeech = entry.partOfSpeech,
+                                meaning = entry.meaning,
+                                sourceNote = PersonalDictionary.label(entry) + "\n" +
+                                    PersonalDictionary.provenance(entry)
+                            ))
+                            // Only the first success delivery of this guard may enqueue the write. The
+                            // event identity is created once per accepted tap, so a hostile duplicate
+                            // closure cannot add a second event even if it runs before the first save.
+                            if (guard.admitSave()) {
+                                saveInlineWord(guard, QueryEvent(
+                                    guard.eventId, entry.key, guard.source, entry.key,
+                                    System.currentTimeMillis()
+                                ), entry)
+                            }
                         }
-                        // Publish the entry key before the save so the deletion observer can bind a
-                        // later delete/restore to this exact displayed word. Never recapture. The
-                        // immutable read revision is bound to this request for the save admission.
-                        guard.key = entry.key
-                        guard.revision = readValue.revision
-                        screen.showWordFound(TranslationScreen.WordDisplay(
-                            requestId = tap.requestId,
-                            queried = result.form,
-                            headword = entry.headword,
-                            partOfSpeech = entry.partOfSpeech,
-                            meaning = entry.meaning,
-                            sourceNote = PersonalDictionary.label(entry) + "\n" +
-                                PersonalDictionary.provenance(entry)
-                        ))
-                        // Only the first success delivery of this guard may enqueue the write. The
-                        // event identity is created once per accepted tap, so a hostile duplicate
-                        // closure cannot add a second event even if it runs before the first save.
-                        if (guard.admitSave()) {
-                            saveInlineWord(guard, QueryEvent(
-                                guard.eventId, entry.key, guard.source, result.form,
-                                System.currentTimeMillis()
-                            ), entry)
-                        }
+                        if (result.entries.size == 1) deliver(result.entries.first())
+                        else screen.showWordChoices(tap.requestId, result.form, result.entries, ::deliver)
                     }
                 }
             }
@@ -2628,9 +2772,11 @@ class CaptureService : Service() {
                 // snapshots; such a read is rejected rather than mixed or relabelled later.
                 val before = app.repository.changes.version
                 val result = app.lookupWord(form)
-                val user = (result as? LookupResult.Match)?.let { app.repository.userEntry(it.form) }
+                val users = (result as? LookupResult.Match)?.entries.orEmpty()
+                    .associate { it.key to app.repository.userEntry(it.key) }
+                val user = (result as? LookupResult.Match)?.entries?.singleOrNull()?.let { users[it.key] }
                 val after = app.repository.changes.version
-                LookupRead(result, user, after, before == after)
+                LookupRead(result, user, after, before == after, users)
             }
             main.post {
                 if (!sessionIsActive() || !gate.accepts(token)) return@post
@@ -2652,13 +2798,28 @@ class CaptureService : Service() {
                             } else showMissing(result.form, raw, replaces, credential)
                         }
                         is LookupResult.Match -> {
-                            val entry = result.entries.single()
-                            if (app.repository.deletions.isStale(entry.key, credential))
-                                showMessage("查询已失效（词条已删除或数据已恢复），本次未查询、未收录，请重新查询。", raw, replaces)
-                            else if (!read.isCurrent(app.repository.changes.version)) {
-                                perf.stage("dictionary", "stale")
-                                showMessage("查询已失效（词条或本机补充已更新），本次未查询、未收录，请重新查询。", raw, replaces)
-                            } else showDefinition(result.form, raw, entry, read.user, replaces, credential, manual)
+                            fun deliver(entry: DictionaryEntry) {
+                                if (!sessionIsActive() || !gate.accepts(token)) return
+                                if (app.repository.deletions.isStale(entry.key, credential))
+                                    showMessage("查询已失效（词条已删除或数据已恢复），本次未查询、未收录，请重新查询。", raw, replaces)
+                                else if (!read.isCurrent(app.repository.changes.version))
+                                    showMessage("查询已失效（词条或本机补充已更新），本次未查询、未收录，请重新查询。", raw, replaces)
+                                else showDefinition(result.form, raw, entry, read.users[entry.key], replaces, credential, manual, read.revision)
+                            }
+                            if (!read.isCurrent(app.repository.changes.version))
+                                showMessage("词义已更新，请重新查询；本次未收录。", raw, replaces)
+                            else if (result.entries.size == 1) deliver(result.entries.first())
+                            else {
+                                val card = compactCard("「${result.form}」请选择词义")
+                                card.body.addView(text("原词条与原型分别保留；选择前不收录。", 15f, Paper.secondary))
+                                var chosen = false
+                                for (entry in result.entries) card.body.addView(compactButton(
+                                    (if (entry.key == result.form) "原词条：" else "词形原型：") + entry.headword +
+                                        "\n" + entry.meaning.lineSequence().first().take(64)) {
+                                    if (!chosen && panel === card) { chosen = true; deliver(entry) }
+                                })
+                                mountCompactCard(card)
+                            }
                         }
                     }
                 }.onFailure {
@@ -2846,7 +3007,7 @@ class CaptureService : Service() {
     private fun submitManualInput(session: ManualInputSession, input: EditText, status: TextView) {
         if (stopped || !sessionIsActive() || session.closed || manualInputSession !== session) return
         val raw = input.text?.toString()?.trim().orEmpty()
-        val form = RawKajwebDictionary.normalize(raw)
+        val form = DictionaryKeys.normalize(raw)
         if (form == null || !RecognitionFeedback.hasLatinLetter(form)) {
             status.text = "请输入一个有效英文词头；空内容或无效输入不会查询或新增记录"
             status.setTextColor(Paper.error)
@@ -3116,12 +3277,13 @@ class CaptureService : Service() {
 
     private fun showDefinition(form: String, raw: String, entry: DictionaryEntry,
                                initialUser: UserDictionaryEntry?, replaces: String?,
-                               credential: Long, manual: Boolean = false) {
+                               credential: Long, manual: Boolean = false, readRevision: Long) {
         val token = gate.next()
         // The authority may be either the pixel lift guard or the direct-read text guard. Binding
         // only pageGuard would silently drop the text guard's save admission for direct-read words.
         val page = currentPageGuard()
-        val event = QueryEvent(UUID.randomUUID().toString(), entry.key, raw, form, System.currentTimeMillis())
+        val event = QueryEvent(UUID.randomUUID().toString(), entry.key, raw, entry.key, System.currentTimeMillis())
+        val saveCommitted = AtomicBoolean(false)
         val card = compactCard(entry.headword)
         // The save/undo status is the core feedback of this card, so it stays in the fixed header
         // (directly under the headword) and cannot be scrolled out of sight by a long meaning or an
@@ -3196,6 +3358,7 @@ class CaptureService : Service() {
         }
         content.viewTreeObserver.addOnDrawListener(drawListener)
         fun save() {
+            if (saveCommitted.get()) return
             // A stale card (word deleted after this query started) must not start/retry a save.
             if (definitionCardStale(guard)) { invalidateDefinition(guard); return }
             // Retry/initial save from an automatic OCR lookup may only run while the page accepted
@@ -3211,10 +3374,15 @@ class CaptureService : Service() {
                 // The page/card admission is re-read at the worker boundary and again inside the
                 // repository's pre-transaction predicate, so an invalidation on another thread
                 // cannot be lost between the main-thread comparison and the commit.
-                fun admittedNow(): Boolean = sessionIsActive() && gate.accepts(token) &&
+                if (saveCommitted.get()) return@execute
+                fun admittedNow(): Boolean = sessionIsActive() && gate.accepts(token) && !guard.invalid &&
+                    readRevision == app.repository.changes.version &&
+                    !app.repository.deletions.isStale(entry.key, credential) &&
                     (guard.manual || guard.page?.isValid == true)
-                if (!admittedNow()) return@execute
                 val result = runCatching { app.repository.record(event, entry, replaces, credential) { admittedNow() } }
+                // A queued duplicate must not invalidate the first successful commit after its
+                // own revision publication. Once committed this exact event is never re-submitted.
+                if (result.getOrNull() == true) saveCommitted.set(true)
                 main.post {
                     if (sessionIsActive() && gate.accepts(token) && definitionGuard === guard && !guard.invalid) {
                         val error = result.exceptionOrNull()
@@ -3290,10 +3458,11 @@ class CaptureService : Service() {
      */
     private fun compactCard(title: String): OverlayCardLayout {
         val card = OverlayCardLayout(this)
-        card.setPadding(dp(18), dp(14), dp(18), dp(12))
+        card.setPadding(dp(16), dp(12), dp(16), dp(12))
         card.background = shape(Paper.surface, border = true)
         card.setTitle(title)
-        card.body.setPadding(0, dp(4), 0, dp(4))
+        card.showTitleDragHint()
+        card.body.setPadding(0, dp(10), 0, dp(8))
         card.footer.setPadding(0, dp(10), 0, 0)
         return card
     }

@@ -9,9 +9,9 @@ import java.util.Locale
 import java.util.zip.GZIPInputStream
 
 /** Only the original kajweb asset. No reviewed overrides, demo fallback or inferred word forms. */
-class RawKajwebDictionary private constructor(private val entries: Map<String, DictionaryEntry>) {
-    val entryCount get() = entries.size
-    val aliasCount get() = 0
+class RawKajwebDictionary private constructor(private val entries: Map<String, DictionaryEntry>) : DictionaryStore {
+    override val entryCount get() = entries.size
+    override val aliasCount get() = 0
 
     data class Manifest(val assetSha256: String, val entryCount: Int, val aliasCount: Int,
                         val source: String = SOURCE, val version: String = VERSION)
@@ -31,7 +31,7 @@ class RawKajwebDictionary private constructor(private val entries: Map<String, D
      * Keyed lookup used by the study index: [normalizedKey] already matches the entry-key form; this
      * never invents a form or falls back. Returns null when the key is not in the pinned dictionary.
      */
-    fun entry(normalizedKey: String): DictionaryEntry? = normalize(normalizedKey)?.let { entries[it] }
+    override fun entry(normalizedKey: String): DictionaryEntry? = normalize(normalizedKey)?.let { entries[it] }
 
     companion object {
         const val FORMAT = "SHICI_KAJWEB"
@@ -54,12 +54,14 @@ class RawKajwebDictionary private constructor(private val entries: Map<String, D
 
         fun label(source: String, version: String): String = when {
             source == DemoDictionary.SOURCE && version == DemoDictionary.VERSION -> "自编演示词库（旧记录）"
+            source == EcdictInfo.SOURCE -> "ECDICT 大词库 · 未逐条核对"
             source == SOURCE -> "原始词库 · 未逐条核对"
             else -> "历史词源 · 核对状态未确认"
         }
 
         fun reviewNotice(source: String, version: String): String = when {
             source == DemoDictionary.SOURCE && version == DemoDictionary.VERSION -> "自编演示数据，仅用于原型流程验证；不是正式考试词典。"
+            source == EcdictInfo.SOURCE -> EcdictInfo.NOTICE
             source == SOURCE -> NOTICE
             else -> "历史词源记录，核对状态未确认；不代表官方大纲全覆盖。"
         }

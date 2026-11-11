@@ -1,3 +1,12 @@
+## 2026-11-11 双端界面升级与手机版追平（2.7.0/54，本地有限验收，未安装发布）
+
+- 平板：窄侧栏、底部独立设置，宽屏生词列表/详情分栏；手机：固定“查词 / 生词本 / 复习 / 更多”，保短横屏、IME及弹窗高度保护。全部原路由和四排序仍可达，收藏/移除沿原保护链。
+- 手机不只抬版本：同步主线完整ECDICT/词形查询、划词准备重试与结果卡拖动；默认每日合计20、四选一、学习schema/备份和原词书合同不改。
+- 双端三目标编译通过；独立实际Sol/high首轮28控制为27PASS/1夹具FAIL，手机补词未达尾部在独立新域1PASS闭合，原27/1不倒填。这是本地有限宿主/源码结论，真实测量/触控/IME、大字旋转、物理笔与长期使用未验；原失败和大幅滚屏已知问题保持。
+- 用户授权GPT本批直接实施，无外部AI、设备/学习实库/服务器操作；尚未安装或更新官网，平板/公开包最后已知仍2.6.1/52。主线准确提交后按现private跟踪分支推送；手机无upstream不擅选远端，Git以真实回执为准。
+
+详[双端界面升级工作记录](工作记录/20261111-3-双端界面升级工作记录.md)；原四草稿content/index、815B原件及手机原记录保持，所有数据库/APK/私有证据/签名不入Git。沿用主方案17.19.4，不另建重复路线。
+
 # 拾词 · Android 演示原型
 
 ## 当前修复版：2.6.1 / versionCode 52（2026-10-29，有限验收通过）
@@ -720,3 +729,22 @@ GRADLE_USER_HOME="$PWD/.tools/gradle-home" \
 - integrate：`ui/MainActivity.kt` 精简首页状态与功能卡、生词本导出范围、生词详情说明、统计口径、设置词库状态与版本显示；`ui/VocabularyActions.kt` 缩短列表级移除说明，逐词移除与原有范围选择/二次确认流程不变。
 
 五路（layout / lookup / translation / study 四路实现 + integrate 整合）已完整实现并写入当前源码。四路交付的实际模型均为普通 `commandcode-plan/deepseek/deepseek-v4.1-flash-1017`；study 交付曾自报 Fast，按实际路由记录为准。执行者已实际执行离线三编译（`assembleDebug`、`compileDebugUnitTestKotlin`、`assembleDebugAndroidTest`，只编译、不运行任何单元/仪器/功能测试）：exit 0，脚本计时 **32.77 秒**（Gradle `BUILD SUCCESSFUL in 32s`，67 tasks），source-01 主 APK SHA256 `bb7fd69a5bb16c347b12e27b23470ed6ca81c082b418bddba608cffedeab259d`；编译由本批执行者完成，不由验收者承担产品编译。首轮新的实际 `gpt-6.1-sol` / `high` 独立有界验收事前锁定 28 个唯一 ID，唯一 `run-01` 为 **27 PASS / 1 FAIL / 0 ERROR / 0 SKIP**（动态宿主 26 项 25/1，另 2 项 source-audit PASS）；唯一失败 `UI-SIMPLIFY-T01` 是 Missing 时结果卡已隐藏但复制按钮对象仍 `isEnabled=true`，未满足“未就绪复制禁用”的属性合同，没有可见误点、复制或数据泄漏证据。该失败已在本批按原断言修正（复制按钮显式引用、render 同步准入、close 同步禁用），**仍待新的独立受影响复验**，不宣称本批全部通过；原 27/1 报告与证据保持冻结，不改断言凑绿。未安装、未连接平板、未做原生 UI/SDK/真实模型/真实设备验收；原生平板与 SDK 层仍待验证。当前状态与验收进度以 `docs/原型验收清单.md`、`docs/原型开发进度.md` 及同批交付 `.tools/validation/20261025-ui-simplify/delivery-copy-fix.md` 的最新记录为准。
+
+## 手机窄屏适配候选（2026-10-29，基于 2.6.1 / versionCode 52，独立手机候选，不是正式发布）
+
+本节只追加本批手机适配事实，不改写上文任何历史结论；版本名/版本码、appID、签名/权限、Gradle、数据结构与全部原测试均未改。基线为 `codex/phone-adaptation` 分支 `803c4eade5246c067d942604c41da352bb0ddf31`（2.6.1/52），只改以下 9 个产品路径：`ui/MainActivity.kt`、`ui/MainNavigation.kt`、`ui/SettingsScreen.kt`、`ui/StudyScreen.kt`、`ui/Ui.kt`、`ui/UsageGuideScreen.kt`、`ui/VocabularySortView.kt`、`ui/VocabularyToolbar.kt` 与本 README。
+
+- 导航：窄屏底部导航改为**一行**横向滚动，设置作为同一行最后一个入口；行实际溢出时才显示“← 左右滑动查看全部入口 →”并显示横向滚动条，选中项在布局后滚入可见区（已可见时不动），每个入口 ≥48dp。宽屏 216dp 侧栏只在宽度 ≥840dp **且**高度 ≥480dp 时使用，手机短横屏不再误切侧栏。全部稳定入口 ID/点击回调未改。
+- 键盘：API 30+ 按 IME 可见性隐藏/恢复窄屏底导航；API 26–29 以不被键盘缩小的窗口 `screenHeightDp` 参考高度与 `getWindowVisibleDisplayFrame` 比较做同样切换。只改 `View.visibility`，不 render/重建/重查/清草稿；宽屏侧栏不受影响。
+- 背词目标：`每日新词目标` 与 `−5 / 值 / +5` 在窄屏或 fontScale≥1.3 时分两层；`setGoal`、默认 20、范围、调度、四选一答题与提交链未改。最新四选一选项按钮本身已按整行有效宽度呈现，没有恢复旧版“认识/模糊/忘记”行。
+- 生词本：四向排序芯片在窄屏/大字下为“排序”标签 + 完整可横向滚动芯片条（每个 ≥48dp），宽屏仍等分；`VocabularyToolbar` 的“全部/仅收藏、管理与导出/完成、排序”语义、回调与显隐未改，仅 filter/manage 在该条件下分层。词条正文占满整行、勾选/更多操作下移一行；导出面板仍只在“管理与导出”时出现，显式零、删除 scope/二次确认与全部闭包凭据保留。
+- 设置与引导：悬浮窗/通知权限“标题 + 状态徽章”在窄屏/大字分层，徽章对象与 `updatePermissionStatus` 原地更新不变；引导场景选择在该条件下每项一行，场景回调、动画生命周期（`onHostResume`/`onHostPause`/`close`）与设置/帮助入口未改，底部“上一步/下一步”与“跳过/完成”保持原两行布局（按当前内边距/字号估算在 320dp/fontScale 2.0 下可容纳，未真机验证）。
+- 对话框：`paperDialog` 仍用 `ScrollView`；`showPaperDialog` 先按内容 wrap，再由每个对话框自己的 `DialogHeightGuard` 按当前可见高度限制高，键盘收起可回 wrap；dismiss 时 detach 自身两个监听并拒旧 dialog 迟回调，高度只在变化超过 8dp 时重设，不形成布局循环；保存/恢复/删除/owner 业务链未改。
+- 共用判断：`ui/Ui.kt` 新增 `PaperLayout`（`COMPACT_MAX_WIDTH_DP = 600`、`LARGE_FONT_SCALE = 1.3f`）、`Context.compactWidth`、`Context.stackedActions`，只决定是否分层，不缩字体、不新增截断、不读写状态。词条原有的单行释义省略是 2.6.1 既有卡片设计，本批保留。
+
+### 本批编译与边界
+
+- 唯一编译路线：`python3 .tools/phone-sync-20261029/compile-phone.py`（只读复用现有离线缓存与打包词库资产，只 `assembleDebug` + `compileDebugUnitTestKotlin` + `assembleDebugAndroidTest`，不运行任何测试）。
+- **run 01（最终）**：candidate **`candidate-01`**，**exit 0**，脚本计时 **51.92 秒**（Gradle `BUILD SUCCESSFUL in 51s`，`67 actionable tasks: 67 executed`），Kotlin `e:` 错误 **0**。三段任务均实际执行；主 APK 为 `candidate-01/app/build/outputs/apk/debug/app-debug.apk`，**SHA256 `ae8378bc8c776a4607d59cc76337c15d7cbb647ad411259330d71b9c67a7cfc1`**（110,685,905 字节）；仪器测试包 `app-debug-androidTest.apk` SHA256 `a804894703417d6584fb01be7a1b3e80f2217b6b1b55560752f618b768332c5f`（500,009 字节）。
+- 编译后产品路径只追加本 README 段（另在 `.tools/phone-sync-20261029/` 写私有 `delivery.md`，不属产品源）；候选快照中的 **178 个非 README phone-source 条目在工作树中逐 hash 相同**，8 个手机源码文件即上述路径，未因 README 文案再编译。
+- 这是执行端语法交付，不是独立功能验收，也未安装：未连设备/adb、未跑任何单元/仪器/逻辑测试、未读学习实库、未改词库原资产、未提交/推送/暂存、未建 worktree。320/360/393/412dp 与 fontScale 1.3/1.5/2.0 的真实布局、选中项滚动手感、真实 IME/系统栏与键盘收起回 wrap、API 26–29 回退、平板宽屏回归均未真机验证。

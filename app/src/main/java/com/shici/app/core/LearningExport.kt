@@ -214,6 +214,8 @@ object LearningExportText {
         }
         val allKnown = words.isNotEmpty() && words.all { it.knownExportSource() }
         return when {
+            words.any { it.source == EcdictInfo.SOURCE } ->
+                "ECDICT 大词库未逐条核对；历史记录按各自来源标注"
             words.any { it.source == RawKajwebDictionary.SOURCE } ->
                 "原始词库未逐条核对；历史记录按各自来源标注"
             allDemo -> "自编演示数据，仅用于原型流程验证"

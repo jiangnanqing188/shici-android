@@ -94,7 +94,7 @@ class SettingsScreen(
     init {
         val content = context.column()
         content.addView(context.text("设置", 28f, Paper.ink, true))
-        content.space(16)
+        content.space(12)
 
         // 高频优先：正在进行的查词会话和停止动作最先可见，其次才是两个权限入口。
         val session = section(context, "查词与权限")
@@ -106,28 +106,22 @@ class SettingsScreen(
         session.space(12)
         session.divider()
 
-        val overlayRow = context.row().apply { gravity = Gravity.CENTER_VERTICAL }
-        overlayRow.addView(
-            context.text("悬浮窗权限", 17f, Paper.ink, true),
-            LinearLayout.LayoutParams(0, -2, 1f)
-        )
+        // 悬浮窗/通知权限：窄屏或大字时标题与状态徽章分层，徽章不会把标题挤成一列窄字。
+        // 只改排布；按钮仍调用同一个系统设置入口回调，不申请、不打开捕获。
         overlayBadge = permissionBadge(context, overlayStatus)
-        overlayRow.addView(overlayBadge, LinearLayout.LayoutParams(-2, -2))
-        session.addView(overlayRow)
+        session.addView(
+            statusLine(context, "悬浮窗权限", overlayBadge)
+        )
         session.addView(
             context.button("打开系统悬浮窗权限设置") { onOpenOverlayPermission() },
             LinearLayout.LayoutParams(-1, -2)
         )
         session.divider()
 
-        val notificationRow = context.row().apply { gravity = Gravity.CENTER_VERTICAL }
-        notificationRow.addView(
-            context.text("通知权限", 17f, Paper.ink, true),
-            LinearLayout.LayoutParams(0, -2, 1f)
-        )
         notificationBadge = permissionBadge(context, notificationStatus)
-        notificationRow.addView(notificationBadge, LinearLayout.LayoutParams(-2, -2))
-        session.addView(notificationRow)
+        session.addView(
+            statusLine(context, "通知权限", notificationBadge)
+        )
         session.addView(
             context.button("打开系统通知设置") { onOpenNotificationSettings() },
             LinearLayout.LayoutParams(-1, -2)
@@ -381,9 +375,30 @@ class SettingsScreen(
             }
         }
 
+    /**
+     * A settings row whose label and status badge share one line when they fit, and stack when the
+     * window is narrow or the text is enlarged. Only the arrangement differs; the badge view is the
+     * same object the host later updates in place, so [updatePermissionStatus] keeps working without
+     * rebuilding anything.
+     */
+    private fun statusLine(context: Context, label: String, badge: TextView): LinearLayout {
+        val title = context.text(label, 17f, Paper.ink, true)
+        if (!context.stackedActions()) {
+            return context.row().apply {
+                gravity = Gravity.CENTER_VERTICAL
+                addView(title, LinearLayout.LayoutParams(0, -2, 1f))
+                addView(badge, LinearLayout.LayoutParams(-2, -2))
+            }
+        }
+        return context.column().apply {
+            addView(title, LinearLayout.LayoutParams(-1, -2))
+            addView(badge, LinearLayout.LayoutParams(-2, -2))
+        }
+    }
+
     private fun section(context: Context, title: String): LinearLayout =
         context.column().apply {
-            setPadding(context.dp(20), context.dp(20), context.dp(20), context.dp(20))
+            setPadding(context.dp(16), context.dp(16), context.dp(16), context.dp(16))
             background = context.shape(Paper.surface, border = true)
             addView(context.text(title, 20f, Paper.ink, true))
             space(8)

@@ -6,6 +6,7 @@ import android.app.Activity
 import android.app.AlertDialog
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Rect
 import android.graphics.Typeface
 import android.media.projection.MediaProjectionConfig
 import android.media.projection.MediaProjectionManager
@@ -49,7 +50,8 @@ private data class LookupRead(
     val result: LookupResult,
     val user: UserDictionaryEntry?,
     val revision: Long,
-    val stable: Boolean
+    val stable: Boolean,
+    val users: Map<String, UserDictionaryEntry?> = emptyMap()
 ) {
     fun isCurrent(now: Long): Boolean = stable && revision == now
 }
@@ -59,6 +61,11 @@ class MainActivity : Activity() {
         private const val OVERLAY_PERMISSION = 10
         private const val CAPTURE_PERMISSION = 11
         private const val NOTIFICATION_PERMISSION = 12
+        /**
+         * Minimum usable window height for the 216dp sidebar. A phone in landscape can exceed the
+         * 840dp width rule while staying short; the sidebar there would leave almost no page area.
+         */
+        private const val MIN_SIDEBAR_HEIGHT_DP = 480
         // Row-menu item ids for the vocabulary list (see showVocabularyRowMenu).
         private const val MENU_FAVORITE = 1
         private const val MENU_REMOVE = 2
@@ -308,6 +315,9 @@ class MainActivity : Activity() {
     private var dictionaryStatusView: TextView? = null
     private var dictionaryDetailView: TextView? = null
     private var activeDialog: AlertDialog? = null
+    // Height guard of the dialog currently shown. It is replaced with each new dialog and detached
+    // by its own dismiss listener, so a dismissed dialog can never re-lay out over its successor.
+    private var dialogHeightGuard: DialogHeightGuard? = null
     // One scoped-delete flow at a time. Every dialog keeps its own identity: a late dismiss can
     // settle only the flow it belongs to, and the admission is invalidated by page navigation,
     // onStop and onDestroy before any transaction that has not been admitted yet.
@@ -336,7 +346,8 @@ class MainActivity : Activity() {
     }
     @Volatile private var deleteFlow: DeleteFlow? = null
     private var stopCaptureButton: Button? = null
-    private val wide get() = resources.configuration.screenWidthDp >= 840
+    private val wide get() = resources.configuration.screenWidthDp >= 840 &&
+        resources.configuration.screenHeightDp >= MIN_SIDEBAR_HEIGHT_DP
     private val contentWidthDp get() = resources.configuration.screenWidthDp - (if (wide) 216 + 64 else 40)
     private val splitContent get() = contentWidthDp >= 840 && resources.configuration.fontScale <= 1.3f
     private fun inlineAt(widthDp: Int) = widthDp >= 440 * resources.configuration.fontScale
@@ -630,16 +641,24 @@ class MainActivity : Activity() {
         root.setBackgroundColor(Paper.background)
         root.setOnApplyWindowInsetsListener { view, insets ->
             if (Build.VERSION.SDK_INT >= 30) {
+                // Same padding math as before (system bars or IME, whichever is larger), so the
+                // system bars and the keyboard keep exactly their original padding.
                 val bars = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.ime())
                 view.setPadding(bars.left, bars.top, bars.right, bars.bottom)
+                // Phone layout only: the single-row navigation is hidden while the keyboard is up
+                // so the input and its primary action keep the remaining height. This is visibility
+                // only; the page, its draft, its queries and its scroll position are untouched.
+                applyCompactNavForKeyboard(insets.isVisible(WindowInsets.Type.ime()))
             } else {
                 @Suppress("DEPRECATION")
                 view.setPadding(insets.systemWindowInsetLeft, insets.systemWindowInsetTop,
                     insets.systemWindowInsetRight, insets.systemWindowInsetBottom)
+                // Before API 30 the IME inset is not distinguishable; the layout listener installed
+                // below performs the same phone-only visibility switch from the visible frame.
             }
             insets
         }
-        body = column().apply { setPadding(dp(if (wide) 32 else 20), dp(24), dp(if (wide) 32 else 20), dp(12)) }
+        body = column().apply { setPadding(dp(if (wide) 32 else 20), dp(16), dp(if (wide) 32 else 20), dp(12)) }
         // One navigation component owns both layouts. Its ids are the stable MainPage names, so a
         // restored/legacy selection never depends on display order or a child index.
         navigation = MainNavigation(
@@ -656,10 +675,56 @@ class MainActivity : Activity() {
         } else {
             root.addView(body, LinearLayout.LayoutParams(-1, 0, 1f))
             root.addView(navigation.view, LinearLayout.LayoutParams(-1, -2))
+            if (Build.VERSION.SDK_INT < 30) installLegacyKeyboardProbe()
         }
         setContentView(root)
         root.requestApplyInsets()
         render()
+    }
+
+    /**
+     * Phone-only keyboard rule. Wide (sidebar) navigation never changes here, and nothing but
+     * [View.getVisibility] is touched: no page rebuild, no re-query, no draft or state reset.
+     */
+    private fun applyCompactNavForKeyboard(keyboardVisible: Boolean) {
+        if (wide) return
+        // Insets may be dispatched before the shell finishes building; nothing to do then.
+        if (!this::navigation.isInitialized) return
+        val nav = navigation.view
+        val wanted = if (keyboardVisible) View.GONE else View.VISIBLE
+        if (nav.visibility != wanted) nav.visibility = wanted
+    }
+
+    /**
+     * Pre-API-30 fallback. These versions resize the window instead of reporting an IME inset, so
+     * `root.height` itself already shrinks with the keyboard and a `root.height - visibleFrame`
+     * difference would stay at zero and never hide the navigation.
+     *
+     * The reference height is therefore taken from the current window configuration
+     * (`screenHeightDp`), which describes the app window, is not shrunk by the IME, follows a
+     * rotation or a multi-window resize, and is never the whole display in split screen. The
+     * visible frame is read on every pass, so nothing is cached across rotations. A generous
+     * threshold (20% of the reference, at least 72dp) keeps status/navigation bars from ever being
+     * mistaken for a keyboard while still catching a real one, which is far taller.
+     *
+     * Only [applyCompactNavForKeyboard] is called: visibility only, never a render/re-query/rebuild,
+     * and the wide (sidebar) layout is untouched because that function returns early for it.
+     */
+    private fun installLegacyKeyboardProbe() {
+        root.viewTreeObserver.addOnGlobalLayoutListener {
+            if (isFinishing || isDestroyed || wide) return@addOnGlobalLayoutListener
+            val frame = Rect()
+            root.getWindowVisibleDisplayFrame(frame)
+            val frameHeight = frame.height()
+            if (frameHeight <= 0) return@addOnGlobalLayoutListener
+            // Read live every pass: a rotated or resized window always contributes its own height
+            // instead of a stale portrait value kept from before the configuration change.
+            val referencePx = (resources.configuration.screenHeightDp * resources.displayMetrics.density).toInt()
+                .takeIf { it > 0 } ?: resources.displayMetrics.heightPixels
+            if (referencePx <= 0) return@addOnGlobalLayoutListener
+            val threshold = maxOf((referencePx * 0.2f).toInt(), dp(72))
+            applyCompactNavForKeyboard(referencePx - frameHeight > threshold)
+        }
     }
 
     // Navigation rendering is a single delegation: MainNavigation restyles its own buttons in place
@@ -725,16 +790,16 @@ class MainActivity : Activity() {
 
     private fun loadDictionaryStatus() {
         app.worker.execute {
-            val result = app.dictionary
+            val result = app.lookupDictionary
             main.post {
                 if (isDestroyed) return@post
                 // The first screen shows one short status; the full counts stay available in the
                 // collapsed "词库校验详情" next to it. A failure stays fully visible, never hidden.
                 dictionarySummary = result.fold(
-                    { "原始词库已校验可用" },
+                    { "ECDICT 大词库已校验可用" },
                     { "词库不可用：${it.message}；不会生成释义或新增查询记录" })
                 dictionaryDetail = result.fold(
-                    { "已校验 ${it.entryCount} 个原始词头 · ${it.aliasCount} 个词形别名（仅格式与完整性校验）" },
+                    { "已校验 ${it.entryCount} 个可检索词头 · ${it.aliasCount} 组词形关系（仅格式与完整性校验）" },
                     { "词库不可用：${it.message}；不会生成释义或新增查询记录" })
                 dictionaryStatusView?.text = dictionarySummary
                 dictionaryDetailView?.text = dictionaryDetail
@@ -794,12 +859,13 @@ class MainActivity : Activity() {
         return content
     }
     private fun panel(): LinearLayout = column().apply {
-        setPadding(dp(24), dp(24), dp(24), dp(24)); background = shape(Paper.surface, border = true)
+        val inset = if (compactWidth()) 16 else 24
+        setPadding(dp(inset), dp(inset), dp(inset), dp(inset)); background = shape(Paper.surface, border = true)
     }
     private fun home() {
         val content = scrolled()
-        content.addView(text("专注阅读，随手拾词", 16f, Paper.secondary))
-        content.addView(text("让生词停在这里", if (wide) 36f else 28f, Paper.ink, true)); content.space(24)
+        content.addView(text("拾词", 28f, Paper.ink, true))
+        content.addView(text("专注阅读，随手拾词", 15f, Paper.secondary)); content.space(12)
         // Non-blocking first-use recommendation. It never opens by itself, never steals focus and
         // only writes the independent guide preference when the user taps "跳过，不再提示".
         if (!guideSeen()) {
@@ -808,7 +874,7 @@ class MainActivity : Activity() {
                 onOpenGuide = { selectPage(MainPage.GUIDE) },
                 onDismiss = { markGuideSeen(); render() }
             ))
-            content.space(16)
+            content.space(12)
         }
         val session = panel()
         val heading = row().apply { gravity = Gravity.CENTER_VERTICAL }
@@ -831,22 +897,14 @@ class MainActivity : Activity() {
             addView(text("开启后，点悬浮「词」，直接在题目页面上划一笔查词。", 15f, Paper.secondary))
             addView(text("不需要悬浮权限时，也可以到「查词」页手动输入。", 15f, Paper.secondary))
         })
-        content.addView(session); content.space(24)
-        content.addView(text("主要功能", 22f, bold = true)); content.space(8)
-        content.addView(entryCard("查词", "输入或划词查询；缺词可新增词义。") { selectPage(MainPage.LOOKUP) })
+        content.addView(session); content.space(12)
+        content.addView(entryCard("手动查词", "输入英文单词，查看本机词义。") { selectPage(MainPage.LOOKUP) })
         content.space(8)
-        // Optional-component privacy details live on the translation page and in Settings, not here.
-        content.addView(entryCard("离线 AI 翻译（可选组件）", "可选组件，确认后才下载模型；其他功能不依赖它。") { selectPage(MainPage.TRANSLATION) })
-        content.space(8)
-        content.addView(entryCard("添加/补词", "只维护本机个人词义，不产生查询或复习记录。") { selectPage(MainPage.PERSONAL_ENTRY) })
-        content.space(8)
-        content.addView(entryCard("生词本", "查看和管理已收录的生词。") { selectPage(MainPage.VOCABULARY) })
-        content.space(8)
-        content.addView(entryCard("复习", "看英文词，从四个中文释义中选一个。") { selectPage(MainPage.STUDY) })
-        content.space(8)
-        content.addView(entryCard("统计", "查看真实查询与复习进度。") { selectPage(MainPage.STATISTICS) })
-        content.space()
-        content.addView(text("打开悬浮查词 → 点「词」→ 划一笔 → 抬笔即查", 16f, Paper.secondary))
+        content.addView(entryCard("继续复习", "接着今天已保存的学习进度。") { selectPage(MainPage.STUDY) })
+        content.space(12)
+        content.addView(dictionaryStatus())
+        content.space(12)
+        content.addView(text("补词、翻译、统计、使用引导和设置，请从「更多」进入。", 14f, Paper.secondary))
         statusListener(CaptureStatus.state)
     }
     private fun entryCard(title: String, description: String, action: () -> Unit): View = column().apply {
@@ -1195,44 +1253,49 @@ class MainActivity : Activity() {
      * ([toggleListFavorite] and [openListRemoval] → scope chooser + second confirmation).
      */
     private fun vocabularyRow(word: LearnedWord, action: () -> Unit): View {
-        val container = row().apply { gravity = Gravity.CENTER_VERTICAL; minimumHeight = dp(64) }
-        if (vocabularyManaging) {
-            val check = CheckBox(this).apply {
-                // The default scope is "all current results", so under that intent every visible
-                // row really is in scope and is shown checked. Nothing is written by rendering it.
-                isChecked = !exportSelectionExplicit || word.entry.key in exportSelection
-                contentDescription = "勾选导出 ${word.entry.headword}"
-                setOnCheckedChangeListener { _, checked ->
-                    // The first real edit materialises the visible default scope before applying
-                    // the change, so unchecking one row means "all of this filter except it" instead
-                    // of collapsing into an accidental zero. From then on the set is the explicit
-                    // allow-list: unchecking the last row stays an explicit 0, never "all".
-                    if (!exportSelectionExplicit) {
-                        exportSelection.clear()
-                        exportSelection.addAll(filteredWords().map { it.entry.key })
-                        exportSelectionExplicit = true
-                    }
-                    if (checked) exportSelection += word.entry.key else exportSelection -= word.entry.key
-                    refreshListSummary()
-                    updateExportButton()
-                }
-            }
-            container.addView(check)
+        // Layout only: in a phone-width window (or with enlarged text) the word text keeps the full
+        // row width and the checkbox/overflow actions move to a second line, so a long headword or
+        // a long meaning line is never squeezed into a narrow middle column. The wide row is
+        // unchanged. Every control keeps its original binding, closed-over snapshot and menu flow.
+        val stacked = resources.configuration.fontScale >= PaperLayout.LARGE_FONT_SCALE || contentWidthDp < 300
+        val container = (if (stacked) column() else row()).apply {
+            if (!stacked) gravity = Gravity.CENTER_VERTICAL
+            minimumHeight = dp(64)
         }
+        val check = if (vocabularyManaging) CheckBox(this).apply {
+            // The default scope is "all current results", so under that intent every visible
+            // row really is in scope and is shown checked. Nothing is written by rendering it.
+            isChecked = !exportSelectionExplicit || word.entry.key in exportSelection
+            contentDescription = "勾选导出 ${word.entry.headword}"
+            setOnCheckedChangeListener { _, checked ->
+                // The first real edit materialises the visible default scope before applying
+                // the change, so unchecking one row means "all of this filter except it" instead
+                // of collapsing into an accidental zero. From then on the set is the explicit
+                // allow-list: unchecking the last row stays an explicit 0, never "all".
+                if (!exportSelectionExplicit) {
+                    exportSelection.clear()
+                    exportSelection.addAll(filteredWords().map { it.entry.key })
+                    exportSelectionExplicit = true
+                }
+                if (checked) exportSelection += word.entry.key else exportSelection -= word.entry.key
+                refreshListSummary()
+                updateExportButton()
+            }
+        } else null
         // Light, glanceable metadata only: how often and how recently it was looked up, plus a star
         // when it is favorited. An unstarred word says nothing rather than adding a second marker;
         // mastery, full timestamps and provenance stay in the detail.
         val meta = buildList {
             add("${word.queryCount} 次")
             add(compactTime(word.lastAt))
-            if (word.favorite) add("★ 已收藏")
+            if (word.favorite) add("已收藏")
         }.joinToString(" · ")
         val body = column().apply {
             setPadding(dp(4), dp(8), dp(4), dp(8)); isClickable = true; isFocusable = true
             addView(text(word.entry.headword, 21f, bold = true).apply {
                 typeface = Typeface.create("serif", Typeface.BOLD)
             })
-            addView(text("${word.entry.partOfSpeech} ${word.entry.meaning}", 15f, Paper.secondary).apply {
+            addView(text("${word.entry.partOfSpeech} ${word.entry.meaning.lineSequence().firstOrNull().orEmpty()}", 15f, Paper.secondary).apply {
                 maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END
             })
             addView(text(meta, 13f, if (word.favorite) Paper.warning else Paper.secondary))
@@ -1240,7 +1303,6 @@ class MainActivity : Activity() {
             contentDescription = "${word.entry.headword}，${word.entry.partOfSpeech} ${word.entry.meaning}，" +
                 "$meta，${if (word.favorite) "已收藏" else "未收藏"}，点按查看详情"
         }
-        container.addView(body, LinearLayout.LayoutParams(0, -2, 1f))
         // One 48dp overflow entry per row; removal and favorite stay discoverable without a row of
         // large buttons or a repeated explanation.
         val more = Button(this).apply {
@@ -1249,11 +1311,39 @@ class MainActivity : Activity() {
             isAllCaps = false
             minWidth = dp(48); minHeight = dp(48)
             setTextColor(Paper.secondary)
-            background = shape(Paper.lightGreen, 8)
+            background = shape(Paper.surface, 8)
+            setPadding(0, dp(8), 0, dp(8))
+            minimumWidth = dp(48)
             contentDescription = "更多操作 ${word.entry.headword}"
             setOnClickListener { showVocabularyRowMenu(this, word) }
         }
-        container.addView(more)
+        val favorite = button(if (word.favorite) "★" else "☆") { toggleListFavorite(word) }.apply {
+            textSize = 23f
+            setPadding(0, dp(8), 0, dp(8))
+            minWidth = dp(48); minimumWidth = dp(48)
+            setTextColor(if (word.favorite) Paper.green else Paper.secondary)
+            background = shape(Paper.surface, 8)
+            contentDescription = "${if (word.favorite) "取消收藏" else "收藏"} ${word.entry.headword}"
+        }
+        if (stacked) {
+            // Text first with the whole width, then one action line: the checkbox keeps its
+            // explicit export-selection semantics and the overflow menu keeps its exact flows.
+            container.addView(body, LinearLayout.LayoutParams(-1, -2))
+            val actions = row().apply { gravity = Gravity.CENTER_VERTICAL }
+            if (check != null) {
+                actions.addView(check, LinearLayout.LayoutParams(0, -2, 1f))
+            } else {
+                actions.addView(View(this), LinearLayout.LayoutParams(0, -2, 1f))
+            }
+            actions.addView(favorite, LinearLayout.LayoutParams(dp(48), -2))
+            actions.addView(more, LinearLayout.LayoutParams(dp(48), -2))
+            container.addView(actions, LinearLayout.LayoutParams(-1, -2))
+        } else {
+            if (check != null) container.addView(check)
+            container.addView(body, LinearLayout.LayoutParams(0, -2, 1f))
+            container.addView(favorite, LinearLayout.LayoutParams(dp(48), -2))
+            container.addView(more, LinearLayout.LayoutParams(dp(48), -2))
+        }
         return container
     }
     /** Row menu: only the existing exact flows, chosen per row; it never deletes or edits by itself. */
@@ -1261,7 +1351,7 @@ class MainActivity : Activity() {
         if (page != MainPage.VOCABULARY || !foreground || isFinishing || isDestroyed) return
         val menu = PopupMenu(this, anchor)
         menu.menu.add(0, MENU_FAVORITE, 0, if (word.favorite) "取消收藏" else "收藏")
-        menu.menu.add(0, MENU_REMOVE, 1, VocabularyActions.LIST_LABEL)
+        menu.menu.add(0, MENU_REMOVE, 1, "从生词本移除…")
         menu.setOnMenuItemClickListener { item ->
             when (item.itemId) {
                 MENU_FAVORITE -> toggleListFavorite(word)
@@ -1606,10 +1696,12 @@ class MainActivity : Activity() {
             if (!personalGate.accepts(token)) return@execute
             val read = runCatching {
                 val before = app.repository.changes.version
-                val result = app.lookupWord(text)
-                val user = (result as? LookupResult.Match)?.let { app.repository.userEntry(it.form) }
+                val result = app.lookupExactWord(text)
+                val users = (result as? LookupResult.Match)?.entries.orEmpty()
+                    .associate { it.key to app.repository.userEntry(it.key) }
+                val user = (result as? LookupResult.Match)?.entries?.singleOrNull()?.let { users[it.key] }
                 val after = app.repository.changes.version
-                LookupRead(result, user, after, before == after)
+                LookupRead(result, user, after, before == after, users)
             }
             main.post {
                 if (isDestroyed || page != MainPage.PERSONAL_ENTRY || personalSession !== session ||
@@ -1638,7 +1730,7 @@ class MainActivity : Activity() {
                             }
                         }
                         is LookupResult.Match -> {
-                            val entry = result.entries.single()
+                            val entry = result.entries.first()
                             if (app.repository.deletions.isStale(entry.key, credential)) {
                                 personalStatusText = "读取已失效（词条已删除或数据已恢复），请重新读取"
                                 render()
@@ -2576,16 +2668,103 @@ class MainActivity : Activity() {
         return binding
     }
     private fun paperDialog(content: LinearLayout): AlertDialog = AlertDialog.Builder(this).create().apply {
-        setView(ScrollView(this@MainActivity).apply { addView(content) }, 0, 0, 0, 0)
+        setView(ScrollView(this@MainActivity).apply { isFillViewport = false; addView(content) }, 0, 0, 0, 0)
     }
     private fun showPaperDialog(dialog: AlertDialog, maxWidth: Int, onDismiss: () -> Unit = {}) {
         activeDialog?.dismiss(); activeDialog = dialog; dialog.show()
+        val widthPx = dp(minOf(resources.configuration.screenWidthDp - 32, maxWidth))
         dialog.window?.apply {
             setBackgroundDrawable(shape(Paper.surface, border = true))
             setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
-            setLayout(dp(minOf(resources.configuration.screenWidthDp - 32, maxWidth)), ViewGroup.LayoutParams.WRAP_CONTENT)
+            // Wrap first, so a short dialog stays short. The guard below only intervenes when the
+            // content would not fit the window area currently available.
+            setLayout(widthPx, ViewGroup.LayoutParams.WRAP_CONTENT)
         }
-        dialog.setOnDismissListener { if (activeDialog === dialog) activeDialog = null; onDismiss() }
+        val guard = DialogHeightGuard(dialog, widthPx).apply { attach() }
+        dialogHeightGuard = guard
+        dialog.setOnDismissListener {
+            // Detach this dialog's own listeners; a late callback from a dismissed dialog can then
+            // never re-lay out or disturb a newer dialog.
+            guard.detach()
+            if (dialogHeightGuard === guard) dialogHeightGuard = null
+            if (activeDialog === dialog) activeDialog = null
+            onDismiss()
+        }
+    }
+
+    /**
+     * Tracks one dialog's own window and keeps its height inside the area actually available, so
+     * the keyboard opening later (or closing again) is followed instead of only being sampled once.
+     *
+     * The content stays in a [ScrollView], so capping decides when scrolling starts and never cuts
+     * anything off; a dialog whose content fits stays wrapped. Every update is idempotent and only
+     * re-applies a layout when the height it wants actually differs, so the layout pass this causes
+     * cannot feed back into an endless loop, and no business callback is invoked from here. On
+     * dismiss [detach] removes both listeners, so a dismissed dialog cannot affect a newer one.
+     */
+    private inner class DialogHeightGuard(private val dialog: AlertDialog, private val widthPx: Int) {
+        /** Height currently imposed, or 0 while the dialog is allowed to wrap. */
+        private var cappedTo = 0
+        private val slop = dp(8)
+        private val layoutListener = View.OnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> update() }
+        private val globalListener = ViewTreeObserver.OnGlobalLayoutListener { update() }
+        private var attached = false
+
+        fun attach() {
+            val decor = dialog.window?.decorView ?: return
+            if (attached) return
+            attached = true
+            decor.addOnLayoutChangeListener(layoutListener)
+            decor.viewTreeObserver.addOnGlobalLayoutListener(globalListener)
+            decor.post { update() }
+        }
+
+        fun detach() {
+            if (!attached) return
+            attached = false
+            val decor = dialog.window?.decorView ?: return
+            decor.removeOnLayoutChangeListener(layoutListener)
+            // The observer can already be dead when the window is being torn down.
+            if (decor.viewTreeObserver.isAlive) {
+                decor.viewTreeObserver.removeOnGlobalLayoutListener(globalListener)
+            }
+        }
+
+        private fun update() {
+            if (!attached || !dialog.isShowing) return
+            // A dismissed/replaced dialog must never re-lay out over the current one.
+            if (activeDialog !== dialog) return
+            val window = dialog.window ?: return
+            val decor = window.decorView
+            val frame = Rect()
+            decor.getWindowVisibleDisplayFrame(frame)
+            val frameHeight = frame.height()
+            if (frameHeight <= 0 || widthPx <= 0) return
+            // Small margin so the dialog never sits flush against the keyboard or the bars.
+            val available = frameHeight - dp(24)
+            if (available <= 0) return
+            if (cappedTo > 0) {
+                when {
+                    // The keyboard closed (or the window grew): drop the cap once so the next layout
+                    // pass measures the natural height again; it is re-capped only if still too tall.
+                    available > cappedTo + slop -> {
+                        cappedTo = 0
+                        window.setLayout(widthPx, ViewGroup.LayoutParams.WRAP_CONTENT)
+                    }
+                    // The keyboard opened further / the window shrank: tighten to the new area.
+                    available < cappedTo - slop -> {
+                        cappedTo = available
+                        window.setLayout(widthPx, available)
+                    }
+                    // Same area within the tolerance: leave the current layout alone (no loop).
+                }
+                return
+            }
+            if (decor.height > available) {
+                cappedTo = available
+                window.setLayout(widthPx, available)
+            }
+        }
     }
     private fun statisticMetrics(values: List<Pair<String, Int>>, inline: Boolean): LinearLayout {
         val metrics = if (inline) row() else column()
@@ -2654,7 +2833,7 @@ class MainActivity : Activity() {
             // Short, honest display: an internal experience build, not an official release.
             versionText = "体验版 ${BuildConfig.VERSION_NAME}（${BuildConfig.VERSION_CODE}）",
             provenanceText = RawKajwebDictionary.provenance(
-                RawKajwebDictionary.SOURCE, RawKajwebDictionary.VERSION
+                EcdictDictionary.SOURCE, EcdictDictionary.VERSION
             ),
             onOpenOverlayPermission = { openOverlayPermissionSettings() },
             onOpenNotificationSettings = { openNotificationSettings() },
@@ -2900,9 +3079,11 @@ class MainActivity : Activity() {
                 // snapshots; such a read is rejected rather than mixed or relabelled later.
                 val before = app.repository.changes.version
                 val result = app.lookupWord(raw)
-                val user = (result as? LookupResult.Match)?.let { app.repository.userEntry(it.form) }
+                val users = (result as? LookupResult.Match)?.entries.orEmpty()
+                    .associate { it.key to app.repository.userEntry(it.key) }
+                val user = (result as? LookupResult.Match)?.entries?.singleOrNull()?.let { users[it.key] }
                 val after = app.repository.changes.version
-                LookupRead(result, user, after, before == after)
+                LookupRead(result, user, after, before == after, users)
             }
             main.post {
                 if (isDestroyed || page != MainPage.LOOKUP || !manualGate.accepts(token)) return@post
@@ -2923,13 +3104,36 @@ class MainActivity : Activity() {
                             } else showManualMissing(result.form, raw, replaces, deletionCredential, read.revision)
                         }
                         is LookupResult.Match -> {
-                            val entry = result.entries.single()
-                            if (app.repository.deletions.isStale(entry.key, deletionCredential)) {
-                                toast("查询已失效（词条已删除或数据已恢复），请重新查询")
-                            } else if (!read.isCurrent(app.repository.changes.version)) {
-                                showManualLookupExpired()
-                            } else showManualDefinition(originalRaw, result.form, entry, read.user, replaces,
-                                deletionCredential, read.revision)
+                            fun deliver(entry: DictionaryEntry) {
+                                if (isDestroyed || page != MainPage.LOOKUP || !manualGate.accepts(token)) return
+                                if (app.repository.deletions.isStale(entry.key, deletionCredential)) {
+                                    toast("查询已失效（词条已删除或数据已恢复），请重新查询")
+                                } else if (!read.isCurrent(app.repository.changes.version)) {
+                                    showManualLookupExpired()
+                                } else showManualDefinition(originalRaw, result.form, entry, read.users[entry.key],
+                                    replaces, deletionCredential, read.revision)
+                            }
+                            if (!read.isCurrent(app.repository.changes.version)) showManualLookupExpired()
+                            else if (result.entries.size == 1) deliver(result.entries.first())
+                            else {
+                                val content = panel()
+                                content.addView(text("「${result.form}」请选择词义", 22f, bold = true))
+                                content.addView(text("原词条与词形原型分别保留；选择前不收录。", 15f, Paper.secondary))
+                                lateinit var choices: AlertDialog
+                                var selected = false
+                                for (entry in result.entries) content.addView(button(
+                                    (if (entry.key == result.form) "原词条：" else "词形原型：") + entry.headword +
+                                        "\n" + entry.meaning.lineSequence().first().take(64)) {
+                                    if (!selected && activeDialog === choices && choices.isShowing) {
+                                        selected = true
+                                        choices.dismiss()
+                                        deliver(entry)
+                                    }
+                                })
+                                content.addView(button("取消") { choices.dismiss() })
+                                choices = paperDialog(content)
+                                showPaperDialog(choices, 640)
+                            }
                         }
                     }
                 }.onFailure { toast("词库不可用：${it.message}；未生成释义或新增记录") }
@@ -3131,14 +3335,25 @@ class MainActivity : Activity() {
         }
         dialog.show()
         manualGuard = guard
-        val event = QueryEvent(UUID.randomUUID().toString(), entry.key, raw, form, System.currentTimeMillis())
+        val event = QueryEvent(UUID.randomUUID().toString(), entry.key, raw, entry.key, System.currentTimeMillis())
+        val saveCommitted = java.util.concurrent.atomic.AtomicBoolean(false)
         fun save() {
+            if (saveCommitted.get()) return
             // A stale card (word deleted after this query started) must not start/retry a save.
             if (manualCardStale(guard)) { invalidateManualCard(guard); return }
             retry.visibility = View.GONE; status.text = "保存中…"
             app.worker.execute {
-                if (!manualGate.accepts(token)) return@execute
-                val result = runCatching { app.repository.record(event, entry, replaces, deletionCredential) { manualGate.accepts(token) } }
+                if (saveCommitted.get()) return@execute
+                val result = runCatching {
+                    app.repository.record(event, entry, replaces, deletionCredential) {
+                        manualGate.accepts(token) && !guard.invalid &&
+                            readRevision == app.repository.changes.version &&
+                            !app.repository.deletions.isStale(entry.key, deletionCredential)
+                    }
+                }
+                // Ignore queued duplicate submissions after this event committed, rather than
+                // treating its own published revision as a stale failed query.
+                if (result.getOrNull() == true) saveCommitted.set(true)
                 main.post {
                     if (!isDestroyed && manualGate.accepts(token) && dialog.isShowing && manualGuard === guard && !guard.invalid) {
                         val error = result.exceptionOrNull()

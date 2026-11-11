@@ -8,6 +8,7 @@ import android.view.View
 import android.view.inputmethod.EditorInfo
 import android.widget.EditText
 import android.widget.ScrollView
+import android.widget.LinearLayout
 
 /**
  * The daily-lookup page body, extracted from the Activity so the page can be assembled and reasoned
@@ -48,16 +49,16 @@ class LookupScreen(
     init {
         val content = context.column()
         content.addView(context.text("查词", 28f, bold = true))
-        content.space(8)
+        content.space(12)
 
         // Order is deliberate: title, input, the two main actions, then only the two short boundary
         // lines a user needs before acting. Everything explanatory is folded below.
         val card = context.column().apply {
-            setPadding(context.dp(24), context.dp(24), context.dp(24), context.dp(24))
+            setPadding(context.dp(16), context.dp(16), context.dp(16), context.dp(16))
             background = context.shape(Paper.surface, border = true)
         }
 
-        input = context.inputField("例如 evidence、quantum", true)
+        input = context.inputField("输入英文单词", true)
         // Restore the draft before the watcher is attached so restoring never looks like a user edit
         // and can never be mistaken for a query.
         input.setText(initialText)
@@ -87,26 +88,25 @@ class LookupScreen(
 
         card.addView(input)
         card.space(8)
-        card.addView(context.button("查询", true) { submit() })
-        card.addView(context.button("清空") {
-            // Clearing only empties the field. The text watcher forwards the empty draft, and no
-            // lookup, record or query count is created here.
+        val query = context.button("查询", true) { submit() }
+        val clear = context.button("清空") {
+            // Clear only changes the draft; it does not query or create a record.
             input.setText("")
             input.setSelection(0)
-        })
+        }
+        val stack = context.resources.configuration.fontScale >= PaperLayout.LARGE_FONT_SCALE ||
+            context.resources.configuration.screenWidthDp < 360
+        card.addView(context.pair(query, clear, horizontal = !stack, gap = 8),
+            LinearLayout.LayoutParams(-1, -2))
         card.space(4)
         // Kept visible next to the primary action: a query is a real recording action.
         card.addView(context.text("查询会收录到生词本。", 15f, Paper.secondary))
         content.addView(card)
         content.space(12)
 
-        val supplement = context.column().apply {
-            setPadding(context.dp(24), context.dp(24), context.dp(24), context.dp(24))
-            background = context.shape(Paper.surface, border = true)
-        }
-        supplement.addView(context.button("添加/补词") { onOpenPersonalEntry() })
-        supplement.addView(context.text("仅保存词义，不加入生词本。", 15f, Paper.secondary))
-        content.addView(supplement)
+        // Secondary maintenance stays a quiet entry, not another equally prominent form card.
+        content.addView(context.button("添加 / 补充词义") { onOpenPersonalEntry() })
+        content.addView(context.text("仅保存词义，不加入生词本。", 14f, Paper.secondary))
         content.space(12)
 
         // Full unknown-word / inflection / provenance / recording rules stay available but folded.
@@ -114,7 +114,7 @@ class LookupScreen(
             context.helpDisclosure("查词说明") {
                 addView(
                     context.text(
-                        "未知词或未收录词形不生成释义，也不新增记录。词形按本机词库已有词条解释；没有对应词条时按未知词处理。",
+                        "原词条与词形原型分别显示；存在多个候选时先选择词义，选择前不收录。未知词或未收录词形不生成释义，也不新增记录。",
                         15f,
                         Paper.secondary
                     )

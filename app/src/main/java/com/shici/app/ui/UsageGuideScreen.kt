@@ -157,7 +157,7 @@ class UsageGuideScreen(
     private fun demoSection(): View {
         val card = context.column().apply {
             setPadding(context.dp(16), context.dp(12), context.dp(16), context.dp(12))
-            background = context.shape(Paper.surface, 12, true)
+            background = context.shape(Paper.surface, 16, true)
         }
 
         demoTitle = context.text(selectedDemo.title, 20f, Paper.ink, true)
@@ -203,27 +203,43 @@ class UsageGuideScreen(
         sceneBody = context.column().apply { visibility = View.GONE }
 
         val entries = GuideAnimation.Demo.values().toList()
-        for (rowIndex in 0 until 2) {
-            val row = context.row()
-            for (columnIndex in 0 until 2) {
-                val index = rowIndex * 2 + columnIndex
-                if (index >= entries.size) break
-                val demo = entries[index]
+        if (context.stackedActions()) {
+            // Phone width or enlarged text: one full-width scene per line so the label keeps a
+            // readable width. Same buttons, same selectScene callback, same stable scene ids.
+            entries.forEachIndexed { index, demo ->
                 val button = context.button(demo.shortLabel) {
                     selectScene(demo)
                     setScenePickerExpanded(false)
                 }
                 button.contentDescription = "查看${demo.title}"
                 sceneButtons[demo] = button
-                row.addView(
-                    button,
-                    LinearLayout.LayoutParams(0, -2, 1f).apply {
-                        if (columnIndex == 0) marginEnd = context.dp(8)
-                    }
-                )
+                sceneBody.addView(button, LinearLayout.LayoutParams(-1, -2).apply {
+                    if (index != entries.lastIndex) bottomMargin = context.dp(8)
+                })
             }
-            sceneBody.addView(row, LinearLayout.LayoutParams(-1, -2))
-            if (rowIndex == 0) sceneBody.space(8)
+        } else {
+            for (rowIndex in 0 until 2) {
+                val row = context.row()
+                for (columnIndex in 0 until 2) {
+                    val index = rowIndex * 2 + columnIndex
+                    if (index >= entries.size) break
+                    val demo = entries[index]
+                    val button = context.button(demo.shortLabel) {
+                        selectScene(demo)
+                        setScenePickerExpanded(false)
+                    }
+                    button.contentDescription = "查看${demo.title}"
+                    sceneButtons[demo] = button
+                    row.addView(
+                        button,
+                        LinearLayout.LayoutParams(0, -2, 1f).apply {
+                            if (columnIndex == 0) marginEnd = context.dp(8)
+                        }
+                    )
+                }
+                sceneBody.addView(row, LinearLayout.LayoutParams(-1, -2))
+                if (rowIndex == 0) sceneBody.space(8)
+            }
         }
 
         sceneToggle = context.button(sceneToggleLabel(false)) { setScenePickerExpanded(!scenePickerExpanded) }

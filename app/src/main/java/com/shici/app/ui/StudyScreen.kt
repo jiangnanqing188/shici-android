@@ -245,7 +245,7 @@ class StudyScreen(
         val primary = runCatching {
             candidateEntries(card.entryKey, card.token, personalKeys, BOOK_CANDIDATES, MAX_CANDIDATES)
         }.getOrElse { emptyList() }
-        if (primary.isEmpty() && app.dictionary.isFailure) {
+        if (primary.isEmpty() && app.lookupDictionary.isFailure && app.dictionary.isFailure) {
             return ReviewQuestion.Unavailable(ReviewUnavailableReason.NO_READABLE_DICTIONARY)
         }
         val first = runCatching { ReviewChoices.build(card.entry, primary, card.token) }
@@ -306,7 +306,7 @@ class StudyScreen(
         content.removeAllViews()
         optionButtons = mutableListOf()
         content.addView(context.text("复习", 26f, Paper.ink, true))
-        content.addView(context.text(summaryLine(overview), 15f, Paper.secondary))
+        content.addView(context.badge(summaryLine(overview)))
         content.space(12)
         val card = view.card
         if (card == null) {
@@ -331,7 +331,7 @@ class StudyScreen(
      */
     private fun questionCard(content: LinearLayout, card: StudyCard, credential: Long,
                              question: ReviewQuestion?, questionVersion: Long): LinearLayout = context.column().apply {
-        setPadding(context.dp(20), context.dp(20), context.dp(20), context.dp(20))
+        setPadding(context.dp(16), context.dp(16), context.dp(16), context.dp(16))
         background = context.shape(Paper.surface, 14, true)
         addView(context.text(caption(card), 15f, Paper.green))
         addView(context.text(card.entry.headword, 32f, Paper.ink, true))
@@ -380,7 +380,7 @@ class StudyScreen(
         ))
         content.space(12)
         val panel = context.column().apply {
-            setPadding(context.dp(20), context.dp(20), context.dp(20), context.dp(20))
+            setPadding(context.dp(16), context.dp(16), context.dp(16), context.dp(16))
             background = context.shape(Paper.surface, 14, true)
             addView(context.text(result.headword, 30f, Paper.ink, true))
             addView(context.text(
@@ -447,14 +447,39 @@ class StudyScreen(
         }
     }
 
-    private fun goalRow(goal: Int): LinearLayout = context.row().apply {
-        gravity = Gravity.CENTER_VERTICAL
-        addView(context.text("每日新词目标", 18f), LinearLayout.LayoutParams(0, -2, 1f))
-        addView(context.button("−5", primary = false) { setGoal(goal - 5) })
-        addView(context.text("$goal", 22f, Paper.ink, true).apply {
+    /**
+     * The daily goal label, current value and −5/+5 controls. On a phone-width window or with
+     * enlarged text the label takes its own line above the controls instead of being squeezed into
+     * a single column next to them. Only layout changes: both buttons keep calling [setGoal] with
+     * exactly the same bounds-checked value as before, and no goal/state is touched here.
+     */
+    private fun goalRow(goal: Int): LinearLayout {
+        val label = context.text("每日新词目标", 18f)
+        val value = context.text("$goal", 22f, Paper.ink, true).apply {
             gravity = Gravity.CENTER; setPadding(context.dp(16), 0, context.dp(16), 0)
-        })
-        addView(context.button("+5", primary = false) { setGoal(goal + 5) })
+        }
+        val minus = context.button("−5", primary = false) { setGoal(goal - 5) }
+        val plus = context.button("+5", primary = false) { setGoal(goal + 5) }
+        if (!context.stackedActions()) {
+            return context.row().apply {
+                gravity = Gravity.CENTER_VERTICAL
+                addView(label, LinearLayout.LayoutParams(0, -2, 1f))
+                addView(minus)
+                addView(value)
+                addView(plus)
+            }
+        }
+        // Full-width label on its own line, then the controls on one tidy row below.
+        val controls = context.row().apply {
+            gravity = Gravity.CENTER_VERTICAL
+            addView(minus)
+            addView(value)
+            addView(plus)
+        }
+        return context.column().apply {
+            addView(label, LinearLayout.LayoutParams(-1, -2))
+            addView(controls, LinearLayout.LayoutParams(-1, -2))
+        }
     }
 
     private fun emptyMessage(overview: StudyOverview): String {

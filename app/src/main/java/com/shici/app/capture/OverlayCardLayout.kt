@@ -2,7 +2,13 @@ package com.shici.app.capture
 
 import android.content.Context
 import android.text.TextUtils
+import android.text.SpannableString
+import android.text.Spanned
+import android.text.style.RelativeSizeSpan
+import android.text.style.ForegroundColorSpan
 import android.view.Gravity
+import android.view.MotionEvent
+import android.view.ViewConfiguration
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
@@ -13,6 +19,7 @@ import com.shici.app.ui.Paper
 import com.shici.app.ui.dp
 import com.shici.app.ui.shape
 import com.shici.app.ui.text
+import kotlin.math.abs
 
 /**
  * One compact floating result card: a fixed header, an internally scrolling body and an
@@ -87,7 +94,82 @@ internal class OverlayCardLayout(context: Context) : LinearLayout(context) {
         exit.contentDescription = "退出当前词卡，返回悬浮条（不停止查词）"
     }
 
-    fun setTitle(title: String) { titleView.text = title }
+    fun setTitle(title: String) {
+        titleView.text = title
+        titleView.contentDescription = title
+    }
+
+    /** Called by compactCard before measuring; independent manual input keeps its old title. */
+    fun showTitleDragHint() {
+        val title = titleView.text.toString()
+        titleView.text = SpannableString("$title  ⠿\n按住标题拖动").apply {
+            val hintStart = title.length + 4
+            setSpan(RelativeSizeSpan(0.62f), hintStart, length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            setSpan(ForegroundColorSpan(Paper.secondary), hintStart, length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        }
+        titleView.textSize = 21f
+        titleView.maxLines = 3
+        titleView.setPadding(context.dp(10), context.dp(8), context.dp(10), context.dp(8))
+        titleView.background = context.shape(Paper.lightGreen, 10)
+    }
+
+    private var stopTitleDrag: () -> Unit = {}
+
+    fun cancelTitleDrag() { stopTitleDrag() }
+
+    override fun onDetachedFromWindow() {
+        cancelTitleDrag()
+        super.onDetachedFromWindow()
+    }
+
+    /** Only the title is a drag handle; status controls, body scrolling and footer taps stay native. */
+    fun setOnTitleDrag(onStart: () -> Boolean, onDrag: (Float, Float) -> Unit) {
+        val slop = ViewConfiguration.get(context).scaledTouchSlop
+        var active = false
+        var dragging = false
+        var downX = 0f
+        var downY = 0f
+        var lastX = 0f
+        var lastY = 0f
+        stopTitleDrag = { active = false; dragging = false }
+        titleView.contentDescription = "${titleView.text}，按住标题可拖动词卡"
+        titleView.minimumHeight = context.dp(48)
+        titleView.setOnTouchListener { handle, event ->
+            val x = event.rawX
+            val y = event.rawY
+            // A second pointer or malformed input retires this stroke until a fresh DOWN. Never
+            // transfer ownership between fingers (or from a cancelled stylus to a finger).
+            if (event.pointerCount != 1 || !x.isFinite() || !y.isFinite()) {
+                active = false
+                dragging = false
+                true
+            } else {
+                when (event.actionMasked) {
+                    MotionEvent.ACTION_DOWN -> {
+                        active = onStart(); dragging = false
+                        downX = x; downY = y; lastX = x; lastY = y
+                    }
+                    MotionEvent.ACTION_MOVE -> if (active) {
+                        if (!dragging && abs(x - downX) + abs(y - downY) > slop) dragging = true
+                        if (dragging) {
+                            // Incremental screen-space deltas also let the card move back from an
+                            // edge immediately; no invisible over-drag distance must be undone.
+                            onDrag(x - lastX, y - lastY)
+                            lastX = x; lastY = y
+                        }
+                    }
+                    MotionEvent.ACTION_UP -> {
+                        if (active && !dragging) handle.performClick()
+                        active = false; dragging = false
+                    }
+                    MotionEvent.ACTION_CANCEL, MotionEvent.ACTION_POINTER_UP -> {
+                        active = false; dragging = false
+                    }
+                }
+                true
+            }
+        }
+    }
 
     /** Scrolls the body to its end, for example after opening an inline editor at the bottom. */
     fun scrollBodyToEnd() { scroll.post { scroll.fullScroll(View.FOCUS_DOWN) } }

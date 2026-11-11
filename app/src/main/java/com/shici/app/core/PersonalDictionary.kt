@@ -48,7 +48,7 @@ object PersonalDictionary {
         require(key.isNotBlank()) { "词头不能为空" }
         require(key.length <= MAX_KEY_LENGTH) { "词头超过 $MAX_KEY_LENGTH 字符" }
         require(validText(key, allowNewline = false)) { "词头包含非法控制字符" }
-        require(RawKajwebDictionary.normalize(key) == key) { "词头不是规范化形式" }
+        require(DictionaryKeys.normalize(key) == key) { "词头不是规范化形式" }
         return key
     }
 

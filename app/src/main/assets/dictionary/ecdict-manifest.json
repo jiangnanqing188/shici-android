@@ -1,0 +1,30 @@
+{
+  "format": "SHICI_ECDICT_SQLITE",
+  "format_version": 1,
+  "source": "ECDICT · skywind3000/ECDICT",
+  "version": "bc015ed2e24a7abef49fc6dbbb7fe32c1dadaf8b",
+  "source_sha256": "1a6947e04785db63613a92e14903cdae7954f7e84860b10e68e5c7cbb3f9c3cf",
+  "record_count": 770611,
+  "empty_translation_records": 1872,
+  "unindexable_records": 129,
+  "self_relations_rejected": 2216,
+  "invalid_or_self_forms_rejected": 2502,
+  "chained_or_cyclic_relations_rejected": 1208,
+  "entry_count": 770482,
+  "indexed_records": 770482,
+  "alias_count": 56001,
+  "content_review_status": "unreviewed",
+  "syllabus_verified": false,
+  "extra_fields": [
+    "collins",
+    "oxford",
+    "tag",
+    "bnc",
+    "frq",
+    "detail",
+    "audio"
+  ],
+  "forms_policy": "one-hop documented exchange; no suffix guessing; derived forward edges rejected",
+  "asset_sha256": "71ed9862db593614a529152f97852b35928f3f3f2f6c5b554faca31e95dd2955",
+  "asset_bytes": 115470336
+}

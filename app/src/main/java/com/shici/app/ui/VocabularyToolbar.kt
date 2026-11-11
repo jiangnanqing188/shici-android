@@ -1,7 +1,6 @@
 package com.shici.app.ui
 
 import android.content.Context
-import android.view.Gravity
 import android.widget.LinearLayout
 import com.shici.app.core.VocabularySort
 
@@ -16,8 +15,9 @@ import com.shici.app.core.VocabularySort
  * real user tap on a different value. The programmatic [setState] never notifies, so restoring the
  * host's state or reacting to a manage toggle cannot loop back into another list rebuild.
  *
- * The layout uses two rows (filter + manage, then the sort chips) so a narrow screen never has to
- * fit every control on one line. Every control keeps the shared >=48dp minimum touch height.
+ * Filter occupies its own row; a single sort chooser and management entry share the next row
+ * when they fit. Narrow/large-text windows stack them without hiding or shortening any choice.
+ * Every control retains a >=48dp touch target.
  */
 class VocabularyToolbar(context: Context) : LinearLayout(context) {
 
@@ -60,20 +60,15 @@ class VocabularyToolbar(context: Context) : LinearLayout(context) {
             setPadding(context.dp(10), context.dp(8), context.dp(10), context.dp(8))
         }
 
-        val filterRow = context.row().apply { gravity = Gravity.CENTER_VERTICAL }
-        filterRow.addView(
-            filterView,
-            LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
-                marginEnd = context.dp(6)
-            }
-        )
-        filterRow.addView(
-            manageButton,
-            LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-        )
-        addView(filterRow, LinearLayout.LayoutParams(-1, LinearLayout.LayoutParams.WRAP_CONTENT))
-
-        addView(sortView, LinearLayout.LayoutParams(-1, LinearLayout.LayoutParams.WRAP_CONTENT))
+        // Filter is the first layer; sort and management are secondary, never a horizontal scroller.
+        addView(filterView, LinearLayout.LayoutParams(-1, -2))
+        val stack = context.resources.configuration.fontScale >= PaperLayout.LARGE_FONT_SCALE ||
+            context.resources.configuration.screenWidthDp < 360
+        val actions = if (stack) context.column() else context.row()
+        actions.addView(sortView, if (stack) LinearLayout.LayoutParams(-1, -2)
+            else LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = context.dp(6) })
+        actions.addView(manageButton, LinearLayout.LayoutParams(if (stack) -1 else -2, -2))
+        addView(actions, LinearLayout.LayoutParams(-1, -2))
         render()
     }
 
@@ -102,7 +97,7 @@ class VocabularyToolbar(context: Context) : LinearLayout(context) {
         manageButton.text = if (managing) "完成" else "管理与导出"
         manageButton.isSelected = managing
         manageButton.setTextColor(Paper.green)
-        manageButton.background = context.shape(Paper.lightGreen, 8)
+        manageButton.background = context.shape(if (managing) Paper.lightGreen else Paper.background, 10, !managing)
         manageButton.contentDescription = if (managing)
             "完成勾选，收起导出与选择栏"
         else
