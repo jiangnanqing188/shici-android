@@ -32,6 +32,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.ceil
 import kotlin.math.floor
+import kotlin.math.roundToInt
 
 /**
  * One dictionary read plus the committed revision observed on the worker immediately around it.
@@ -1764,7 +1765,7 @@ class CaptureService : Service() {
      */
     private fun addPanel(view: View, focusable: Boolean = true) {
         removePanelView()
-        val width = minOf(dp(440), (screenWidth - dp(24)).coerceAtLeast(dp(200)))
+        val width = minOf(dp(440), (frameBody().width - dp(24)).coerceAtLeast(1))
         // A long definition scrolls inside a card that never grows into a full-screen surface. The
         // cap already excludes the system bars, so the pinned footer is not placed under them.
         val maxHeight = panelMaxHeight()
@@ -1795,6 +1796,42 @@ class CaptureService : Service() {
         // and returns to the bubble; the service keeps running, and the manual/translation windows
         // keep their own separate listeners.
         val owner = panelOwner
+        var usable = frameBody()
+        var dragLeft = 0.0
+        var dragTop = 0.0
+        var dragOffsetX = 0
+        var dragOffsetY = 0
+        if (view is OverlayCardLayout) view.setOnTitleDrag(onStart = {
+            val current = !stopped && owner == panelOwner && panel === view &&
+                view.isAttachedToWindow && view.width > 0 && view.height > 0
+            if (current) {
+                val location = IntArray(2)
+                view.getLocationOnScreen(location)
+                dragLeft = location[0].toDouble(); dragTop = location[1].toDouble()
+                dragOffsetX = params.x - location[0]; dragOffsetY = params.y - location[1]
+            }
+            current
+        }, onDrag = { dx, dy ->
+            if (!stopped && owner == panelOwner && panel === view && view.isAttachedToWindow) {
+                dragLeft = (dragLeft + dx).coerceIn(usable.left.toDouble(),
+                    maxOf(usable.left, usable.right - view.width).toDouble())
+                dragTop = (dragTop + dy).coerceIn(usable.top.toDouble(),
+                    maxOf(usable.top, usable.bottom - view.height).toDouble())
+                // Absolute requests from this gesture's real origin. Rapid MOVE events may arrive
+                // before native relayout: do not add each correction to an already-pending x/y.
+                movePanel(view, owner, params, (dragOffsetX + dragLeft).roundToInt(),
+                    (dragOffsetY + dragTop).roundToInt())
+            }
+        })
+        // Window-only moves need not change the View's local layout rectangle. Read the real
+        // screen coordinates before drawing too, not just in onLayoutChange or from requested x/y.
+        view.viewTreeObserver.addOnPreDrawListener {
+            if (!stopped && owner == panelOwner && panel === view && view.isAttachedToWindow) {
+                fitPanelBounds(view, owner, params, usable)
+                updatePanelOverlayBox(view, owner)
+            }
+            true
+        }
         // A waiting direct-read card is deliberately non-focusable: the external application must
         // keep window focus while the accessibility service is still reading it. Its footer buttons
         // remain touchable, so 划词 / 手动输入 / 退出 are still reachable; only Back is unavailable.
@@ -1809,25 +1846,38 @@ class CaptureService : Service() {
         view.addOnLayoutChangeListener { v, _, _, _, _, _, _, _, _ ->
             updatePanelOverlayBox(v, owner)
         }
-        // The IME (inline supplement/correction editors) and a rotation can shrink the usable region
-        // after the card is mounted. Re-cap the same card in a posted pass so the pinned footer is
-        // never clipped; only the body shrinks. The window stays centred (ADJUST_RESIZE already
-        // re-centres it inside the reduced display frame), so no manual y shift is applied twice.
+        // Keep CENTER gravity: positions below are corrections from the actual screen location,
+        // using the observed frame rather than hard-coded status-bar / IME offsets. A display-size
+        // change still retires the old card through resize().
         view.setOnApplyWindowInsetsListener { v, insets ->
+            val leftInset: Int
             val topInset: Int
+            val rightInset: Int
             val bottomInset: Int
             if (Build.VERSION.SDK_INT >= 30) {
-                val bars = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.ime())
-                topInset = bars.top; bottomInset = bars.bottom
+                val bars = insets.getInsets(WindowInsets.Type.systemBars() or
+                    WindowInsets.Type.displayCutout() or WindowInsets.Type.ime())
+                leftInset = bars.left; topInset = bars.top
+                rightInset = bars.right; bottomInset = bars.bottom
             } else {
+                @Suppress("DEPRECATION") leftInset = insets.systemWindowInsetLeft
                 @Suppress("DEPRECATION") topInset = insets.systemWindowInsetTop
+                @Suppress("DEPRECATION") rightInset = insets.systemWindowInsetRight
                 @Suppress("DEPRECATION") bottomInset = insets.systemWindowInsetBottom
             }
             v.post {
-                fitPanelHeight(v, width, params, topInset, bottomInset)
-                // fitPanelHeight can only republish a pre-layout centred estimate. Read the real
-                // window bounds after the inset pass so the frame mask follows what is covered.
-                updatePanelOverlayBox(v, owner)
+                if (!stopped && owner == panelOwner && panel === v) {
+                    val bars = frameBody()
+                    val next = PixelBox(maxOf(bars.left, leftInset), maxOf(bars.top, topInset),
+                        minOf(bars.right, screenWidth - rightInset),
+                        minOf(bars.bottom, screenHeight - bottomInset))
+                    if (next.width > 0 && next.height > 0 && next != usable) {
+                        (v as? OverlayCardLayout)?.cancelTitleDrag()
+                        usable = next
+                    }
+                    fitPanelBounds(v, owner, params, usable)
+                    updatePanelOverlayBox(v, owner)
+                }
             }
             insets
         }
@@ -1927,32 +1977,51 @@ class CaptureService : Service() {
         }
     }
 
-    /**
-     * Shrinks the mounted card to the region actually left by the IME / system bars.
-     *
-     * Only the body loses height: [OverlayCardLayout] measures the header and footer first, so the
-     * "划词 | 手动输入 | 退出" row stays laid out at every font scale and in landscape. The page-exclusion
-     * rectangle is updated to the window that is really covered, never to a larger one.
-     * Idempotent: a pass that would not change the height does nothing, so insets arriving in a
-     * burst cannot loop through relayout.
-     */
-    private fun fitPanelHeight(view: View, width: Int, params: WindowManager.LayoutParams,
-                               topInset: Int, bottomInset: Int) {
-        if (panel !== view || stopped) return
-        val usable = (screenHeight - topInset - bottomInset).coerceAtLeast(dp(200))
-        val cap = minOf(panelMaxHeight(), usable)
-        if (params.height <= cap) return
-        view.measure(View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
-            View.MeasureSpec.makeMeasureSpec(cap, View.MeasureSpec.AT_MOST))
-        val height = view.measuredHeight.coerceIn(1, cap)
-        if (height >= params.height) return
-        params.height = height
-        // Keep the chosen horizontal/vertical position; only the body's height shrinks. The real
-        // bounds are republished by updatePanelOverlayBox after this layout pass.
-        pageOverlayBoxes = listOf(PixelBox(panelLeft, panelTop,
-            (panelLeft + width).coerceAtMost(screenWidth),
-            (panelTop + height).coerceAtMost(screenHeight)))
-        runCatching { windows.updateViewLayout(view, params) }
+    /** Apply an absolute window request; page masks are published only from real screen bounds. */
+    private fun movePanel(view: View, owner: Long, params: WindowManager.LayoutParams,
+                          x: Int, y: Int) {
+        if (stopped || owner != panelOwner || panel !== view || !view.isAttachedToWindow) return
+        if (params.x == x && params.y == y) return
+        val oldX = params.x; val oldY = params.y
+        params.x = x; params.y = y
+        try {
+            windows.updateViewLayout(view, params)
+            view.post { updatePanelOverlayBox(view, owner) }
+        } catch (_: IllegalArgumentException) {
+            // A detached window cannot move; do not publish a requested rectangle as a real one.
+            params.x = oldX; params.y = oldY
+            (view as? OverlayCardLayout)?.cancelTitleDrag()
+        }
+    }
+
+    /** Shrink only if needed, then keep the entire real card inside system bars / the IME. */
+    private fun fitPanelBounds(view: View, owner: Long, params: WindowManager.LayoutParams,
+                               usable: PixelBox) {
+        if (stopped || owner != panelOwner || panel !== view || !view.isAttachedToWindow) return
+        val width = minOf(params.width, usable.width).coerceAtLeast(1)
+        val height = minOf(params.height, usable.height, panelMaxHeight()).coerceAtLeast(1)
+        if (width != params.width || height != params.height) {
+            (view as? OverlayCardLayout)?.cancelTitleDrag()
+            val oldWidth = params.width; val oldHeight = params.height
+            params.width = width; params.height = height
+            try {
+                windows.updateViewLayout(view, params)
+            } catch (_: IllegalArgumentException) {
+                params.width = oldWidth; params.height = oldHeight
+            }
+            // The size change also changes CENTER's origin. Clamp only after the next layout,
+            // against its real coordinates, rather than shifting twice using the old dimensions.
+            return
+        }
+        if (view.width <= 0 || view.height <= 0) return
+        val location = IntArray(2)
+        view.getLocationOnScreen(location)
+        val left = location[0].coerceIn(usable.left, maxOf(usable.left, usable.right - view.width))
+        val top = location[1].coerceIn(usable.top, maxOf(usable.top, usable.bottom - view.height))
+        if (left != location[0] || top != location[1]) {
+            (view as? OverlayCardLayout)?.cancelTitleDrag()
+            movePanel(view, owner, params, params.x + left - location[0], params.y + top - location[1])
+        }
     }
     private fun removePanelView() {
         // Every removal retires the old card owner, including replacement by a newer success card,
