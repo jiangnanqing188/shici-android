@@ -43,6 +43,9 @@ class LookupScreen(
     /** The editable field; the Activity keeps this as its `lookupInputView` for draft capture. */
     val input: EditText
 
+    /** The actual input, clear and query area; no guide uses an estimated rectangle. */
+    val practiceArea: View
+
     /** Complete scrollable page body. No sidebar and no root padding; the host body supplies those. */
     val view: View
 
@@ -57,6 +60,8 @@ class LookupScreen(
             setPadding(context.dp(20), context.dp(20), context.dp(20), context.dp(20))
             background = context.shape(Paper.surface, border = true)
         }
+
+        practiceArea = card
 
         input = context.inputField("例如 evidence、quantum", true)
         // Restore the draft before the watcher is attached so restoring never looks like a user edit

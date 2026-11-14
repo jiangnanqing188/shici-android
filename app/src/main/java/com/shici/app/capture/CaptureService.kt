@@ -54,6 +54,8 @@ private data class LookupRead(
 class CaptureService : Service() {
     companion object {
         const val ACTION_START = "com.shici.app.START_CAPTURE"
+        const val ACTION_PRACTICE = "com.shici.app.START_CAPTURE_PRACTICE"
+        const val EXTRA_PRACTICE = "practice"
         const val ACTION_STOP = "com.shici.app.STOP_CAPTURE"
         const val EXTRA_RESULT = "result"
         const val EXTRA_DATA = "data"
@@ -324,14 +326,85 @@ class CaptureService : Service() {
         // actually current and never stores the change's (text-free) details.
         AccessibleTextBridge.addChangeListener(textChangeListener)
     }
+    private var capturePractice = false
+    private var capturePracticeOwner = 0L
+    private var practiceManualResult = false
+    private var practiceHint: CapturePracticeHint? = null
+    private var practicePulse: android.animation.ValueAnimator? = null
+    private var practicePulseTarget: View? = null
+
+    private fun stopPracticePulse() {
+        practicePulse?.cancel(); practicePulse = null
+        practicePulseTarget?.alpha = 1f; practicePulseTarget = null
+    }
+    private fun endCapturePractice(markSeen: Boolean) {
+        capturePractice = false; capturePracticeOwner++
+        practiceHint?.close(); practiceHint = null; stopPracticePulse()
+        if (markSeen) getSharedPreferences("guide_prefs", MODE_PRIVATE).edit()
+            .putBoolean(com.shici.app.core.UsageGuide.SEEN_PREFERENCE_KEY, true).apply()
+    }
+    private fun startCapturePractice() {
+        endCapturePractice(false)
+        capturePractice = true; practiceManualResult = false
+        val current = bubble
+        if (current != null) showPracticeBubble(current)
+    }
+    private fun showPracticeBubble(view: View) {
+        if (!capturePractice || stopped || bubble !== view || !view.isAttachedToWindow) return
+        practiceHint?.close()
+        val owner = capturePracticeOwner
+        val box = frameBody()
+        val message = if (practiceManualResult) "已完成真实查词与手动输入，并回到悬浮条。可以结束引导，继续阅读。"
+            else "切到你自己的题页，点悬浮条左边的「词」，沿真实单词划一笔；不用截图或切到演示页。"
+        practiceHint = CapturePracticeHint(this, windows, view, Rect(box.left, box.top, box.right, box.bottom), message,
+            onSkip = { if (owner == capturePracticeOwner && bubble === view && sessionIsActive()) endCapturePractice(true) },
+            onNext = {
+                if (owner == capturePracticeOwner && bubble === view && sessionIsActive()) {
+                    if (practiceManualResult) endCapturePractice(true) else beginLiveSelection()
+                }
+            }, nextLabel = if (practiceManualResult) "完成引导" else "下一步").also { it.show() }
+    }
+    private fun addPracticeNote(card: OverlayCardLayout, message: String, onNext: () -> Unit) {
+        if (!capturePractice) return
+        val owner = capturePracticeOwner
+        val note = column().apply {
+            setPadding(dp(10), dp(8), dp(10), dp(6)); background = shape(Paper.lightGreen, 8)
+            addView(text(message, 14f, Paper.green))
+            addView(compactButton("下一步", true) {
+                if (owner == capturePracticeOwner && (panel === card || manualInput === card) && sessionIsActive()) onNext()
+            })
+            addView(compactButton("结束引导") {
+                if (owner == capturePracticeOwner && (panel === card || manualInput === card) && sessionIsActive()) {
+                    endCapturePractice(true); visibility = View.GONE
+                }
+            })
+        }
+        card.body.addView(note, 0)
+    }
+    private fun pulsePracticeTarget(target: View) {
+        stopPracticePulse()
+        if (!capturePractice) return
+        practicePulseTarget = target
+        practicePulse = android.animation.ValueAnimator.ofFloat(1f, 0.55f).apply {
+            duration = 400; repeatCount = 3; repeatMode = android.animation.ValueAnimator.REVERSE
+            addUpdateListener { if (capturePractice && target.isAttachedToWindow) target.alpha = it.animatedValue as Float }
+            start()
+        }
+    }
+
     override fun onBind(intent: Intent?) = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_PRACTICE) {
+            if (!stopped && sessionIsActive()) startCapturePractice()
+            return START_NOT_STICKY
+        }
         if (intent?.action != ACTION_START) { CaptureStatus.stop(this); stopSelf(); return START_NOT_STICKY }
         if (projection != null || stopped) return START_NOT_STICKY
         if (intent.getLongExtra(EXTRA_GENERATION, -1) != CaptureStatus.generation ||
             CaptureStatus.state.phase != CapturePhase.PREPARING) { stopSelf(); return START_NOT_STICKY }
         sessionGeneration = intent.getLongExtra(EXTRA_GENERATION, -1)
+        if (intent.getBooleanExtra(EXTRA_PRACTICE, false)) startCapturePractice()
         try {
             check(Settings.canDrawOverlays(this)) { "请先允许显示悬浮窗" }
             startCaptureForeground()
@@ -1019,12 +1092,24 @@ class CaptureService : Service() {
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
+        // Retire every old hint/animation owner, but keep the user's practice intent when their
+        // actual reading app has a different orientation. Existing resize still retires all query
+        // authority and cards; only a newly located real bubble receives another instruction.
+        val continuePractice = capturePractice
+        val previousBubble = bubble
+        endCapturePractice(false)
+        capturePractice = continuePractice
         super.onConfigurationChanged(newConfig)
         if (!stopped && projection != null) {
             try {
                 val (width, height) = screenSize()
                 if (width != screenWidth || height != screenHeight) resize(width, height)
             } catch (e: Exception) { fail("无法更新捕获尺寸：${e.message}") }
+        }
+        val current = bubble
+        val owner = capturePracticeOwner
+        if (capturePractice && current != null && current === previousBubble) {
+            current.post { if (owner == capturePracticeOwner && bubble === current) showPracticeBubble(current) }
         }
     }
 
@@ -1754,10 +1839,18 @@ class CaptureService : Service() {
         // Left half keeps the original one-stroke action; the visible right half opens the input.
         view.setOnClickListener { beginLiveSelection() }
         view.onInput = { openManualInput("") }
-        return try { windows.addView(view, params); bubble = view; true }
+        return try {
+            windows.addView(view, params); bubble = view
+            val owner = capturePracticeOwner
+            view.post { if (owner == capturePracticeOwner && bubble === view) showPracticeBubble(view) }
+            true
+        }
         catch (e: Exception) { fail("悬浮窗不可用：${e.message}"); false }
     }
-    private fun removeBubble() { bubble?.let { runCatching { windows.removeViewImmediate(it) } }; bubble = null }
+    private fun removeBubble() {
+        // Never leave a tutorial window or pulse in the clean ENTRY/lift sampling path.
+        practiceHint?.close(); practiceHint = null
+        bubble?.let { runCatching { windows.removeViewImmediate(it) } }; bubble = null }
 
     /**
      * A compact, non-full-screen result/pending card. FLAG_NOT_TOUCH_MODAL keeps everything outside
@@ -2024,6 +2117,7 @@ class CaptureService : Service() {
         }
     }
     private fun removePanelView() {
+        stopPracticePulse()
         // Every removal retires the old card owner, including replacement by a newer success card,
         // dismissal and service stop. A late retry click from the removed card is then a no-op.
         panelOwner++
@@ -2939,6 +3033,9 @@ class CaptureService : Service() {
         card.exit.textSize = 15f
         card.exit.contentDescription = "关闭输入框，返回悬浮条（不停止查词）"
         val content = card.body
+        addPracticeNote(card, "输入后点「查询」才会收录；也可点「下一步」返回悬浮条，不产生查询。") {
+            if (manualInputSession === session && manualInput === card && closeManualInput(session, card)) showBubble()
+        }
         content.addView(text("输入一个英文词头后点「查询」或键盘搜索键；打开或编辑不会自动查询。", 13f, Paper.secondary))
         val entry = row()
         // Field and query action share the top row, so both stay above the keyboard.
@@ -3285,6 +3382,13 @@ class CaptureService : Service() {
         val event = QueryEvent(UUID.randomUUID().toString(), entry.key, raw, entry.key, System.currentTimeMillis())
         val saveCommitted = AtomicBoolean(false)
         val card = compactCard(entry.headword)
+        if (capturePractice) {
+            if (manual) practiceManualResult = true
+            addPracticeNote(card, if (manual) "这是你手动输入后真实查到的词义。点底部「退出」回到题页上的悬浮条。"
+                else "已在真实页面取到词义。可以按住顶部标题拖动；点「下一步」打开真实手动输入。") {
+                if (manual) { dismissPanel(); showBubble() } else openManualInput("")
+            }
+        }
         // The save/undo status is the core feedback of this card, so it stays in the fixed header
         // (directly under the headword) and cannot be scrolled out of sight by a long meaning or an
         // open inline editor. Its text and color are still driven by the same invalidate/save
@@ -3340,6 +3444,7 @@ class CaptureService : Service() {
         }); content.space(4)
         content.addView(supplementStatus); content.addView(editorHost)
         mountCompactCard(card)
+        if (capturePractice) pulsePracticeTarget(if (manual) card.exit else card.header)
         val guard = DefinitionGuard(entry.key, credential, page, manual, status, undo, correct, retry)
         definitionGuard = guard
         correct.setOnClickListener {
@@ -3537,6 +3642,7 @@ class CaptureService : Service() {
     }
     override fun onTaskRemoved(rootIntent: Intent?) { CaptureStatus.stop(this) }
     override fun onDestroy() {
+        endCapturePractice(false)
         perf.end("stopped", "session_stop")
         stopped = true
         // Closing the session before removing anything else suppresses every in-flight ML Kit

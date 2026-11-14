@@ -76,9 +76,11 @@ class MainNavigation(
             main.space(8)
             main.addView(navButton(it), LinearLayout.LayoutParams(-1, -2))
         }
-        main.space(8)
-        val moreItems = items.filter { it.id !in primaryIds && it.id != "TRANSLATION" && it.id != "GUIDE" }
-        main.addView(moreButton(moreItems), LinearLayout.LayoutParams(-1, -2))
+        main.space(12)
+        main.addView(context.text("工具", 13f, Paper.secondary))
+        items.filter { it.id !in primaryIds && it.id != "TRANSLATION" && it.id != "GUIDE" }.forEach {
+            main.addView(navButton(it), LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = context.dp(4) })
+        }
         sidebar.addView(ScrollView(context).apply { addView(main) }, LinearLayout.LayoutParams(-1, 0, 1f))
         sidebar.divider()
         items.firstOrNull { it.id == "GUIDE" }?.let {
@@ -99,6 +101,9 @@ class MainNavigation(
         // Exactly four fixed entries. Every other original route, including settings, is here.
         addView(moreButton(secondary), LinearLayout.LayoutParams(0, -2, 1f))
     }
+
+    /** The real navigation button; used only by explicit interactive practice. */
+    fun practiceTarget(id: String): View? = buttons[id]
 
     private fun retireMoreMenu() {
         val retired = moreMenu
