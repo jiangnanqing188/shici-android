@@ -17,7 +17,7 @@
 | 设备与分支 | 最新测试包 | 当前区别 |
 | --- | --- | --- |
 | 平板：[codex/android-mvp](https://github.com/jiangnanqing188/shici-android/tree/codex/android-mvp) | [2.8.0 / 55](https://github.com/jiangnanqing188/shici-android/releases/tag/v2.8.0-tablet-test) | 宽屏侧栏直接入口、列表与详情分栏、真实界面动画引导和“下一步” |
-| 手机：[codex/phone-adaptation](https://github.com/jiangnanqing188/shici-android/tree/codex/phone-adaptation) | [2.7.0 / 54](https://github.com/jiangnanqing188/shici-android/releases/tag/v2.7.0-phone-test) | 固定四入口、紧凑布局与键盘适配；尚未同步平板 2.8 引导 |
+| 手机：[codex/phone-adaptation](https://github.com/jiangnanqing188/shici-android/tree/codex/phone-adaptation) | [2.8.0 / 55](https://github.com/jiangnanqing188/shici-android/releases/tag/v2.8.0-phone-test) | 保留固定四入口、紧凑布局与键盘适配；同步真实界面引导、下一步与锚定“更多”菜单 |
 
 从 Release 的 **Assets** 下载对应的 `.apk`；`Source code` 压缩包是源码，不能直接安装。每个 Release 提供安装包大小与 SHA-256 校验文件。
 
@@ -38,7 +38,7 @@
 1. 安装对应测试包，先用“查词”页输入一个单词。
 2. 需要在其他应用上查词时，主动开启悬浮查词，按系统提示授予悬浮窗、屏幕捕获等权限。
 3. 回到阅读材料，点击悬浮条的划词入口，在词上划过并抬手；有候选时先选词，再查看结果。
-4. 在生词本整理记录，在“复习”里完成当天任务。平板 2.8 的使用引导可在真实页面上跟着操作，也可用“下一步／跳过”。
+4. 在生词本整理记录，在“复习”里完成当天任务。2.8 的使用引导可在真实页面上跟着操作，也可用“下一步／跳过”。
 
 ## 数据与权限
 
@@ -53,7 +53,7 @@
 - **大幅滚屏后连续重划**仍有失败或笔迹不显示的已知问题；遇到时可先停止滚动、退出后重开，或使用手动输入。
 - 原始词义与词形没有逐条语义核对，不保证覆盖全部考试大纲；缺失释义不自动编造。
 - 平板 2.8 已保数据更新到真实设备；最后受影响范围检查为 6 通过、1 测试操作异常、1 未测。真实英文题页“划词 → 词卡 → 手动查询 → 退出”完整引导链尚未验完。
-- 手机 2.7 完成编译与有限本地验收，尚无这一版的手机真机验收。物理笔、大字号、不同厂商系统和长期功耗仍需进一步验证。
+- 手机 2.8 已同步真实界面引导，完成编译与有限本地宿主/源码验收，尚无这一版的手机真机验收。物理笔、大字号、不同厂商系统和长期功耗仍需进一步验证。
 - 可选翻译的真实下载、译文质量和设备兼容性不作普遍保证。
 
 详细记录在 [工作记录](工作记录/) 与 [验收清单](docs/原型验收清单.md)。历史结论保留当时范围，不将不同批次的通过数累加成“全软件通过”。

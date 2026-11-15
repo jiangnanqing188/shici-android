@@ -152,6 +152,11 @@ class MainActivity : Activity() {
     // The single live animated guide page. Only one may exist: a rebuild/re-entry pauses and closes
     // the old one before a new screen is created, so no detached instance keeps animating.
     private var guideScreen: UsageGuideScreen? = null
+    private enum class PracticeStep { LOOKUP, INPUT, WAIT_RESULT, CLOSE_RESULT, VOCABULARY, STUDY, COMPLETE, CAPTURE }
+    private var practiceStep: PracticeStep? = null
+    private var practiceCoach: PracticeCoach? = null
+    private var practiceGeneration = 0L
+    private var pendingCapturePractice = false
     // Translation page draft and the single owner of its ML Kit session. The draft survives page
     // switches and rotation; the translator itself is closed on leave/stop/destroy and is recreated
     // only when the page is entered again (which performs a local model check, never a download).
@@ -182,6 +187,7 @@ class MainActivity : Activity() {
     private var lookupSelectionStart = 0
     private var lookupSelectionEnd = 0
     private var lookupInputView: EditText? = null
+    private var lookupPracticeArea: View? = null
     // Personal-entry page: the page owns one editor generation at a time. A source captured from a
     // lookup card keeps that card's original deletion credential and user-row snapshot; a direct
     // navigation read is the only path allowed to capture a fresh credential, at the explicit action.
@@ -526,6 +532,10 @@ class MainActivity : Activity() {
         loadDictionaryStatus()
     }
     override fun onStop() {
+        // No coach can cover another app or a system permission window.
+        closePracticeCoach()
+        practiceStep = null
+        practiceGeneration++
         // Refuse every favorite mutation that was queued by a surface that is no longer in front.
         foreground = false
         interactionEpoch++
@@ -560,6 +570,7 @@ class MainActivity : Activity() {
         super.onStop()
     }
     override fun onDestroy() {
+        closePracticeCoach(); practiceStep = null; pendingCapturePractice = false
         foreground = false
         interactionEpoch++
         // Idempotent: also covers a destroy that never received onStop. The translator, its pending
@@ -585,6 +596,7 @@ class MainActivity : Activity() {
     }
     @Deprecated("Legacy Activity back handling is retained; no AndroidX dependency is added")
     override fun onBackPressed() {
+        if (practiceStep != null) { endPractice(false); return }
         // Back from any functional page returns home and closes that page's editor generation;
         // pressing back on home keeps the platform exit behavior.
         if (page != MainPage.HOME) {
@@ -734,6 +746,15 @@ class MainActivity : Activity() {
     }
 
     private fun selectPage(target: MainPage) {
+        if (target != page) {
+            practiceStep = when {
+                practiceStep == PracticeStep.LOOKUP && target == MainPage.LOOKUP -> PracticeStep.INPUT
+                practiceStep == PracticeStep.VOCABULARY && target == MainPage.VOCABULARY -> PracticeStep.STUDY
+                practiceStep == PracticeStep.STUDY && target == MainPage.STUDY -> PracticeStep.COMPLETE
+                else -> null
+            }
+            closePracticeCoach()
+        }
         if (target == page) { renderNavState(); return }
         // A new page retires mutations (for example a favorite write) queued by the old page.
         interactionEpoch++
@@ -819,6 +840,7 @@ class MainActivity : Activity() {
     }
 
     private fun render() {
+        closePracticeCoach()
         // Compatibility bridge for the historical reflection host and any old caller that still
         // writes the five legacy indices. Product navigation always keeps [currentTab] equal to
         // [page]'s legacy mirror, so this cannot override an enum-selected page (LOOKUP and
@@ -834,7 +856,7 @@ class MainActivity : Activity() {
         dictionaryStatusView = null; dictionaryDetailView = null
         backupExportButton = null; restoreButton = null; backupStatusView = null
         settingsScreen = null
-        lookupInputView = null; personalStatusView = null
+        lookupInputView = null; lookupPracticeArea = null; personalStatusView = null
         vocabularyToolbar = null; selectionPanel = null; vocabularyScroll = null
         // A rebuild never leaves the previous guide screen alive behind detached views. It is closed
         // permanently; the GUIDE branch below creates the only new instance when it is still current.
@@ -852,6 +874,7 @@ class MainActivity : Activity() {
             MainPage.SETTINGS -> settings()
             MainPage.GUIDE -> guidePage()
         }
+        updatePracticeCoach()
     }
     private fun scrolled(): LinearLayout {
         val content = column()
@@ -938,22 +961,103 @@ class MainActivity : Activity() {
      * and no topic action queries, records, downloads or deletes anything.
      */
     private fun guidePage() {
-        // render() already closed the previous instance; this is the defensive single-owner path.
-        guideScreen?.close()
-        val screen = UsageGuideScreen(
-            context = this,
-            firstRun = false,
-            initialTopicId = null,
-            onNavigate = { id -> MainPage.fromStableName(id)?.let { selectPage(it) } },
-            onDismissFirstRun = { markGuideSeen() },
-            onBack = { selectPage(MainPage.HOME) }
-        )
-        guideScreen = screen
-        // The component is already a ScrollView; do not wrap it in scrolled().
-        body.addView(screen.view, LinearLayout.LayoutParams(-1, -1))
-        // Drive the single bounded demo only while this page is actually in front. onCreate's first
-        // render is before onStart, so onStart performs the resume for that path.
-        if (foreground) screen.onHostResume()
+        guideScreen?.close(); guideScreen = null
+        val content = scrolled()
+        content.addView(text("跟着实际操作", 28f, bold = true)); content.space(8)
+        content.addView(text("直接在你的界面练习，高亮真实按钮；完成操作后继续。", 16f, Paper.secondary))
+        content.space(16)
+        content.addView(button("从查词开始", true) {
+            endPractice(false)
+            selectPage(MainPage.HOME)
+            practiceGeneration++; practiceStep = PracticeStep.LOOKUP
+            updatePracticeCoach()
+        }, LinearLayout.LayoutParams(-1, -2))
+        content.addView(text("输入与查询 → 看真实词义 → 生词本 → 复习。查询成功会按正常规则收录。", 15f, Paper.secondary))
+        content.space(16)
+        content.addView(button("在我的题页练划词") {
+            endPractice(false)
+            if (CaptureStatus.state.phase == CapturePhase.ACTIVE) {
+                startService(Intent(this, CaptureService::class.java).setAction(CaptureService.ACTION_PRACTICE))
+                toast("切到你的阅读页，跟随真实悬浮条练习")
+            } else {
+                selectPage(MainPage.HOME)
+                practiceGeneration++; practiceStep = PracticeStep.CAPTURE
+                pendingCapturePractice = true
+                updatePracticeCoach()
+            }
+        }, LinearLayout.LayoutParams(-1, -2))
+        content.addView(text("使用当前页面和真实词卡。系统授权由你确认；不会自动截图、代点、查询或下载模型。", 15f, Paper.secondary))
+        content.space(16)
+        content.addView(button("返回首页") { selectPage(MainPage.HOME) })
+    }
+
+    private fun closePracticeCoach() { practiceCoach?.close(); practiceCoach = null }
+
+    private fun endPractice(markSeen: Boolean) {
+        closePracticeCoach(); practiceStep = null; pendingCapturePractice = false
+        practiceGeneration++
+        if (markSeen) markGuideSeen()
+    }
+
+    private fun nextPracticeStep() {
+        when (practiceStep) {
+            PracticeStep.LOOKUP -> selectPage(MainPage.LOOKUP)
+            PracticeStep.INPUT -> {
+                // Explicitly browsing the next real page is not a successful query or collection.
+                practiceStep = PracticeStep.VOCABULARY
+                selectPage(MainPage.VOCABULARY)
+            }
+            PracticeStep.VOCABULARY -> selectPage(MainPage.VOCABULARY)
+            PracticeStep.STUDY -> selectPage(MainPage.STUDY)
+            PracticeStep.CAPTURE -> {
+                if (CaptureStatus.state.phase == CapturePhase.ACTIVE) {
+                    startService(Intent(this, CaptureService::class.java).setAction(CaptureService.ACTION_PRACTICE))
+                    endPractice(false)
+                } else if (CaptureStatus.state.phase != CapturePhase.PREPARING && CaptureStatus.state.phase != CapturePhase.STOPPING) {
+                    beginCapture()
+                } else toast("请先完成当前授权，也可以跳过引导")
+            }
+            else -> Unit
+        }
+    }
+
+    private fun updatePracticeCoach() {
+        closePracticeCoach()
+        if (!foreground || isFinishing || isDestroyed) return
+        val step = practiceStep ?: return
+        if (step == PracticeStep.WAIT_RESULT || step == PracticeStep.CLOSE_RESULT) return
+        val target: View? = when (step) {
+            PracticeStep.LOOKUP -> navigation.practiceTarget(MainPage.LOOKUP.name)
+            PracticeStep.INPUT -> lookupPracticeArea
+            PracticeStep.VOCABULARY -> navigation.practiceTarget(MainPage.VOCABULARY.name)
+            PracticeStep.STUDY -> navigation.practiceTarget(MainPage.STUDY.name)
+            PracticeStep.CAPTURE -> floatingSwitch
+            else -> null
+        }
+        if (target == null && step != PracticeStep.COMPLETE) { endPractice(false); return }
+        val message = when (step) {
+            PracticeStep.LOOKUP -> "先点这里的「查词」。"
+            PracticeStep.INPUT -> "输入单词并查询；也可点「下一步」先认识生词本，不会自动查询或收录。"
+            PracticeStep.VOCABULARY -> "词义已显示。是否收录以词卡状态为准；点「生词本」查看实际词条。"
+            PracticeStep.STUDY -> "这里是你的生词本。点「复习」，查看今天的真实计划。"
+            PracticeStep.COMPLETE -> "已到达真实复习页面。每题四个答案，只有你实际作答才产生反馈。"
+            PracticeStep.CAPTURE -> "打开这个真实开关。授权说明和系统确认都由你操作；返回后切到自己的题页。"
+            else -> return
+        }
+        val owner = practiceGeneration
+        practiceCoach = PracticeCoach(window.decorView as ViewGroup, target, message,
+            onSkip = { if (owner == practiceGeneration) endPractice(true) },
+            onFinish = if (step == PracticeStep.COMPLETE) ({ if (owner == practiceGeneration) endPractice(true) }) else null,
+            onNext = { if (owner == practiceGeneration && practiceStep == step) nextPracticeStep() },
+            onTargetGone = { if (owner == practiceGeneration) endPractice(false) })
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        // A cancelled candidate/missing card resumes real input, never fabricates a successful step.
+        if (hasFocus && foreground && practiceStep == PracticeStep.WAIT_RESULT && activeDialog?.isShowing != true) {
+            practiceStep = PracticeStep.INPUT; updatePracticeCoach()
+        }
     }
 
     private fun vocabulary() {
@@ -1428,12 +1532,16 @@ class MainActivity : Activity() {
                 // run the same manualLookup that button/IME submissions always used.
                 lookupQuery = text
                 captureLookupDraft()
+                if (practiceStep == PracticeStep.INPUT && page == MainPage.LOOKUP) {
+                    practiceStep = PracticeStep.WAIT_RESULT; closePracticeCoach()
+                }
                 manualLookup(text)
             },
             onOpenPersonalEntry = { selectPage(MainPage.PERSONAL_ENTRY) }
         )
         // onSaveInstanceState, page switches and rotation capture the draft through this field.
         lookupInputView = screen.input
+        lookupPracticeArea = screen.practiceArea
         body.addView(screen.view, LinearLayout.LayoutParams(-1, -1))
     }
 
@@ -3032,7 +3140,10 @@ class MainActivity : Activity() {
                     val intent = Intent(this, CaptureService::class.java).setAction(CaptureService.ACTION_START)
                         .putExtra(CaptureService.EXTRA_RESULT, resultCode).putExtra(CaptureService.EXTRA_DATA, data)
                         .putExtra(CaptureService.EXTRA_GENERATION, consentGeneration)
-                    runCatching { startForegroundService(intent) }.onFailure { permissionError("无法启动捕获服务：${it.message}") }
+                        .putExtra(CaptureService.EXTRA_PRACTICE, pendingCapturePractice)
+                    runCatching { startForegroundService(intent) }
+                        .onSuccess { endPractice(false) }
+                        .onFailure { permissionError("无法启动捕获服务：${it.message}") }
                 } else permissionError("已取消屏幕捕获，查词未开启")
             }
             else -> if (interruptedDocumentRequests.remove(requestCode)) {
@@ -3061,7 +3172,7 @@ class MainActivity : Activity() {
             }
         }
     }
-    private fun permissionError(message: String) { stopCapture(); CaptureStatus.update(CapturePhase.ERROR, message); toast(message) }
+    private fun permissionError(message: String) { endPractice(false); stopCapture(); CaptureStatus.update(CapturePhase.ERROR, message); toast(message) }
 
     private fun manualLookup(raw: String, replaces: String? = null, originalRaw: String = raw,
                              credentialOverride: Long? = null) {
@@ -3264,6 +3375,7 @@ class MainActivity : Activity() {
     private fun showManualDefinition(raw: String, form: String, entry: DictionaryEntry,
                                       initialUser: UserDictionaryEntry?, replaces: String?,
                                       deletionCredential: Long, readRevision: Long) {
+        val practiceOwner = practiceGeneration
         var sourceRevision = readRevision
         val content = panel()
         content.addView(text(entry.headword, 28f, bold = true).apply { typeface = Typeface.create("serif", Typeface.BOLD) })
@@ -3326,6 +3438,10 @@ class MainActivity : Activity() {
         val token = manualGate.next()
         guard = ManualGuard(entry.key, deletionCredential, status, undo, correct, retry, supplement)
         dialog.setOnDismissListener {
+            if (practiceOwner == practiceGeneration && practiceStep == PracticeStep.CLOSE_RESULT && activeDialog === dialog) {
+                closePracticeCoach(); practiceStep = PracticeStep.VOCABULARY
+                main.post { if (practiceOwner == practiceGeneration && page == MainPage.LOOKUP) updatePracticeCoach() }
+            }
             // Closing this card window closes only the editors it opened; a newer card's editor lease
             // stays live, so its own save is still admitted on its owner.
             cancelPendingPersonalHandoff(handoffToken)
@@ -3334,6 +3450,17 @@ class MainActivity : Activity() {
             if (manualGate.accepts(token)) manualGate.next()
         }
         dialog.show()
+        if (practiceOwner == practiceGeneration && practiceStep == PracticeStep.WAIT_RESULT) {
+            practiceStep = PracticeStep.CLOSE_RESULT
+            practiceCoach = PracticeCoach(dialog.window!!.decorView as ViewGroup,
+                dialog.getButton(AlertDialog.BUTTON_NEGATIVE), "这是真实词义与收录状态。看完点「关闭」，继续查看生词本。",
+                onSkip = { if (practiceOwner == practiceGeneration) endPractice(true) },
+                onNext = {
+                    if (practiceOwner == practiceGeneration && practiceStep == PracticeStep.CLOSE_RESULT &&
+                        activeDialog === dialog && dialog.isShowing) dialog.dismiss()
+                },
+                onTargetGone = { if (practiceOwner == practiceGeneration) endPractice(false) })
+        }
         manualGuard = guard
         val event = QueryEvent(UUID.randomUUID().toString(), entry.key, raw, entry.key, System.currentTimeMillis())
         val saveCommitted = java.util.concurrent.atomic.AtomicBoolean(false)

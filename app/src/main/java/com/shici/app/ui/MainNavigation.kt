@@ -1,6 +1,5 @@
 package com.shici.app.ui
 
-import android.app.AlertDialog
 import android.content.Context
 import android.graphics.Typeface
 import android.view.Gravity
@@ -9,6 +8,7 @@ import android.view.ViewGroup
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.PopupMenu
 
 /** Stable route ids belong to the host. Navigation only draws and forwards explicit selections. */
 class MainNavigation(
@@ -25,7 +25,7 @@ class MainNavigation(
     private val compact = !wide
     private val primaryIds = listOf("LOOKUP", "VOCABULARY", "STUDY")
     private val moreId = "MORE"
-    private var moreDialog: AlertDialog? = null
+    private var moreMenu: PopupMenu? = null
     private var selectedRoute = selectedId
 
     val view: View = if (wide) wideView(items, settings) else compactView(items, settings)
@@ -34,13 +34,13 @@ class MainNavigation(
         setSelected(selectedId)
         view.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
             override fun onViewAttachedToWindow(v: View) {}
-            override fun onViewDetachedFromWindow(v: View) { retireMoreDialog() }
+            override fun onViewDetachedFromWindow(v: View) { retireMoreMenu() }
         })
     }
 
     /** No scrolling or posted reveal: an old SETTINGS selection cannot move a later HOME route. */
     fun setSelected(id: String) {
-        if (selectedRoute != id) retireMoreDialog()
+        if (selectedRoute != id) retireMoreMenu()
         selectedRoute = id
         val visibleId = if (compact && id !in primaryIds) moreId else id
         buttons.forEach { (buttonId, button) ->
@@ -68,27 +68,23 @@ class MainNavigation(
         }
         val more = navButton(Item(moreId, "更多")).apply {
             contentDescription = "更多：首页、添加补词、翻译、统计、使用引导、设置"
-            setOnClickListener {
-                if (wrapper.isAttachedToWindow && moreDialog?.isShowing != true) {
-                    retireMoreDialog()
-                    val openingRoute = selectedRoute
-                    val current = secondary.indexOfFirst { it.id == openingRoute }
-                    lateinit var dialog: AlertDialog
-                    dialog = AlertDialog.Builder(context)
-                        .setTitle("更多功能")
-                        .setSingleChoiceItems(secondary.map { it.label }.toTypedArray(), current) choice@{ source, which ->
-                            // Capture this exact menu, never a replacement menu's current owner.
-                            if (source !== dialog || moreDialog !== dialog || !dialog.isShowing ||
-                                !wrapper.isAttachedToWindow || selectedRoute != openingRoute) return@choice
-                            retireMoreDialog()
-                            onSelect(secondary[which].id)
-                        }
-                        .setNegativeButton("关闭", null)
-                        .create()
-                    moreDialog = dialog
-                    dialog.setOnDismissListener { if (moreDialog === dialog) moreDialog = null }
-                    dialog.show()
+            setOnClickListener { anchor ->
+                retireMoreMenu()
+                if (!wrapper.isAttachedToWindow || !anchor.isAttachedToWindow) return@setOnClickListener
+                val openingRoute = selectedRoute
+                val menu = PopupMenu(context, anchor)
+                moreMenu = menu
+                secondary.forEachIndexed { index, item -> menu.menu.add(0, index, index, item.label) }
+                menu.setOnDismissListener { if (moreMenu === it) moreMenu = null }
+                menu.setOnMenuItemClickListener choice@{ item ->
+                    if (moreMenu !== menu || !wrapper.isAttachedToWindow || !anchor.isAttachedToWindow ||
+                        selectedRoute != openingRoute) return@choice false
+                    val destination = secondary.getOrNull(item.itemId) ?: return@choice false
+                    retireMoreMenu()
+                    onSelect(destination.id)
+                    true
                 }
+                menu.show()
             }
         }
         row.addView(more, LinearLayout.LayoutParams(0, -2, 1f))
@@ -96,9 +92,12 @@ class MainNavigation(
         return wrapper
     }
 
-    private fun retireMoreDialog() {
-        val previous = moreDialog
-        moreDialog = null
+    /** The existing real button; no guide owns a duplicate or an estimated hit area. */
+    fun practiceTarget(id: String): View? = buttons[id]
+
+    private fun retireMoreMenu() {
+        val previous = moreMenu
+        moreMenu = null
         previous?.dismiss()
     }
 
@@ -112,7 +111,7 @@ class MainNavigation(
         sidebar.addView(context.text("专注阅读 · 随手拾词", 14f, Paper.secondary))
         sidebar.space(16)
         val main = context.column()
-        items.forEach { item ->
+        items.filter { it.id != "GUIDE" }.forEach { item ->
             main.addView(navButton(item), LinearLayout.LayoutParams(-1, -2).apply {
                 bottomMargin = context.dp(6)
             })
@@ -121,6 +120,9 @@ class MainNavigation(
         sidebar.addView(separator(), LinearLayout.LayoutParams(-1, context.dp(1)).apply {
             topMargin = context.dp(12); bottomMargin = context.dp(12)
         })
+        items.firstOrNull { it.id == "GUIDE" }?.let {
+            sidebar.addView(navButton(it), LinearLayout.LayoutParams(-1, -2))
+        }
         sidebar.addView(navButton(settings), LinearLayout.LayoutParams(-1, -2))
         return sidebar
     }

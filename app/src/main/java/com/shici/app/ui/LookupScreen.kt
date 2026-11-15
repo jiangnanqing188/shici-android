@@ -43,6 +43,9 @@ class LookupScreen(
     /** The editable field; the Activity keeps this as its `lookupInputView` for draft capture. */
     val input: EditText
 
+    /** The real input, clear and query area for the interactive guide. */
+    val practiceArea: View
+
     /** Complete scrollable page body. No sidebar and no root padding; the host body supplies those. */
     val view: View
 
@@ -57,6 +60,8 @@ class LookupScreen(
             setPadding(context.dp(16), context.dp(16), context.dp(16), context.dp(16))
             background = context.shape(Paper.surface, border = true)
         }
+
+        practiceArea = card
 
         input = context.inputField("输入英文单词", true)
         // Restore the draft before the watcher is attached so restoring never looks like a user edit
