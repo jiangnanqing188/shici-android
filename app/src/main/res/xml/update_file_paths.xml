@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Only the one private sub-directory that holds an already downloaded, length/size/SHA-256 and
+  package/signature verified APK is shared, and only read-only for a granted content URI.
+  Nothing else in the app cache (screen bitmaps, lookups, drafts) is exposed.
+-->
+<paths>
+    <cache-path name="verified_updates" path="updates/verified/" />
+</paths>

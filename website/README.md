@@ -1,5 +1,13 @@
 # 拾词官网（私有开发目录）
 
+## A01：官网 APK 明文分发止血（2026-11-17，本地候选，未上线）
+
+- 下载页仅导航到 `jiangnanqing188/shici-android` 的 HTTPS Release 页面：安卓手机 `v2.8.0-phone-test`，安卓平板 `v2.8.0-tablet-test`。均为 2.8.0 / 55 Debug 测试包，但附件不同；点按只打开发布页，不自动下载。版本及附件核对依据见 `../工作记录/20261117-2-A01与A03首批修复任务单.md` 的 A01；该证据仅为 Release 元数据核对，不代表重新下载或哈希整包。
+- 官网页面仍为 HTTP，内容和链接都可能被篡改。应从已知的 GitHub 仓库独立打开对应设备的 Release，核对附件、大小和 `SHA256SUMS.txt`；不把官网或同页校验值当作信任锚。本候选不迁移站点 HTTPS。Apple 仍为纯文字；安装前备份及大幅滚屏后划词失败的已知问题提示继续保留。
+- 四页共享资源引用统一为 `20261117a`。候选 `deploy/nginx.conf` 移除 `/downloads/shici-2.6.1-52.apk` 的精确路由；该路径的 GET/HEAD 在候选中应落入 404，不删除原文件。保留原七个静态文件及首页 `/` 别名、GET/HEAD 限制和 443 边界；未运行安装脚本，未探测、变更或重载生产站点。
+
+下面的日期章节是各批历史记录，不代表本地候选或已完成线上止血。
+
 ## 新版 Logo（2026-11-08）
 
 本批使用用户最终批准的首版“墨绿底＋米色托手＋a 词卡”，不采用后续三个备选。CSS 内嵌 96×96 PNG 供四页页头/页尾复用，四页内嵌 favicon 为同源 64×64 PNG；原图只按尺寸派生，不重画、改色或改变页面布局。
@@ -69,7 +77,7 @@ Android 仅本机源码和构建产物同步新版 Launcher，仍为 2.6.2/53，
 - `content.js`：全部简体中文产品文案和发布配置，只声明 `window.SHICI_SITE`；稳定产品简介、每页标题/meta、平台文案与分状态文案分开存放。
 - `app.js`：四页共用的渲染脚本，读取 `window.SHICI_SITE`，把 `publicRelease` 校验为唯一发布状态，并据此统一渲染每页标题/meta、运行要求、下载区、hero 提示和页脚；按 `data-page` 选择页面文案，并对不存在的容器逐块跳过；`repositoryUrl` 仍按 `null` 处理。
 
-每页按顺序先加载 `content.js`，再加载 `app.js`，两者都带同一版本查询值。修改文案时只改 `content.js` 中对应字段，不把事实写死在 HTML 或 JS 里。2026-11-01 之前只有 `index.html` 单页，上述四页结构自本批起生效。
+每页按顺序先加载 `content.js`，再加载 `app.js`，与 `styles.css` 共用同一版本查询值。发布地址只在 `content.js` 配置，HTML 的无脚本说明不提供下载链接。四页结构自 2026-11-01 生效。
 
 ## Logo当前状态（2026-10-28）
 
@@ -226,44 +234,33 @@ systemctl daemon-reload
 
 - `publicRelease: null`：准备中，显示“公开测试版准备中 / 暂未开放下载”。
 - `publicRelease` 非空但任一条件不满足：配置不完整，显示“发布信息待确认 / 暂未开放下载”，不渲染下载链接。
-- `publicRelease` 全部条件满足：有效公开测试版，下载区、hero 提示和页脚统一显示已开放。
+- `publicRelease` 全部条件满足：下载区显示两个独立的 GitHub Release 页面入口，hero 提示和页脚统一说明发布渠道。
 
-`content.js` 的 `releaseStatus.preparing`、`releaseStatus.incomplete`、`releaseStatus.open` 只是上述三种状态的中文文案来源，不参与状态判定。`app.js` 先校验 `publicRelease`，再用同一个状态选择文案，并在四页同时更新每页标题、`meta[name="description"]`、运行要求末项、下载区（页面存在时）、hero 下载提示和页脚说明，避免同一页出现“已开放下载”与“尚无公开发行包／暂未开放下载”并存。不要把 `open` 文案当作已发布的证据，也不要通过只改状态文案来制造可下载状态。
+`content.js` 中的 `releaseStatus` 只提供中文文案，不参与校验。`app.js` 根据同一个状态更新各页的 `meta[name="description"]`、运行要求末项、下载区、hero 提示和页脚（若该页存在对应区块）。`open` 只表示本地配置满足规则，不证明线上站点已更新或目标附件已重新核验。
 
 `description` 只写稳定产品简介，不写发布状态；状态句放在 `releaseStatus` 中。运行要求的前三项是稳定内容，第四项由当前状态的 `requirement` 生成。状态文案中的 `{name}`、`{version}` 会由页面替换为站点名和已校验的版本号。
 
 ## 上线时需要填写的字段
 
-目前 `content.js` 中：
-
-- `publicRelease` 当前为已校验通过的 2.6.1 / 52 测试包配置（2026-10-29 起公开）；若改为 `null` 则回到“公开测试版准备中 / 暂未开放下载”，不出现空链接或假下载。
-- `repositoryUrl` 必须保持 `null`，页面不渲染公开仓库入口；只有公开下载仓库真正创建并获批准后才填写真实地址。
-- `internalVersion` 当前为 `2.6.2`、`internalVersionCode` 为 `53`，只是本地开发参考，不代表已有公开发行包；公开可下载版本仍是 `publicRelease` 里的 2.6.1 / 52。
-- `description` 只写稳定产品简介；每页标题与 meta 描述在 `pages` 中维护，状态句、运行要求末项和页脚说明在 `releaseStatus` 中维护，平台按钮文案与共包说明在 `platforms` 中维护。
-
-将来有经过确认的公开测试包时，只改 `content.js` 的发布配置字段；三种状态的文案已在 `releaseStatus` 中准备好，不需要改 `app.js` 或逐处追改页面文案：
+本地候选的 `publicRelease` 如下。替换为新版本前，先独立确认两个设备的 Release 页面和附件：
 
 ```js
 publicRelease: {
-  version: '版本号',
-  versionCode: 1,
-  url: 'https://真实下载地址',
-  sha256: '64 位十六进制 SHA-256',
-  sizeLabel: '安装包大小',
-  releaseNotesUrl: 'https://真实更新说明地址',
+  version: '2.8.0',
+  versionCode: 55,
+  phoneReleaseUrl: 'https://github.com/jiangnanqing188/shici-android/releases/tag/v2.8.0-phone-test',
+  tabletReleaseUrl: 'https://github.com/jiangnanqing188/shici-android/releases/tag/v2.8.0-tablet-test',
   channel: 'test'
 }
 ```
 
 页面只在配置完整且有效时渲染下载链接，必须同时满足：
 
-- `version` 非空。
+- `version` 为三段数字版本号。
 - `versionCode` 为正整数。
-- `sha256` 为 64 位十六进制字符串。
-- `sizeLabel` 非空。
-- `url` 为绝对 `http:` 或 `https:` 地址，不能是 `#`、空值、相对路径或带用户名密码的地址。
+- 两个 URL 分别精确匹配该仓库的 `releases/tag/v<版本>-phone-test` 和 `releases/tag/v<版本>-tablet-test` HTTPS 页面。拒绝其他仓库、HTTP、附件直链、相对路径、凭据、查询串、片段及设备错配。
 - `channel` 为 `test`（当前只有公开测试包）。
 
-任一条件不满足时，页面不渲染下载链接，显示“发布信息待确认 / 暂未开放下载”，不会把占位或残缺配置当作可下载版本。`releaseNotesUrl` 为可选字段，同样只接受绝对 `http:` 或 `https:` 地址。
+任一条件不满足时，两个设备入口均不渲染链接，不回退到旧同源 APK。发布说明、附件大小和摘要从对应 GitHub Release 查看，不复制到 HTTP 官网作独立核验。
 
-`repositoryUrl` 只填写公开下载仓库的绝对 `http:` 或 `https:` 真实地址，页面只展示链接、不主动请求。不要使用示例域名、占位下载地址或未创建的仓库链接。正式接入前需要确认签名发布方式、包内容与许可、下载托管位置、SHA-256 和公开包状态；这些尚未确定。官网页面本身不发起网络请求；本轮只做上述 HTTP 80 静态站部署，不改变下载与发布状态。正式开放下载前仍需逐项核对页面事实。
+`repositoryUrl` 仍为 `null`，不额外开启页脚仓库入口；该字段如启用，只允许同一个已知仓库的 HTTPS 首页。站点不会主动请求 GitHub。`internalVersion` / `internalVersionCode` 仍为原开发参考 2.6.2 / 53，与发布入口的版本校验独立。平台和发布状态文案分别维护在 `platforms` 与 `releaseStatus`。

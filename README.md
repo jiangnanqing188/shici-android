@@ -12,7 +12,7 @@
 
 ## 下载与版本
 
-目前是持续开发的 **Debug 签名测试版**，尚未发布应用商店正式版。Android 8.0（API 26）及以上；暂不支持 iPhone、iPad。
+目前已发布的两端 2.8.0 / 55 都是 **Debug 签名、可调试的测试包**，尚未发布应用商店正式版。Android 8.0（API 26）及以上；暂不支持 iPhone、iPad。
 
 | 设备与分支 | 最新测试包 | 当前区别 |
 | --- | --- | --- |
@@ -44,7 +44,7 @@
 
 查词、学习记录、个人词义与复习进度保存在设备本机，没有账号、云同步或自建查询后端。屏幕捕获由用户主动授权，画面仅在本机内存中临时识别；可选文字直读需要用户另外开启无障碍服务，不自动代开。
 
-备份和 PDF 通过系统文件选择器保存。`.shicibackup` 为未加密的本地文件，请妥善保管。可选 ML Kit 翻译会涉及模型下载、更新及 SDK 诊断通信；不使用翻译不影响本地查词和学习功能。
+备份和 PDF 通过系统文件选择器保存。普通 `.shicibackup` 备份和恢复前安全副本均为未加密的明文；拾词不会主动上传，若选择云盘位置，提供方可能上传或同步文件，建议将敏感备份存到本机。恢复会完整覆盖当前学习数据（不合并）；PDF 不是备份，不能用于恢复。可选 ML Kit 翻译会涉及模型下载、更新及 SDK 诊断通信；不使用翻译不影响本地查词和学习功能。
 
 ## 已知限制与验证范围
 
@@ -111,13 +111,53 @@ cp .tools/generated-study-books/dictionary/study-books.tsv.bin \
 
 </details>
 
-准备资产后构建：
+准备资产后，本地开发使用 Debug 构建（仪器测试仍使用 Debug）：
 
 ```sh
 ./gradlew :app:assembleDebug
 ```
 
-输出为 `app/build/outputs/apk/debug/app-debug.apk`。自己构建使用本机签名，与已安装测试包签名可能不同；请先备份，不要通过卸载来绕过签名不一致。
+输出为 `app/build/outputs/apk/debug/app-debug.apk`，**不要用于新分发**。本机 Debug 签名可能与已安装测试包不同；请先备份，不要通过卸载绕过签名不一致。
+
+### 发行候选与上传前检查
+
+在对应设备分支准备同样的词库资产后，构建不可调试的发行候选：
+
+```sh
+./gradlew :app:assembleRelease
+```
+
+当前没有配置发行签名，默认输出 `app/build/outputs/apk/release/app-release-unsigned.apk`。这是**未签名候选，不能直接安装或上传**。不可调试与签名是两回事；即使包名相同，换证书也不等于可以原位覆盖旧测试包。签名方案和保数据升级须另行确认，不能用新证书或卸载绕过；已有测试包不因此改变。
+
+新分发（包括 GitHub Releases 和官网）不要沿用历史 Debug 包打包或上传脚本。签名方案另行获准后，上传前须对**最终拟上传的原件**运行下列只读检查。先设置 `ANDROID_HOME`、`CANDIDATE_APK`（最终 APK 绝对路径）、`PUBLISHED_APK`（对应渠道已公开 APK 绝对路径）、`PUBLISHED_SHA256`（该旧包已公开或已核验的 SHA-256，小写，不从候选取得）：
+
+```bash
+(
+  set -euo pipefail
+  export LC_ALL=C
+  : "${ANDROID_HOME:?}" "${CANDIDATE_APK:?}" "${PUBLISHED_APK:?}" "${PUBLISHED_SHA256:?}"
+  build_tools="$ANDROID_HOME/build-tools/35.0.0"
+  fail() { printf '%s\n' "$*" >&2; exit 1; }
+
+  published_sum=$(sha256sum < "$PUBLISHED_APK")
+  [[ "${published_sum%% *}" == "$PUBLISHED_SHA256" ]] || fail '已发布基准 APK 的 SHA-256 不符'
+  badging=$("$build_tools/aapt" dump badging "$CANDIDATE_APK") || fail '无法读取候选 APK'
+  [[ "$badging" != *application-debuggable* ]] || fail '拒绝可调试 APK'
+  printf '%s\n' "$badging" | grep "^package: name='com\.shici\.app' " || fail '候选应用 ID 不符'
+
+  signer_digests() {
+    local report
+    report=$("$build_tools/apksigner" verify --print-certs "$1") || return 1
+    printf '%s\n' "$report" | sed -nE 's/^Signer #[0-9]+ certificate SHA-256 digest: ([[:xdigit:]]{64})$/\1/p'
+  }
+  published_signers=$(signer_digests "$PUBLISHED_APK") || fail '已发布 APK 验签失败'
+  candidate_signers=$(signer_digests "$CANDIDATE_APK") || fail '候选 APK 验签失败'
+  [[ -n "$published_signers" && "$candidate_signers" == "$published_signers" ]] || fail '无法确认与原包同证书'
+  sha256sum -- "$CANDIDATE_APK"
+)
+```
+
+检查失败即停止分发；成功后仍须核对输出的版本名和 `versionCode` 与目标分支、发布计划一致，且 `versionCode` 不低于计划覆盖的已发布版本。记录最终 APK 的 SHA-256，并在获准发布前另行验证保数据原位升级。该检查只接受同证书，不代替升级验收，也不自动签名或上传。
 
 ## 目录与参与
 

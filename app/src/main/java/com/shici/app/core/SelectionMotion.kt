@@ -84,6 +84,8 @@ enum class FrameMatchReason {
     INVALID_DENSITY,
     PLANE_UNREADABLE,
     SEARCH_BUDGET_EXCEEDED,
+    OBSERVATION_ENDED,
+    TRANSLATION_NOT_ADMISSIBLE,
     GUARD_INVALID
 }
 
@@ -597,7 +599,9 @@ object SelectionMotion {
         candidate: CandidatePixels,
         protection: PixelBox?,
         excluded: List<PixelBox>,
-        maxOffset: Int
+        maxOffset: Int,
+        allowTranslation: Boolean = true,
+        stillObserving: () -> Boolean = { true }
     ): FrameMatch {
         // First handle stationary content with a small unrelated animation, before searching.
         val still = candidate.verify(PageShift.NONE, body, body, baselineBuckets, excluded, protection)
@@ -608,15 +612,22 @@ object SelectionMotion {
                 contextSamples = still.comparedPixels, changedContextSamples = still.changed,
                 edgeContextSamples = still.edges, changedEdgeContextSamples = still.changedEdges)
         }
-        return searchTranslation(body, baselineBuckets, candidate, protection, excluded, maxOffset).copy(
+        val shifted = if (allowTranslation)
+            searchTranslation(body, baselineBuckets, candidate, protection, excluded, maxOffset, stillObserving)
+        else rejected(FrameMatchKind.UNAVAILABLE, FrameMatchReason.TRANSLATION_NOT_ADMISSIBLE, protection, maxOffset)
+        return shifted.copy(
             contextSamples = still.comparedPixels, changedContextSamples = still.changed,
             edgeContextSamples = still.edges, changedEdgeContextSamples = still.changedEdges)
     }
 
     private fun searchTranslation(
         body: PixelBox, baselineBuckets: ShortArray, candidate: CandidatePixels,
-        protection: PixelBox?, excluded: List<PixelBox>, maxOffset: Int
+        protection: PixelBox?, excluded: List<PixelBox>, maxOffset: Int,
+        stillObserving: () -> Boolean
     ): FrameMatch {
+        fun observationEnded() = rejected(FrameMatchKind.UNAVAILABLE,
+            FrameMatchReason.OBSERVATION_ENDED, protection, maxOffset)
+        if (!stillObserving()) return observationEnded()
         val anchors = selectAnchors(body, baselineBuckets, excluded)
         val quadrantCount = anchors.mapTo(HashSet<Int>(4)) { it.quadrant }.size
         if (anchors.size < MIN_ANCHORS || quadrantCount < MIN_CONFIRMING_QUADRANTS) {
@@ -638,11 +649,14 @@ object SelectionMotion {
             val right = minOf(maxOffset, body.right - SIGNATURE_RADIUS - 1 - anchor.x)
             val topY = maxOf(-maxOffset, body.top + SIGNATURE_RADIUS - anchor.y)
             val bottom = minOf(maxOffset, body.bottom - SIGNATURE_RADIUS - 1 - anchor.y)
+            val anchorColor = bucketAt(baselineBuckets, body, anchor.x, anchor.y)
             for (dy in topY..bottom) for (dx in left..right) {
+                // A departed stroke must not keep the single capture thread occupied by a
+                // whole-screen scan while its clean lift/retry frame is waiting for delivery.
+                if ((positions and 255L) == 0L && !stillObserving()) return observationEnded()
                 if (++positions > MAX_SEARCH_POSITIONS) return rejected(FrameMatchKind.UNAVAILABLE,
                     FrameMatchReason.SEARCH_BUDGET_EXCEEDED, protection, maxOffset)
-                if (!LiveFrameFingerprint.bucketsMatch(
-                        bucketAt(baselineBuckets, body, anchor.x, anchor.y),
+                if (!LiveFrameFingerprint.bucketsMatch(anchorColor,
                         candidate.colorAt(anchor.x + dx, anchor.y + dy, body))) continue
                 if (!signatureMatches(baselineBuckets, body, anchor, candidate, dx, dy, excluded)) continue
                 if (!shiftAdmissible(body, protection, excluded, dx, dy, minOverlap)) continue
@@ -664,6 +678,7 @@ object SelectionMotion {
             protection, maxOffset, sampledAnchors = anchors.size)
         val strong = ArrayList<Pair<Confirmation, Verification>>(top.size)
         for (ranked in top) {
+            if (!stillObserving()) return observationEnded()
             val overlap = shiftedOverlap(body, ranked.shift.dx, ranked.shift.dy) ?: continue
             var confirming = 0
             for (anchor in anchors) {

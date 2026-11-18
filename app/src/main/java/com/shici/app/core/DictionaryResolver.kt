@@ -8,12 +8,9 @@ package com.shici.app.core
  */
 object DictionaryResolver {
     /**
-     * Resolves a raw manual/floating query through one strict priority: the normalized complete
-     * form is matched against the original exact headword and the current user supplement together,
-     * so a real dotted headword (including a user-only one) never loses to an original undotted
-     * fallback. Only when both sources miss that complete form may exactly one trailing sentence
-     * stop be removed, and the same original+user exact rule is applied once to the stripped form.
-     * Word forms come only from the source index; there is no suffix guessing or recursive joining.
+     * Tries the normalized complete form, then the form without surrounding punctuation. Both
+     * preserve real dotted headwords, including local entries, before falling back by one trailing
+     * period. Word forms come only from the source index; there is no suffix guessing or recursion.
      */
     fun lookup(
         dictionary: DictionaryStore,
@@ -38,10 +35,9 @@ object DictionaryResolver {
             return entries.values.toList().takeIf { it.isNotEmpty() }?.let { LookupResult.Match(key, it) }
         }
         candidates(form)?.let { return it }
-        // Full dotted headwords win, including a personal-only exact entry.
-        if (form.endsWith('.')) candidates(form.dropLast(1))?.let { return it }
         val unquoted = form.trim { it in " \"'“”()[]{}<>,;:!?«»" }
         if (unquoted != form && unquoted.isNotEmpty()) candidates(unquoted)?.let { return it }
+        if (unquoted.endsWith('.')) candidates(unquoted.dropLast(1).trimEnd())?.let { return it }
         return LookupResult.Missing(form)
     }
 

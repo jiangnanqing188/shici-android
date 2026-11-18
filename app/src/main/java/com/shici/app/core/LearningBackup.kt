@@ -1,10 +1,24 @@
 package com.shici.app.core
 
+import java.io.BufferedInputStream
+import java.io.BufferedOutputStream
+import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.io.Closeable
+import java.io.DataInputStream
+import java.io.DataOutputStream
+import java.io.EOFException
+import java.io.File
+import java.io.FileInputStream
+import java.io.InputStream
+import java.io.OutputStream
 import java.nio.ByteBuffer
 import java.nio.CharBuffer
 import java.nio.charset.CharacterCodingException
 import java.nio.charset.CodingErrorAction
+import java.nio.file.Files
+import java.security.DigestInputStream
+import java.security.DigestOutputStream
 import java.security.MessageDigest
 import java.time.LocalDate
 import java.time.ZoneId
@@ -124,6 +138,56 @@ data class LearningBackupData(
     val userEntries: List<BackupUserEntry> = emptyList()
 )
 
+/** A counted, synchronous row traversal. Repository instances must not outlive their read transaction. */
+internal class BackupRows<T>(val count: () -> Int, val visit: ((T) -> Unit) -> Unit) {
+    fun toList(): List<T> = buildList { visit { add(it) } }
+}
+
+internal class LearningBackupRows(
+    val words: BackupRows<BackupWord>,
+    val events: BackupRows<BackupEvent>,
+    val settings: BackupStudySettings,
+    val states: BackupRows<BackupStudyState>,
+    val reviews: BackupRows<BackupStudyReview>,
+    val session: BackupStudySession?,
+    val userEntries: BackupRows<BackupUserEntry>
+)
+
+/** Length and SHA-256 of the entire file, including the v4 checksum trailer. */
+data class BackupFileFingerprint(val byteCount: Long, val sha256: String)
+
+/** Validated header and exact preview counts, with no decoded table or pending-card payload. */
+internal data class LearningBackupPreview(
+    val appVersionName: String,
+    val appVersionCode: Int,
+    val schemaVersion: Int,
+    val createdAt: Long,
+    val formatVersion: Int,
+    val wordCount: Int,
+    val eventCount: Int,
+    val favoriteCount: Int,
+    val stateCount: Int = 0,
+    val reviewCount: Int = 0,
+    val hasSession: Boolean = false,
+    val userEntryCount: Int = 0
+) {
+    val legacyNoStudyData get() = formatVersion < LearningBackupCodec.STUDY_FORMAT_VERSION
+    val noPersonalDictionary get() = formatVersion < LearningBackupCodec.USER_DICTIONARY_FORMAT_VERSION
+    val hasFavorites get() = formatVersion >= LearningBackupCodec.FAVORITE_FORMAT_VERSION
+    val noFavorites get() = !hasFavorites
+}
+
+/** Receives validated rows synchronously in file order. No effect may commit before replay returns. */
+internal interface BackupRestoreSink {
+    fun word(row: BackupWord)
+    fun event(row: BackupEvent)
+    fun settings(row: BackupStudySettings)
+    fun state(row: BackupStudyState)
+    fun review(row: BackupStudyReview)
+    fun session(row: BackupStudySession)
+    fun userEntry(row: BackupUserEntry)
+}
+
 /** A validated backup file: its identity metadata plus the frozen raw tables. */
 data class LearningBackup(
     val appVersionName: String,
@@ -185,14 +249,45 @@ object LearningBackupCodec {
     const val USER_DICTIONARY_DB_SCHEMA_VERSION = 3
     const val STUDY_DB_SCHEMA_VERSION = 2
     const val LEGACY_DB_SCHEMA_VERSION = 1
+    // Compatibility limits for the ByteArray entry points, not the streaming file limit.
     const val MAX_FILE_BYTES = 64L * 1024 * 1024
     const val MAX_BYTES_LABEL = "64MiB"
+    const val MAX_STREAM_FILE_BYTES = 256L * 1024 * 1024
+    const val MAX_STREAM_BYTES_LABEL = "256MiB"
 
     private const val DIGEST_BYTES = 32
+    private const val BUFFER_BYTES = 64 * 1024
+    // The old whole-file limit already implied this per-field ceiling. No existing file loses support.
+    private const val MAX_STRING_BYTES = MAX_FILE_BYTES.toInt()
 
-    /** Encodes [data] with app identity/version/schema, creation time and a trailing SHA-256. */
+    /** Small-file compatibility wrapper. Use [encodeTo] or the repository writer for a large file. */
     fun encode(data: LearningBackupData, appVersionName: String, appVersionCode: Int, createdAt: Long): ByteArray {
-        val writer = BackupWriter(MAX_FILE_BYTES)
+        val output = ByteArrayOutputStream()
+        writeBackup(output, rowsOf(data), appVersionName, appVersionCode, createdAt, MAX_FILE_BYTES)
+        return output.toByteArray()
+    }
+
+    /**
+     * Writes the unchanged v4 wire format and flushes, but does not close [output]. Failure may
+     * leave partial bytes; publish only after write/close succeeds. No whole-file byte array is built.
+     */
+    fun encodeTo(output: OutputStream, data: LearningBackupData, appVersionName: String,
+                 appVersionCode: Int, createdAt: Long): BackupFileFingerprint =
+        encodeRows(output, rowsOf(data), appVersionName, appVersionCode, createdAt)
+
+    internal fun encodeRows(output: OutputStream, data: LearningBackupRows, appVersionName: String,
+                            appVersionCode: Int, createdAt: Long): BackupFileFingerprint =
+        writeBackup(output, data, appVersionName, appVersionCode, createdAt, MAX_STREAM_FILE_BYTES)
+
+    private fun rowsOf(data: LearningBackupData): LearningBackupRows {
+        fun <T> rows(list: List<T>): BackupRows<T> = BackupRows({ list.size }) { visit -> list.forEach(visit) }
+        return LearningBackupRows(rows(data.words), rows(data.events), data.settings, rows(data.states),
+            rows(data.reviews), data.session, rows(data.userEntries))
+    }
+
+    private fun writeBackup(output: OutputStream, data: LearningBackupRows, appVersionName: String,
+                            appVersionCode: Int, createdAt: Long, limit: Long): BackupFileFingerprint {
+        val writer = BackupWriter(output, limit)
         writer.writeAscii(MAGIC)
         writer.writeInt(FORMAT_VERSION)
         writer.writeString(APP_IDENTITY)
@@ -200,27 +295,31 @@ object LearningBackupCodec {
         writer.writeInt(appVersionCode)
         writer.writeInt(DB_SCHEMA_VERSION)
         writer.writeLong(createdAt)
-        writer.writeInt(data.words.size)
-        writer.writeInt(data.events.size)
-        data.words.forEach { word ->
+        val wordCount = data.words.count()
+        val eventCount = data.events.count()
+        writer.writeInt(wordCount)
+        writer.writeInt(eventCount)
+        writer.writeRows(data.words, wordCount) { word ->
             writer.writeString(word.entryKey); writer.writeString(word.headword); writer.writeString(word.partOfSpeech)
             writer.writeString(word.meaning); writer.writeString(word.source); writer.writeString(word.version)
             writer.writeBoolean(word.mastered); writer.writeString(word.note); writer.writeBoolean(word.favorite)
         }
-        data.events.forEach { event ->
+        writer.writeRows(data.events, eventCount) { event ->
             writer.writeString(event.id); writer.writeString(event.entryKey); writer.writeString(event.rawText)
             writer.writeString(event.finalForm); writer.writeLong(event.time); writer.writeBoolean(event.revoked)
         }
         writer.writeString(data.settings.selectedBook)
         writer.writeInt(data.settings.dailyNewGoal)
-        writer.writeInt(data.states.size)
-        data.states.forEach { state ->
+        val stateCount = data.states.count()
+        writer.writeInt(stateCount)
+        writer.writeRows(data.states, stateCount) { state ->
             writer.writeString(state.entryKey); writer.writeString(state.book); writer.writeInt(state.stage)
             writer.writeLong(state.dueAt); writer.writeLong(state.introducedAt); writer.writeLong(state.lastReviewAt)
             writer.writeLong(state.lastReviewSeq)
         }
-        writer.writeInt(data.reviews.size)
-        data.reviews.forEach { review ->
+        val reviewCount = data.reviews.count()
+        writer.writeInt(reviewCount)
+        writer.writeRows(data.reviews, reviewCount) { review ->
             writer.writeString(review.token); writer.writeString(review.entryKey); writer.writeString(review.feedback)
             writer.writeInt(review.stageBefore); writer.writeInt(review.stageAfter); writer.writeLong(review.dueAfter)
             writer.writeLong(review.reviewedAt); writer.writeString(review.dayKey); writer.writeString(review.zoneId)
@@ -235,14 +334,13 @@ object LearningBackupCodec {
             writer.writeString(it.source); writer.writeString(it.version); writer.writeString(it.dayKey)
             writer.writeLong(it.createdAt)
         }
-        writer.writeInt(data.userEntries.size)
-        data.userEntries.forEach { user ->
+        val userEntryCount = data.userEntries.count()
+        writer.writeInt(userEntryCount)
+        writer.writeRows(data.userEntries, userEntryCount) { user ->
             writer.writeString(user.entryKey); writer.writeString(user.partOfSpeech)
             writer.writeString(user.meaning); writer.writeLong(user.updatedAt)
         }
-        val body = writer.toByteArray()
-        if (body.size.toLong() + DIGEST_BYTES > MAX_FILE_BYTES) throw BackupFormatException("备份文件超过 $MAX_BYTES_LABEL 上限，未写出或读取")
-        return body + sha256(body)
+        return writer.finish()
     }
 
     /**
@@ -252,13 +350,151 @@ object LearningBackupCodec {
      * default settings with an empty review set.
      */
     fun decode(source: ByteArray): LearningBackup {
-        if (source.size.toLong() > MAX_FILE_BYTES) throw BackupFormatException("备份文件超过 $MAX_BYTES_LABEL 上限，未写出或读取")
+        if (source.size > MAX_FILE_BYTES) throw sizeLimitExceeded(MAX_FILE_BYTES)
         if (source.size <= DIGEST_BYTES) throw BackupFormatException("备份文件过小或不完整")
-        val body = source.copyOfRange(0, source.size - DIGEST_BYTES)
-        val digest = source.copyOfRange(source.size - DIGEST_BYTES, source.size)
-        if (!sha256(body).contentEquals(digest)) throw BackupFormatException("备份校验和失败，文件可能损坏或被修改")
+        val bodySize = source.size - DIGEST_BYTES
+        val actual = newDigest().apply { update(source, 0, bodySize) }.digest()
+        requireChecksum(actual, source.copyOfRange(bodySize, source.size))
+        return collectBackup { sink ->
+            readBackup(BackupReader(ByteArrayInputStream(source, 0, bodySize), bodySize.toLong()), sink)
+        }
+    }
 
-        val reader = BackupReader(body)
+    /**
+     * Stages one v1–v4 stream in a unique file in the existing app-private [privateDirectory]. The
+     * stream must reach EOF within the byte cap and its checksum must pass before allocating payload
+     * records. The temporary file is deleted when this call returns or unwinds; [source] is not closed.
+     * Run on the file I/O worker. Disk usage is up to one encoded file; decoded rows and validation
+     * indexes still require heap proportional to their contents, not to the scratch buffer size.
+     */
+    fun decodeFrom(source: InputStream, privateDirectory: File): LearningBackup {
+        val temporary = File.createTempFile("shici-backup-read-", ".tmp", privateDirectory)
+        return Closeable { Files.deleteIfExists(temporary.toPath()) }.use {
+            val fingerprint = copyToPrivate(source, temporary) {}
+            collectBackup { sink -> validatePrivate(temporary, fingerprint, sink) {} }
+        }
+    }
+
+    /**
+     * The document worker owns the stream from [openSource] through close. Only then, after the exact
+     * private copy passes checksum, EOF and the shared parser, does the caller receive ownership.
+     * Preview validation retains identity indexes and the study ledger, not the decoded main tables.
+     */
+    internal fun stageImport(privateDirectory: File, checkpoint: () -> Unit = {},
+                             openSource: () -> InputStream): StagedImport {
+        checkpoint()
+        val temporary = File.createTempFile("shici-backup-read-", ".tmp", privateDirectory)
+        var transferred = false
+        try {
+            val fingerprint = openSource().use { copyToPrivate(it, temporary, checkpoint) }
+            checkpoint()
+            val preview = validatePrivate(temporary, fingerprint, null, checkpoint)
+            checkpoint()
+            return StagedImport(temporary, fingerprint, preview).also { transferred = true }
+        } finally {
+            if (!transferred) temporary.delete()
+        }
+    }
+
+    /** Exclusive app-private source. The preview owns it until admission transfers it to the worker. */
+    internal class StagedImport internal constructor(
+        private val file: File,
+        val fingerprint: BackupFileFingerprint,
+        val preview: LearningBackupPreview
+    ) : Closeable {
+        /** Replay in one pass and verify the exact bytes consumed before commit. */
+        fun replay(sink: BackupRestoreSink) = file.inputStream().use {
+            readPrivate(it, fingerprint, sink) {}
+        }
+
+        override fun close() { file.delete() }
+    }
+
+    private fun copyToPrivate(source: InputStream, temporary: File, checkpoint: () -> Unit): BackupFileFingerprint {
+        val buffer = ByteArray(BUFFER_BYTES)
+        val digest = newDigest()
+        var total = 0L
+        temporary.outputStream().buffered(BUFFER_BYTES).use { output ->
+            while (true) {
+                // Read at most the remaining cap plus one sentinel byte, even for a long stream.
+                val requested = minOf(buffer.size.toLong(), MAX_STREAM_FILE_BYTES - total + 1).toInt()
+                checkpoint()
+                val read = readChunk(source, buffer, requested)
+                checkpoint()
+                if (read < 0) break
+                if (read > MAX_STREAM_FILE_BYTES - total) throw sizeLimitExceeded(MAX_STREAM_FILE_BYTES)
+                output.write(buffer, 0, read)
+                digest.update(buffer, 0, read)
+                total += read
+            }
+        }
+        if (total <= DIGEST_BYTES) throw BackupFormatException("备份文件过小或不完整")
+        return BackupFileFingerprint(total, digest.digest().hex())
+    }
+
+    private fun validatePrivate(temporary: File, fingerprint: BackupFileFingerprint, sink: BackupRestoreSink?,
+                                checkpoint: () -> Unit): LearningBackupPreview = temporary.inputStream().use { file ->
+        val bodySize = fingerprint.byteCount - DIGEST_BYTES
+        val digest = newDigest()
+        if (!digestExactly(file, bodySize, ByteArray(BUFFER_BYTES), digest, checkpoint)) throw EOFException()
+        val trailer = ByteArray(DIGEST_BYTES)
+        DataInputStream(file).readFully(trailer)
+        if (file.read() != -1) throw BackupFormatException("备份在声明内容之后存在多余字节")
+        requireChecksum(digest.digest(), trailer)
+        file.channel.position(0)
+        readPrivate(file, fingerprint, sink, checkpoint)
+    }
+
+    private fun readPrivate(file: FileInputStream, fingerprint: BackupFileFingerprint, sink: BackupRestoreSink?,
+                            checkpoint: () -> Unit): LearningBackupPreview {
+        val digest = newDigest()
+        // Hash what the parser actually consumes (not a separate check then an unverified read).
+        val input = DigestInputStream(file.buffered(BUFFER_BYTES), digest)
+        val bodySize = fingerprint.byteCount - DIGEST_BYTES
+        val preview = readBackup(BackupReader(input, bodySize, checkpoint), sink)
+        DataInputStream(input).readFully(ByteArray(DIGEST_BYTES))
+        if (input.read() != -1 || digest.digest().hex() != fingerprint.sha256) {
+            throw BackupFormatException("暂存的备份内容已改变，未恢复学习数据")
+        }
+        return preview
+    }
+
+    /** Call on a fresh, reopened read-back stream after successful write/flush/close. Does not close it. */
+    fun verifyExactBytes(source: InputStream, expected: BackupFileFingerprint): Boolean {
+        if (expected.byteCount !in 1L..MAX_STREAM_FILE_BYTES) return false
+        val digest = newDigest()
+        return digestExactly(source, expected.byteCount, ByteArray(BUFFER_BYTES), digest) &&
+            source.read() == -1 && digest.digest().hex() == expected.sha256
+    }
+
+    private fun collectBackup(read: (BackupRestoreSink) -> LearningBackupPreview): LearningBackup {
+        val words = ArrayList<BackupWord>()
+        val events = ArrayList<BackupEvent>()
+        val states = ArrayList<BackupStudyState>()
+        val reviews = ArrayList<BackupStudyReview>()
+        val userEntries = ArrayList<BackupUserEntry>()
+        var settings = BackupStudySettings()
+        var session: BackupStudySession? = null
+        val preview = read(object : BackupRestoreSink {
+            override fun word(row: BackupWord) { words += row }
+            override fun event(row: BackupEvent) { events += row }
+            override fun settings(row: BackupStudySettings) { settings = row }
+            override fun state(row: BackupStudyState) { states += row }
+            override fun review(row: BackupStudyReview) { reviews += row }
+            override fun session(row: BackupStudySession) { session = row }
+            override fun userEntry(row: BackupUserEntry) { userEntries += row }
+        })
+        return LearningBackup(preview.appVersionName, preview.appVersionCode, preview.schemaVersion, preview.createdAt,
+            LearningBackupData(words, events, settings, states, reviews, session, userEntries), preview.formatVersion)
+    }
+
+    private fun readBackup(reader: BackupReader, sink: BackupRestoreSink?): LearningBackupPreview = try {
+        readPayload(reader, sink)
+    } catch (_: EOFException) {
+        throw BackupFormatException("备份文件被截断或不完整")
+    }
+
+    private fun readPayload(reader: BackupReader, sink: BackupRestoreSink?): LearningBackupPreview {
         if (reader.readAscii(8) != MAGIC) throw BackupFormatException("不是拾词备份文件（magic 不匹配）")
         val format = reader.readInt()
         if (format > FORMAT_VERSION) {
@@ -290,45 +526,52 @@ object LearningBackupCodec {
         val wordCount = reader.readInt()
         val eventCount = reader.readInt()
         if (wordCount < 0 || eventCount < 0) throw BackupFormatException("备份记录数量无效")
+        // Lower bounds include fixed fields and string prefixes, not string contents.
+        val minWordBytes = if (hasFavorites) 30L else 29L
+        reader.requireRows(wordCount * minWordBytes + eventCount * 25L)
 
-        val words = ArrayList<BackupWord>()
         val keys = HashSet<String>()
+        val unseenFavorites = HashSet<String>()
         repeat(wordCount) {
             val entryKey = reader.readString("词条键")
             val headword = reader.readString("词头")
-            val partOfSpeech = reader.readString("词性")
-            val meaning = reader.readString("释义")
-            val source = reader.readString("来源")
-            val version = reader.readString("来源版本")
+            val partOfSpeech = reader.readString("词性", materialize = sink != null)
+            val meaning = reader.readString("释义", materialize = sink != null)
+            val source = reader.readString("来源", materialize = sink != null)
+            val version = reader.readString("来源版本", materialize = sink != null)
             val mastered = reader.readBoolean("掌握状态")
-            val note = reader.readString("笔记")
+            val note = reader.readString("笔记", materialize = sink != null)
             // v4 appends the star marker after the note; v1–v3 have no such byte and default to false.
             val favorite = if (hasFavorites) reader.readBoolean("收藏状态") else false
             if (entryKey.isEmpty() || headword.isEmpty()) throw BackupFormatException("备份存在空词条键或空词头")
             if (entryKey != headword) throw BackupFormatException("备份词条键与词头不一致（$entryKey / $headword）")
             if (!keys.add(entryKey)) throw BackupFormatException("备份存在重复词条键：$entryKey")
-            words += BackupWord(entryKey, headword, partOfSpeech, meaning, source, version, mastered, note, favorite)
+            if (favorite) unseenFavorites.add(entryKey)
+            sink?.word(BackupWord(entryKey, headword, partOfSpeech, meaning, source, version, mastered, note, favorite))
         }
 
-        val events = ArrayList<BackupEvent>()
+        var favoriteCount = 0
         val ids = HashSet<String>()
         repeat(eventCount) {
             val id = reader.readString("事件 id")
             val entryKey = reader.readString("事件词条键")
-            val rawText = reader.readString("原词形文本")
-            val finalForm = reader.readString("最终词形")
+            val rawText = reader.readString("原词形文本", materialize = sink != null)
+            val finalForm = reader.readString("最终词形", materialize = sink != null)
             val time = reader.readLong()
             val revoked = reader.readBoolean("撤销状态")
             if (id.isEmpty()) throw BackupFormatException("备份存在空事件 id")
             if (!ids.add(id)) throw BackupFormatException("备份存在重复事件 id：$id")
             if (entryKey !in keys) throw BackupFormatException("备份存在无对应词条的事件（$entryKey）")
-            events += BackupEvent(id, entryKey, rawText, finalForm, time, revoked)
+            if (!revoked && unseenFavorites.remove(entryKey)) favoriteCount++
+            sink?.event(BackupEvent(id, entryKey, rawText, finalForm, time, revoked))
         }
 
+        val preview = LearningBackupPreview(appVersionName, appVersionCode, schema, createdAt, format,
+            wordCount, eventCount, favoriteCount)
         if (!hasStudy) {
-            if (reader.remaining != 0) throw BackupFormatException("备份在声明内容之后存在多余字节")
-            return LearningBackup(appVersionName, appVersionCode, schema, createdAt,
-                LearningBackupData(words, events), format)
+            reader.requireEnd()
+            sink?.settings(BackupStudySettings())
+            return preview
         }
 
         val settings = BackupStudySettings(
@@ -341,9 +584,16 @@ object LearningBackupCodec {
             throw BackupFormatException("备份每日目标超出 ${StudyRules.MIN_DAILY_NEW_GOAL}–${StudyRules.MAX_DAILY_NEW_GOAL}")
         }
 
+        sink?.settings(settings)
+
+        // Historical files may order reviews arbitrarily; retain just the ledger needed for the
+        // exact cross-record checks, never the decoded words, events, or user dictionary.
         val states = ArrayList<BackupStudyState>()
         val stateKeys = HashSet<String>()
-        repeat(reader.readInt().also { if (it < 0) throw BackupFormatException("学习状态数量无效") }) {
+        repeat(reader.readInt().also {
+            if (it < 0) throw BackupFormatException("学习状态数量无效")
+            reader.requireRows(it * 44L)
+        }) {
             val entryKey = reader.readString("学习状态词条键")
             val book = reader.readString("学习状态书种")
             val stage = reader.readInt()
@@ -355,12 +605,17 @@ object LearningBackupCodec {
             if (stage < StudyRules.NEW_STAGE_BEFORE || stage > StudyRules.MAX_STAGE) throw BackupFormatException("学习状态阶段越界：$stage")
             if (entryKey !in keys) throw BackupFormatException("学习状态无对应词条：$entryKey")
             if (!stateKeys.add(entryKey)) throw BackupFormatException("学习状态重复词条键：$entryKey")
-            states += BackupStudyState(entryKey, book, stage, dueAt, introducedAt, lastReviewAt, lastReviewSeq)
+            val row = BackupStudyState(entryKey, book, stage, dueAt, introducedAt, lastReviewAt, lastReviewSeq)
+            states += row
+            sink?.state(row)
         }
 
         val reviews = ArrayList<BackupStudyReview>()
         val tokens = HashSet<String>()
-        repeat(reader.readInt().also { if (it < 0) throw BackupFormatException("学习反馈数量无效") }) {
+        repeat(reader.readInt().also {
+            if (it < 0) throw BackupFormatException("学习反馈数量无效")
+            reader.requireRows(it * 53L)
+        }) {
             val token = reader.readString("反馈 token")
             val entryKey = reader.readString("反馈词条键")
             val feedback = reader.readString("反馈类型")
@@ -382,7 +637,9 @@ object LearningBackupCodec {
             // -1 when the word was reset to relearning by 忘记, so only the new-word flag is implied.
             if (newWord && stageBefore != StudyRules.NEW_STAGE_BEFORE) throw BackupFormatException("反馈新词标记与阶段不一致：$token")
             if (dayKey.isEmpty() || zoneId.isEmpty()) throw BackupFormatException("反馈日键或时区为空")
-            reviews += BackupStudyReview(token, entryKey, feedback, stageBefore, stageAfter, dueAfter, reviewedAt, dayKey, zoneId, newWord, seq)
+            val row = BackupStudyReview(token, entryKey, feedback, stageBefore, stageAfter, dueAfter, reviewedAt, dayKey, zoneId, newWord, seq)
+            reviews += row
+            sink?.review(row)
         }
 
         val session = if (reader.readBoolean("待答卡存在标记")) {
@@ -394,10 +651,10 @@ object LearningBackupCodec {
                 newWord = reader.readBoolean("待答卡新词标记"),
                 answerRevealed = reader.readBoolean("待答卡显答案标记"),
                 headword = reader.readString("待答卡词头"),
-                partOfSpeech = reader.readString("待答卡词性"),
-                meaning = reader.readString("待答卡释义"),
-                source = reader.readString("待答卡来源"),
-                version = reader.readString("待答卡来源版本"),
+                partOfSpeech = reader.readString("待答卡词性", materialize = sink != null),
+                meaning = reader.readString("待答卡释义", materialize = sink != null),
+                source = reader.readString("待答卡来源", materialize = sink != null),
+                version = reader.readString("待答卡来源版本", materialize = sink != null),
                 dayKey = reader.readString("待答卡日键"),
                 createdAt = reader.readLong()
             ).also {
@@ -410,12 +667,12 @@ object LearningBackupCodec {
             }
         } else null
 
-        validateStudyCrossRecords(states, reviews, session)
+        session?.let { sink?.session(it) }
 
-        val userEntries = ArrayList<BackupUserEntry>()
-        if (hasUserDictionary) {
+        val userEntryCount = if (hasUserDictionary) {
             val count = reader.readInt()
             if (count < 0) throw BackupFormatException("用户词典数量无效")
+            reader.requireRows(count * 20L)
             val userKeys = HashSet<String>()
             repeat(count) {
                 val entryKey = reader.readString("用户词条键")
@@ -434,13 +691,15 @@ object LearningBackupCodec {
                     throw BackupFormatException("用户词条无效：${e.message ?: entryKey}")
                 }
                 if (!userKeys.add(entryKey)) throw BackupFormatException("用户词典存在重复词条键：$entryKey")
-                userEntries += BackupUserEntry(entryKey, partOfSpeech, meaning, updatedAt)
+                sink?.userEntry(BackupUserEntry(entryKey, partOfSpeech, meaning, updatedAt))
             }
-        }
+            count
+        } else 0
 
-        if (reader.remaining != 0) throw BackupFormatException("备份在声明内容之后存在多余字节")
-        return LearningBackup(appVersionName, appVersionCode, schema, createdAt,
-            LearningBackupData(words, events, settings, states, reviews, session, userEntries), format)
+        reader.requireEnd()
+        validateStudyCrossRecords(states, reviews, session, reader::checkCurrent)
+        return preview.copy(stateCount = states.size, reviewCount = reviews.size, hasSession = session != null,
+            userEntryCount = userEntryCount)
     }
 
     /**
@@ -462,13 +721,20 @@ object LearningBackupCodec {
     private fun validateStudyCrossRecords(
         states: List<BackupStudyState>,
         reviews: List<BackupStudyReview>,
-        session: BackupStudySession?
+        session: BackupStudySession?,
+        checkpoint: () -> Unit
     ) {
         val stateByKey = states.associateBy { it.entryKey }
-        val reviewsByKey = reviews.groupBy { it.entryKey }
-
-        val seqs = HashSet<Long>()
-        for (review in reviews) {
+        // Repository exports are already in seq order. Historical input may be out of order;
+        // keep accepting it without reordering the returned rows. Only that case needs a sort copy.
+        val inSequence = (1 until reviews.size).all { reviews[it - 1].seq <= reviews[it].seq }
+        val ordered = if (inSequence) reviews else reviews.sortedBy { it.seq }
+        val lastByKey = HashMap<String, BackupStudyReview>()
+        var lastSeq: Long? = null
+        for (review in ordered) {
+            checkpoint()
+            if (lastSeq == review.seq) throw BackupFormatException("备份存在重复提交序号：${review.seq}")
+            lastSeq = review.seq
             val feedback = FeedbackKind.fromId(review.feedback) ?: throw BackupFormatException("反馈类型无效：${review.feedback}")
             if (StudyRules.nextStage(review.stageBefore, feedback) != review.stageAfter) {
                 throw BackupFormatException("反馈阶段推进与规则不符：${review.token}")
@@ -481,40 +747,31 @@ object LearningBackupCodec {
             if (StudyRules.dayKey(review.reviewedAt, zone) != day.toString()) {
                 throw BackupFormatException("反馈日键与反馈时间或时区不一致：${review.token}")
             }
-            if (!seqs.add(review.seq)) throw BackupFormatException("备份存在重复提交序号：${review.seq}")
-        }
-
-        // Exactly one introduction per word: a second new-word flag would consume a second daily slot,
-        // and the seq-ordered chain must be continuous from that single introduction.
-        reviewsByKey.forEach { (key, list) ->
-            if (list.count { it.newWord } != 1) throw BackupFormatException("同一词条的首次反馈必须唯一：$key")
-            val ordered = list.sortedBy { it.seq }
-            val intro = ordered.first()
-            if (!intro.newWord || intro.stageBefore != StudyRules.NEW_STAGE_BEFORE) {
-                throw BackupFormatException("同一词条最早的反馈必须是从未引入档引入：$key")
-            }
-            for (index in 1 until ordered.size) {
-                if (ordered[index].stageBefore != ordered[index - 1].stageAfter) {
+            val key = review.entryKey
+            val state = stateByKey[key] ?: throw BackupFormatException("真实反馈缺少对应的学习状态：$key")
+            val previous = lastByKey.put(key, review)
+            if (previous == null) {
+                if (!review.newWord || review.stageBefore != StudyRules.NEW_STAGE_BEFORE) {
+                    throw BackupFormatException("同一词条最早的反馈必须是从未引入档引入：$key")
+                }
+                if (state.introducedAt != review.reviewedAt) {
+                    throw BackupFormatException("学习状态引入时间与首次反馈不一致：$key")
+                }
+            } else {
+                if (review.newWord) throw BackupFormatException("同一词条的首次反馈必须唯一：$key")
+                if (review.stageBefore != previous.stageAfter) {
                     throw BackupFormatException("真实反馈阶段转移链不连续：$key")
                 }
             }
         }
 
         stateByKey.forEach { (key, state) ->
-            val list = reviewsByKey[key] ?: throw BackupFormatException("学习状态缺少对应的真实反馈：$key")
-            val intro = list.single { it.newWord }
-            if (state.introducedAt != intro.reviewedAt) {
-                throw BackupFormatException("学习状态引入时间与首次反馈不一致：$key")
-            }
-            // The final state must be the word's greatest commit sequence, matching exactly that feedback.
-            val last = list.maxByOrNull { it.seq } ?: throw BackupFormatException("学习状态缺少对应的真实反馈：$key")
+            checkpoint()
+            val last = lastByKey[key] ?: throw BackupFormatException("学习状态缺少对应的真实反馈：$key")
             if (state.lastReviewSeq != last.seq) throw BackupFormatException("学习状态末尾提交序号与最后反馈不一致：$key")
             if (last.stageAfter != state.stage || last.dueAfter != state.dueAt || last.reviewedAt != state.lastReviewAt) {
                 throw BackupFormatException("学习状态与最后真实反馈不一致：$key")
             }
-        }
-        reviewsByKey.keys.forEach { key ->
-            if (key !in stateByKey) throw BackupFormatException("真实反馈缺少对应的学习状态：$key")
         }
 
         if (session != null) {
@@ -542,82 +799,219 @@ object LearningBackupCodec {
         null
     }
 
-    private fun sha256(bytes: ByteArray): ByteArray = MessageDigest.getInstance("SHA-256").digest(bytes)
+    private fun newDigest(): MessageDigest = MessageDigest.getInstance("SHA-256")
 
-    private fun encodeUtf8(value: String): ByteArray = try {
-        val buffer = Charsets.UTF_8.newEncoder()
-            .onMalformedInput(CodingErrorAction.REPORT).onUnmappableCharacter(CodingErrorAction.REPORT)
-            .encode(CharBuffer.wrap(value))
-        ByteArray(buffer.remaining()).also { buffer.get(it) }
-    } catch (_: CharacterCodingException) {
-        throw BackupFormatException("文本包含无法按 UTF-8 编码的字符，未写出")
+    private fun digestExactly(input: InputStream, length: Long, buffer: ByteArray, digest: MessageDigest,
+                              checkpoint: () -> Unit = {}): Boolean {
+        var remaining = length
+        while (remaining > 0) {
+            checkpoint()
+            val count = readChunk(input, buffer, minOf(remaining, buffer.size.toLong()).toInt())
+            if (count < 0) return false
+            digest.update(buffer, 0, count)
+            remaining -= count
+        }
+        return true
     }
 
-    /** Enforces the 64MiB cap while building, so a runaway note cannot allocate without bound. */
-    private class BackupWriter(private val limit: Long) {
-        private val out = ByteArrayOutputStream()
-        fun writeAscii(value: String) = write(value.toByteArray(Charsets.US_ASCII))
-        fun writeInt(value: Int) = write(byteArrayOf(
-            (value ushr 24).toByte(), (value ushr 16).toByte(), (value ushr 8).toByte(), value.toByte()))
-        fun writeLong(value: Long) = write(ByteArray(8).also {
-            for (index in 0 until 8) it[index] = (value ushr (56 - 8 * index)).toByte()
-        })
-        fun writeBoolean(value: Boolean) = write(byteArrayOf(if (value) 1 else 0))
-        fun writeString(value: String) { val bytes = encodeUtf8(value); writeInt(bytes.size); write(bytes) }
-        fun write(bytes: ByteArray) {
-            if (out.size().toLong() + bytes.size > limit) {
-                throw BackupFormatException("备份文件超过 ${LearningBackupCodec.MAX_BYTES_LABEL} 上限，未写出或读取")
-            }
+    private fun readChunk(input: InputStream, buffer: ByteArray, length: Int): Int {
+        val count = input.read(buffer, 0, length)
+        if (count != 0) return count
+        val byte = input.read()
+        if (byte < 0) return -1
+        buffer[0] = byte.toByte()
+        return 1
+    }
+
+    private fun ByteArray.hex(): String = joinToString("") { (it.toInt() and 0xff).toString(16).padStart(2, '0') }
+
+    private fun requireChecksum(actual: ByteArray, expected: ByteArray) {
+        if (!MessageDigest.isEqual(actual, expected)) {
+            throw BackupFormatException("备份校验和失败，文件可能损坏或被修改")
+        }
+    }
+
+    private fun sizeLimitExceeded(limit: Long): BackupFormatException {
+        val label = if (limit == MAX_FILE_BYTES) MAX_BYTES_LABEL else MAX_STREAM_BYTES_LABEL
+        return BackupFormatException("备份文件超过 $label 上限，未写出或读取")
+    }
+
+    private class BackupWriter(output: OutputStream, private val limit: Long) {
+        private val bodyDigest = newDigest()
+        private val fileDigest = newDigest()
+        private val digestOutput = DigestOutputStream(DigestOutputStream(BufferedOutputStream(output, BUFFER_BYTES),
+            fileDigest), bodyDigest)
+        private val out = DataOutputStream(digestOutput)
+        private val textBuffer = ByteBuffer.allocate(BUFFER_BYTES)
+        private val encoder = Charsets.UTF_8.newEncoder()
+            .onMalformedInput(CodingErrorAction.REPORT).onUnmappableCharacter(CodingErrorAction.REPORT)
+        private var bodyBytes = 0L
+
+        fun writeAscii(value: String) {
+            val bytes = value.toByteArray(Charsets.US_ASCII)
+            reserve(bytes.size)
             out.write(bytes)
         }
-        fun toByteArray(): ByteArray = out.toByteArray()
+        fun writeInt(value: Int) { reserve(4); out.writeInt(value) }
+        fun writeLong(value: Long) { reserve(8); out.writeLong(value) }
+        fun writeBoolean(value: Boolean) { reserve(1); out.writeBoolean(value) }
+
+        fun <T> writeRows(rows: BackupRows<T>, count: Int, writeRow: (T) -> Unit) {
+            if (count < 0) throw BackupFormatException("备份记录数量无效")
+            var remaining = count
+            rows.visit { row ->
+                if (remaining <= 0) throw BackupFormatException("备份快照记录数不一致，未写出")
+                writeRow(row)
+                remaining--
+            }
+            if (remaining != 0) throw BackupFormatException("备份快照记录数不一致，未写出")
+        }
+
+        fun writeString(value: String) {
+            // The prefix needs a byte count, not the UTF-16 length. Count and validate before writing;
+            // encode a second pass into one reusable buffer rather than creating a full field array.
+            val length = utf8Length(value)
+            writeInt(length)
+            reserve(length)
+            if (length == 0) return
+            val chars = CharBuffer.wrap(value)
+            encoder.reset()
+            try {
+                do {
+                    textBuffer.clear()
+                    val result = encoder.encode(chars, textBuffer, true)
+                    if (result.isError) result.throwException()
+                    out.write(textBuffer.array(), 0, textBuffer.position())
+                } while (result.isOverflow)
+                do {
+                    textBuffer.clear()
+                    val result = encoder.flush(textBuffer)
+                    if (result.isError) result.throwException()
+                    out.write(textBuffer.array(), 0, textBuffer.position())
+                } while (result.isOverflow)
+            } catch (_: CharacterCodingException) {
+                throw BackupFormatException("文本包含无法按 UTF-8 编码的字符，未写出")
+            }
+        }
+
+        fun finish(): BackupFileFingerprint {
+            val trailer = bodyDigest.digest()
+            digestOutput.on(false)
+            out.write(trailer)
+            out.flush()
+            return BackupFileFingerprint(bodyBytes + DIGEST_BYTES, fileDigest.digest().hex())
+        }
+
+        private fun reserve(count: Int) {
+            if (count > limit - DIGEST_BYTES - bodyBytes) throw sizeLimitExceeded(limit)
+            bodyBytes += count
+        }
+
+        private fun utf8Length(value: String): Int {
+            var index = 0
+            var bytes = 0
+            while (index < value.length) {
+                val char = value[index++]
+                bytes += when {
+                    char.code <= 0x7f -> 1
+                    char.code <= 0x7ff -> 2
+                    !Character.isSurrogate(char) -> 3
+                    Character.isHighSurrogate(char) && index < value.length &&
+                        Character.isLowSurrogate(value[index]) -> { index++; 4 }
+                    else -> throw BackupFormatException("文本包含无法按 UTF-8 编码的字符，未写出")
+                }
+                if (bytes > limit - DIGEST_BYTES - bodyBytes - 4) throw sizeLimitExceeded(limit)
+                if (bytes > MAX_STRING_BYTES) throw BackupFormatException("单个备份文本超过 $MAX_BYTES_LABEL 上限，未写出")
+            }
+            return bytes
+        }
     }
 
-    /** Bounds-checked big-endian reader; every access validates the remaining length first. */
-    private class BackupReader(private val bytes: ByteArray) {
-        private var position = 0
-        val remaining get() = bytes.size - position
+    /** Reads the declared body without letting field reads consume the next field or checksum. */
+    private class BackupReader(source: InputStream, private var remaining: Long,
+                               private val checkpoint: () -> Unit = {}) {
+        private val input = DataInputStream(source)
+        private val textBytes = ByteBuffer.allocate(8192)
+        private val chars = CharBuffer.allocate(4096)
+        private val decoder = Charsets.UTF_8.newDecoder()
+            .onMalformedInput(CodingErrorAction.REPORT).onUnmappableCharacter(CodingErrorAction.REPORT)
 
-        fun readAscii(length: Int): String {
-            requireAvailable(length); val value = String(bytes, position, length, Charsets.US_ASCII); position += length
-            return value
+        fun readAscii(length: Int): String = String(readBytes(length), Charsets.US_ASCII)
+        fun readBoolean(label: String): Boolean {
+            take(1)
+            return when (val value = input.readUnsignedByte()) {
+                0 -> false; 1 -> true; else -> throw BackupFormatException("$label 的布尔值无效（$value）")
+            }
         }
-        fun readByte(): Int { requireAvailable(1); return bytes[position++].toInt() and 0xff }
-        fun readBoolean(label: String): Boolean = when (val value = readByte()) {
-            0 -> false; 1 -> true; else -> throw BackupFormatException("$label 的布尔值无效（$value）")
+        fun readInt(): Int { take(4); return input.readInt() }
+        fun readLong(): Long { take(8); return input.readLong() }
+
+        fun requireRows(minimumBytes: Long) {
+            if (minimumBytes > remaining) throw BackupFormatException("备份记录数量超过剩余文件容量")
         }
-        fun readInt(): Int {
-            requireAvailable(4)
-            val value = ((bytes[position].toInt() and 0xff) shl 24) or
-                ((bytes[position + 1].toInt() and 0xff) shl 16) or
-                ((bytes[position + 2].toInt() and 0xff) shl 8) or
-                (bytes[position + 3].toInt() and 0xff)
-            position += 4
-            return value
-        }
-        fun readLong(): Long {
-            requireAvailable(8)
-            var value = 0L
-            for (index in 0 until 8) value = (value shl 8) or (bytes[position + index].toLong() and 0xff)
-            position += 8
-            return value
-        }
-        fun readString(label: String): String {
+
+        // A validation-only field still goes through the same decoder and length/UTF-8 checks.
+        // Its empty return is unused; only materialized fields are used to build emitted rows.
+        fun readString(label: String, materialize: Boolean = true): String {
+            checkCurrent()
             val length = readInt()
             if (length < 0) throw BackupFormatException("$label 的长度前缀无效")
-            requireAvailable(length)
-            val decoder = Charsets.UTF_8.newDecoder()
-                .onMalformedInput(CodingErrorAction.REPORT).onUnmappableCharacter(CodingErrorAction.REPORT)
-            val value = try {
-                decoder.decode(ByteBuffer.wrap(bytes, position, length)).toString()
+            if (length > MAX_STRING_BYTES) throw BackupFormatException("$label 超过单个备份文本 $MAX_BYTES_LABEL 上限")
+            if (length == 0) return ""
+            take(length)
+            // Read only the declared field, reusing scratch space and growing the decoded text
+            // only as bytes arrive. Partial UTF-8 sequences remain in the buffer across chunks.
+            decoder.reset()
+            textBytes.clear().limit(0)
+            var left = length
+            var value: StringBuilder? = null
+            try {
+                while (true) {
+                    checkCurrent()
+                    textBytes.compact()
+                    val count = minOf(left, textBytes.remaining())
+                    input.readFully(textBytes.array(), textBytes.position(), count)
+                    textBytes.position(textBytes.position() + count).flip()
+                    left -= count
+                    while (true) {
+                        chars.clear()
+                        val result = decoder.decode(textBytes, chars, left == 0)
+                        if (result.isError) result.throwException()
+                        if (result.isUnderflow && left == 0) {
+                            // UTF-8 emits no extra characters when flushed.
+                            decoder.flush(chars)
+                            if (!materialize) return ""
+                            val prefix = value ?: return String(chars.array(), 0, chars.position())
+                            return prefix.append(chars.array(), 0, chars.position()).toString()
+                        }
+                        if (materialize) {
+                            val prefix = value ?: StringBuilder().also { value = it }
+                            prefix.append(chars.array(), 0, chars.position())
+                        }
+                        if (result.isUnderflow) break
+                    }
+                }
             } catch (_: CharacterCodingException) {
                 throw BackupFormatException("$label 不是合法 UTF-8 文本")
             }
-            position += length
-            return value
         }
-        private fun requireAvailable(count: Int) {
-            if (count < 0 || count > remaining) throw BackupFormatException("备份文件被截断或不完整")
+
+        fun checkCurrent() = checkpoint()
+
+        fun requireEnd() {
+            if (remaining != 0L) {
+                throw BackupFormatException("备份在声明内容之后存在多余字节")
+            }
+        }
+
+        private fun readBytes(length: Int): ByteArray {
+            take(length)
+            return ByteArray(length).also { input.readFully(it) }
+        }
+
+        private fun take(count: Int) {
+            if (count > remaining) throw BackupFormatException("备份文件被截断或不完整")
+            remaining -= count
         }
     }
 }

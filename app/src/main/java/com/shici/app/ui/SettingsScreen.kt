@@ -83,6 +83,12 @@ class SettingsScreen(
     /** 备份状态行宿主，保持原 backupStatusView 所有权。 */
     val backupStatusHost: LinearLayout
 
+    /**
+     * 更新状态与动作宿主，调用方把版本检查结果、手动检查/下载/安装按钮加入这里。
+     * 本组件不联网、不发起检查、不持有下载状态；离开页面或返回系统设置后由调用方刷新。
+     */
+    val updateHost: LinearLayout
+
     private lateinit var overlayBadge: TextView
     private lateinit var notificationBadge: TextView
     private lateinit var accessibilitySwitch: Switch
@@ -212,7 +218,9 @@ class SettingsScreen(
         backup.addView(context.text("恢复将覆盖当前数据，请先备份。", 16f, Paper.warning, true))
         backup.addView(
             context.text(
-                "备份是本地明文个人数据，未加密、不防恶意篡改，请妥善保存。",
+                "普通备份和恢复前的安全备份均为明文，未加密、不防恶意篡改。" +
+                    "拾词不主动上传或同步备份。保存位置由你在系统文件选择器中选择；" +
+                    "如果选了云盘，提供方可能上传和同步明文学习记录。敏感备份建议保存到本机。",
                 15f,
                 Paper.warning
             )
@@ -230,7 +238,7 @@ class SettingsScreen(
                     context.text(
                         "导出会把本机学习数据（全部词条与事件，含已撤销历史、笔记、掌握状态、" +
                             "统一复习进度与个人补充词库）写成一个 .shicibackup 文件；" +
-                            "只通过系统文档选择器创建或读取，不联网、不上传。",
+                            "恢复时通过系统文件选择器选取备份文件。",
                         15f,
                         Paper.secondary
                     )
@@ -272,6 +280,8 @@ class SettingsScreen(
         dictionaryStatusHost = context.column()
         about.addView(dictionaryStatusHost)
         about.addView(context.text(versionText, 15f, Paper.secondary))
+        updateHost = context.column()
+        about.addView(updateHost)
         about.addView(
             context.helpDisclosure("词库来源、联网与隐私") {
                 addView(context.text("词库来源", 16f, Paper.ink, true))
@@ -325,7 +335,7 @@ class SettingsScreen(
                         "PDF 导出已接入 A4 复习版与自测版＋答案页；支持按首次收录日期（含首尾）、" +
                             "最近查询/查询次数排序、仅收藏，以及“当前筛选全部”或手动勾选当前结果。" +
                             "导出选项只保存在本次导出中，不是全局设置；PDF 不是备份。正式词典、" +
-                            "发音、例句仍未实现；本地备份仅为完整覆盖恢复，不提供合并或云同步。",
+                            "发音、例句仍未实现；备份只能用于完整覆盖恢复，不支持合并。",
                         15f,
                         Paper.secondary
                     )

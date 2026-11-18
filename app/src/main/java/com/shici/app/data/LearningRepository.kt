@@ -6,6 +6,7 @@ import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 import com.shici.app.core.*
+import java.io.File
 import java.time.LocalDate
 import java.time.ZoneId
 import java.util.UUID
@@ -74,8 +75,11 @@ enum class RestoreOutcome { RESTORED, REVISION_CHANGED }
  */
 enum class StudyCommitOutcome { COMMITTED, IDEMPOTENT, CONFLICT, STALE, REJECTED }
 
-/** Raw two-table snapshot plus the committed revision it was read at; no derived cache. */
+/** Full raw snapshot plus the committed revision it was read at; no derived cache. */
 data class LearningBackupSnapshot(val data: LearningBackupData, val revision: Long)
+
+/** A completed private backup file and the committed revision represented by its bytes. */
+data class WrittenLearningBackupSnapshot(val fingerprint: BackupFileFingerprint, val revision: Long)
 
 /** Result of saving one user supplement; [changed] is false for an idempotent repeat save. */
 data class UserEntrySaveResult(
@@ -570,55 +574,97 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
      * re-aggregated later from these rows, never cached here.
      */
     fun backupSnapshot(): LearningBackupSnapshot {
-        check(!readableDatabase.inTransaction()) { "只能读取已提交的学习备份快照" }
+        val (data, revision) = readBackupSnapshot { rows ->
+            LearningBackupData(rows.words.toList(), rows.events.toList(), rows.settings,
+                rows.states.toList(), rows.reviews.toList(), rows.session, rows.userEntries.toList())
+        }
+        return LearningBackupSnapshot(data, revision)
+    }
+
+    /**
+     * On the serialized learning worker, stream a consistent snapshot into a new, caller-owned
+     * temporary file under app-private storage. No provider I/O belongs inside this transaction.
+     * Returns only after closing the file and ending the read transaction. The caller must discard
+     * the file on any failure/cancellation and delete it once the external copy/read-back is done.
+     * Allow room for one stream-sized file; a failed write must never replace an older backup.
+     * Keep the returned revision for the final admitted restore on the learning worker.
+     */
+    fun writeBackupSnapshot(privateFile: File, appVersionName: String, appVersionCode: Int,
+                            createdAt: Long): WrittenLearningBackupSnapshot {
+        val (fingerprint, revision) = readBackupSnapshot { rows ->
+            privateFile.outputStream().use { output ->
+                LearningBackupCodec.encodeRows(output, rows, appVersionName, appVersionCode, createdAt)
+            }
+        }
+        return WrittenLearningBackupSnapshot(fingerprint, revision)
+    }
+
+    private fun <T> readBackupSnapshot(consume: (LearningBackupRows) -> T): Pair<T, Long> {
         val db = readableDatabase
-        val revision = changes.version
+        check(!db.inTransaction()) { "只能读取已提交的学习备份快照" }
         db.beginTransactionNonExclusive()
         try {
-            val words = ArrayList<BackupWord>()
-            db.rawQuery("SELECT entry_key, headword, pos, meaning, source, version, mastered, note, favorite FROM words ORDER BY entry_key", null).use { c ->
-                while (c.moveToNext()) words += BackupWord(c.text("entry_key"), c.text("headword"), c.text("pos"),
+            val revision = changes.version
+            val words = backupRows(db, "words",
+                "SELECT entry_key, headword, pos, meaning, source, version, mastered, note, favorite FROM words ORDER BY entry_key") { c ->
+                BackupWord(c.text("entry_key"), c.text("headword"), c.text("pos"),
                     c.text("meaning"), c.text("source"), c.text("version"), c.int("mastered") == 1, c.text("note"),
                     c.int("favorite") == 1)
             }
-            val events = ArrayList<BackupEvent>()
-            db.rawQuery("SELECT id, entry_key, raw_text, final_form, time, revoked FROM events ORDER BY time, id", null).use { c ->
-                while (c.moveToNext()) events += BackupEvent(c.text("id"), c.text("entry_key"), c.text("raw_text"),
+            val events = backupRows(db, "events",
+                "SELECT id, entry_key, raw_text, final_form, time, revoked FROM events ORDER BY time, id") { c ->
+                BackupEvent(c.text("id"), c.text("entry_key"), c.text("raw_text"),
                     c.text("final_form"), c.long("time"), c.int("revoked") == 1)
             }
             val settings = readSettings(db)
-            val states = ArrayList<BackupStudyState>()
-            db.rawQuery("SELECT entry_key, book, stage, due_at, introduced_at, last_review_at, last_review_seq FROM study_states ORDER BY entry_key", null).use { c ->
-                while (c.moveToNext()) states += BackupStudyState(c.text("entry_key"), c.text("book"), c.int("stage"),
+            val states = backupRows(db, "study_states",
+                "SELECT entry_key, book, stage, due_at, introduced_at, last_review_at, last_review_seq FROM study_states ORDER BY entry_key") { c ->
+                BackupStudyState(c.text("entry_key"), c.text("book"), c.int("stage"),
                     c.long("due_at"), c.long("introduced_at"), c.long("last_review_at"), c.long("last_review_seq"))
             }
-            val reviews = ArrayList<BackupStudyReview>()
             // Ordered by the durable commit sequence, not by wall clock: a legal clock rollback makes a
             // later feedback's reviewed_at smaller, so reviewed_at must never define the export order.
-            db.rawQuery("""SELECT token, entry_key, feedback, stage_before, stage_after, due_after,
-                reviewed_at, day_key, zone_id, new_word, seq FROM study_reviews ORDER BY seq, token""", null).use { c ->
-                while (c.moveToNext()) reviews += BackupStudyReview(c.text("token"), c.text("entry_key"),
+            val reviews = backupRows(db, "study_reviews", """SELECT token, entry_key, feedback, stage_before,
+                stage_after, due_after, reviewed_at, day_key, zone_id, new_word, seq FROM study_reviews ORDER BY seq, token""") { c ->
+                BackupStudyReview(c.text("token"), c.text("entry_key"),
                     c.text("feedback"), c.int("stage_before"), c.int("stage_after"), c.long("due_after"),
                     c.long("reviewed_at"), c.text("day_key"), c.text("zone_id"), c.int("new_word") == 1,
                     c.long("seq"))
             }
-            val session = readPending(db, mergeUser = false)?.let {
-                BackupStudySession(it.token, it.entryKey, it.book.id, it.stageBefore, it.newWord, it.answerRevealed,
-                    it.entry.headword, it.entry.partOfSpeech, it.entry.meaning, it.entry.source, it.entry.version,
-                    it.dayKey, it.createdAt)
+            // No live note or supplement join: the v4 card contains only the saved snapshot fields.
+            val session = db.rawQuery("""SELECT token, entry_key, book, stage_before, new_word, answer_revealed,
+                headword, pos, meaning, source, version, day_key, created_at FROM study_session WHERE id=0""", null).use { c ->
+                if (c.moveToFirst()) BackupStudySession(c.text("token"), c.text("entry_key"),
+                    (StudyBook.fromId(c.text("book")) ?: StudyBook.default).id, c.int("stage_before"),
+                    c.int("new_word") == 1, c.int("answer_revealed") == 1, c.text("headword"), c.text("pos"),
+                    c.text("meaning"), c.text("source"), c.text("version"), c.text("day_key"), c.long("created_at")) else null
             }
-            // Stored independently of `words`, so a new headword saved without any query event is still
-            // part of the full v4 backup.
-            val userEntries = readUserEntries(db).map {
-                BackupUserEntry(it.entryKey, it.partOfSpeech, it.meaning, it.updatedAt)
+            val userEntries = backupRows(db, "user_entries",
+                "SELECT entry_key, pos, meaning, updated_at FROM user_entries ORDER BY entry_key") { c ->
+                BackupUserEntry(c.text("entry_key"), c.text("pos"), c.text("meaning"), c.long("updated_at"))
             }
+            val result = consume(LearningBackupRows(words, events,
+                BackupStudySettings(settings.selectedBook.id, settings.dailyNewGoal), states, reviews, session, userEntries))
             db.setTransactionSuccessful()
-            return LearningBackupSnapshot(
-                LearningBackupData(words, events,
-                    BackupStudySettings(settings.selectedBook.id, settings.dailyNewGoal),
-                    states, reviews, session, userEntries), revision)
+            return result to revision
         } finally { db.endTransaction() }
     }
+
+    private fun <T> backupRows(db: SQLiteDatabase, table: String, sql: String, read: (Cursor) -> T): BackupRows<T> =
+        BackupRows(count = {
+            db.rawQuery("SELECT COUNT(*) FROM $table", null).use { c ->
+                check(c.moveToFirst())
+                val count = c.getLong(0)
+                if (count !in 0L..Int.MAX_VALUE.toLong()) throw BackupFormatException("备份记录数量无效：$table")
+                count.toInt()
+            }
+        }, visit = { emit ->
+            db.rawQuery(sql, null).use { c ->
+                // Android cursors can be windowed: never turn a missing/unreadable row into a
+                // successful short export. The codec checks visited rows against the SQL count.
+                while (c.moveToNext()) emit(read(c))
+            }
+        })
 
     /**
      * Replaces the whole learning database with [data] in one transaction: child rows first, then
@@ -629,7 +675,22 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
      * `endTransaction` returns successfully does the global restore barrier advance and a single
      * change notification publish, invalidating every credential captured before the restore.
      */
-    fun restoreBackup(data: LearningBackupData, expectedRevision: Long): RestoreOutcome {
+    fun restoreBackup(data: LearningBackupData, expectedRevision: Long): RestoreOutcome =
+        restoreBackupRows(expectedRevision) { sink ->
+            data.words.forEach(sink::word)
+            data.userEntries.forEach(sink::userEntry)
+            data.events.forEach(sink::event)
+            sink.settings(data.settings)
+            data.states.forEach(sink::state)
+            data.reviews.forEach(sink::review)
+            data.session?.let(sink::session)
+        }
+
+    /** Called by the learning worker only after apply admission; no provider I/O occurs here. */
+    internal fun restoreBackup(source: LearningBackupCodec.StagedImport, expectedRevision: Long): RestoreOutcome =
+        restoreBackupRows(expectedRevision) { sink -> source.replay(sink) }
+
+    private fun restoreBackupRows(expectedRevision: Long, replay: (BackupRestoreSink) -> Unit): RestoreOutcome {
         check(!writableDatabase.inTransaction()) { "学习变更不能嵌套在未提交事务中" }
         if (changes.version != expectedRevision) return RestoreOutcome.REVISION_CHANGED
         val db = writableDatabase
@@ -641,68 +702,79 @@ class LearningRepository(context: Context, name: String = "learning.db") : SQLit
             db.delete("user_entries", null, null)
             db.delete("events", null, null)
             db.delete("words", null, null)
-            data.words.forEach { word ->
-                db.insertOrThrow("words", null, ContentValues().apply {
-                    put("entry_key", word.entryKey); put("headword", word.headword); put("pos", word.partOfSpeech)
-                    put("meaning", word.meaning); put("source", word.source); put("version", word.version)
-                    put("mastered", if (word.mastered) 1 else 0); put("note", word.note)
-                    // v1–v3 payloads decode every word with favorite=false, so restoring an old file
-                    // intentionally clears the current local stars; a v4 file restores them exactly.
-                    put("favorite", if (word.favorite) 1 else 0)
-                })
-            }
-            data.userEntries.forEach { user ->
-                PersonalDictionary.requireStoredKey(user.entryKey)
-                require(PersonalDictionary.isValidStoredPos(user.partOfSpeech)) { "用户词性未规范化" }
-                require(PersonalDictionary.isValidStoredMeaning(user.meaning)) { "用户释义未规范化" }
-                db.insertOrThrow("user_entries", null, ContentValues().apply {
-                    put("entry_key", user.entryKey); put("pos", user.partOfSpeech)
-                    put("meaning", user.meaning); put("updated_at", user.updatedAt)
-                })
-            }
-            data.events.forEach { event ->
-                db.insertOrThrow("events", null, ContentValues().apply {
-                    put("id", event.id); put("entry_key", event.entryKey); put("raw_text", event.rawText)
-                    put("final_form", event.finalForm); put("time", event.time)
-                    put("revoked", if (event.revoked) 1 else 0)
-                })
-            }
-            db.insertWithOnConflict("study_settings", null, ContentValues().apply {
-                put("id", 0)
-                // Old v1/v2 backups may name one legacy book. Restoring keeps all study rows and due
-                // dates but joins the current unified scope; no switch-book UI remains.
-                put("selected_book", StudyBook.ALL.id)
-                put("daily_new_goal", data.settings.dailyNewGoal)
-            }, SQLiteDatabase.CONFLICT_REPLACE)
-            data.states.forEach { state ->
-                db.insertOrThrow("study_states", null, ContentValues().apply {
-                    put("entry_key", state.entryKey); put("book", state.book); put("stage", state.stage)
-                    put("due_at", state.dueAt); put("introduced_at", state.introducedAt)
-                    put("last_review_at", state.lastReviewAt); put("last_review_seq", state.lastReviewSeq)
-                })
-            }
-            data.reviews.forEach { review ->
-                db.insertOrThrow("study_reviews", null, ContentValues().apply {
-                    put("token", review.token); put("entry_key", review.entryKey); put("feedback", review.feedback)
-                    put("stage_before", review.stageBefore); put("stage_after", review.stageAfter)
-                    put("due_after", review.dueAfter); put("reviewed_at", review.reviewedAt)
-                    put("day_key", review.dayKey); put("zone_id", review.zoneId)
-                    put("new_word", if (review.newWord) 1 else 0); put("seq", review.seq)
-                })
-            }
-            data.session?.let { session ->
-                db.insertOrThrow("study_session", null, ContentValues().apply {
-                    put("id", 0); put("token", session.token); put("entry_key", session.entryKey)
-                    // Token, reveal phase and the real snapshot are preserved; only the scope label
-                    // joins the unified round, exactly like the v2->v3 migration.
-                    put("book", StudyBook.ALL.id); put("stage_before", session.stageBefore)
-                    put("new_word", if (session.newWord) 1 else 0)
-                    put("answer_revealed", if (session.answerRevealed) 1 else 0)
-                    put("headword", session.headword); put("pos", session.partOfSpeech)
-                    put("meaning", session.meaning); put("source", session.source); put("version", session.version)
-                    put("day_key", session.dayKey); put("created_at", session.createdAt)
-                })
-            }
+            replay(object : BackupRestoreSink {
+                override fun word(word: BackupWord) {
+                    db.insertOrThrow("words", null, ContentValues().apply {
+                        put("entry_key", word.entryKey); put("headword", word.headword); put("pos", word.partOfSpeech)
+                        put("meaning", word.meaning); put("source", word.source); put("version", word.version)
+                        put("mastered", if (word.mastered) 1 else 0); put("note", word.note)
+                        // v1–v3 payloads decode every word with favorite=false, so restoring an old file
+                        // intentionally clears the current local stars; a v4 file restores them exactly.
+                        put("favorite", if (word.favorite) 1 else 0)
+                    })
+                }
+
+                override fun userEntry(user: BackupUserEntry) {
+                    PersonalDictionary.requireStoredKey(user.entryKey)
+                    require(PersonalDictionary.isValidStoredPos(user.partOfSpeech)) { "用户词性未规范化" }
+                    require(PersonalDictionary.isValidStoredMeaning(user.meaning)) { "用户释义未规范化" }
+                    db.insertOrThrow("user_entries", null, ContentValues().apply {
+                        put("entry_key", user.entryKey); put("pos", user.partOfSpeech)
+                        put("meaning", user.meaning); put("updated_at", user.updatedAt)
+                    })
+                }
+
+                override fun event(event: BackupEvent) {
+                    db.insertOrThrow("events", null, ContentValues().apply {
+                        put("id", event.id); put("entry_key", event.entryKey); put("raw_text", event.rawText)
+                        put("final_form", event.finalForm); put("time", event.time)
+                        put("revoked", if (event.revoked) 1 else 0)
+                    })
+                }
+
+                override fun settings(settings: BackupStudySettings) {
+                    db.insertWithOnConflict("study_settings", null, ContentValues().apply {
+                        put("id", 0)
+                        // Old v1/v2 backups may name one legacy book. Restoring keeps all study rows and due
+                        // dates but joins the current unified scope; no switch-book UI remains.
+                        put("selected_book", StudyBook.ALL.id)
+                        put("daily_new_goal", settings.dailyNewGoal)
+                    }, SQLiteDatabase.CONFLICT_REPLACE)
+                }
+
+                override fun state(state: BackupStudyState) {
+                    db.insertOrThrow("study_states", null, ContentValues().apply {
+                        put("entry_key", state.entryKey); put("book", state.book); put("stage", state.stage)
+                        put("due_at", state.dueAt); put("introduced_at", state.introducedAt)
+                        put("last_review_at", state.lastReviewAt); put("last_review_seq", state.lastReviewSeq)
+                    })
+                }
+
+                override fun review(review: BackupStudyReview) {
+                    db.insertOrThrow("study_reviews", null, ContentValues().apply {
+                        put("token", review.token); put("entry_key", review.entryKey); put("feedback", review.feedback)
+                        put("stage_before", review.stageBefore); put("stage_after", review.stageAfter)
+                        put("due_after", review.dueAfter); put("reviewed_at", review.reviewedAt)
+                        put("day_key", review.dayKey); put("zone_id", review.zoneId)
+                        put("new_word", if (review.newWord) 1 else 0); put("seq", review.seq)
+                    })
+                }
+
+                override fun session(session: BackupStudySession) {
+                    db.insertOrThrow("study_session", null, ContentValues().apply {
+                        put("id", 0); put("token", session.token); put("entry_key", session.entryKey)
+                        // Token, reveal phase and the real snapshot are preserved; only the scope label
+                        // joins the unified round, exactly like the v2->v3 migration.
+                        put("book", StudyBook.ALL.id); put("stage_before", session.stageBefore)
+                        put("new_word", if (session.newWord) 1 else 0)
+                        put("answer_revealed", if (session.answerRevealed) 1 else 0)
+                        put("headword", session.headword); put("pos", session.partOfSpeech)
+                        put("meaning", session.meaning); put("source", session.source); put("version", session.version)
+                        put("day_key", session.dayKey); put("created_at", session.createdAt)
+                    })
+                }
+            })
+            // A staged replay must reach EOF and match the preview fingerprint before this point.
             db.setTransactionSuccessful()
         } finally { db.endTransaction() }
         deletions.recordRestore()

@@ -46,9 +46,9 @@ class DebugPerformance {
         if (!BuildConfig.DEBUG) return
         diagnostics.flush(result)
     }
-    /** Bounded frame-thread diagnostics; enums/timings only, no content or gesture coordinates. */
-    fun motionProbe(match: com.shici.app.core.FrameMatch?, elapsedMillis: Long) {
-        if (BuildConfig.DEBUG) Log.i("ShiciPerf", "stage=motion_probe reason=${match?.reason} duration_ms=$elapsedMillis " +
+    /** Bounded motion diagnostics; fixed stage, enums/timings, no content or gesture coordinates. */
+    fun motionProbe(match: com.shici.app.core.FrameMatch?, elapsedMillis: Long, stage: String = "motion_probe") {
+        if (BuildConfig.DEBUG) Log.i("ShiciPerf", "stage=$stage reason=${match?.reason} duration_ms=$elapsedMillis " +
             "context=${match?.contextSamples} changed=${match?.changedContextSamples} " +
             "edges=${match?.edgeContextSamples} edge_changed=${match?.changedEdgeContextSamples}")
     }

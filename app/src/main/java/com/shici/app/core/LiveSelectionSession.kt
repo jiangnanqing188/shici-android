@@ -91,7 +91,8 @@ class LiveFrameFingerprint private constructor(
         other: LiveFrameFingerprint,
         protection: PixelBox,
         density: Float,
-        excluded: List<PixelBox> = emptyList()
+        excluded: List<PixelBox> = emptyList(),
+        allowTranslation: Boolean = true
     ): FrameMatch {
         val maxOffset = SelectionMotion.maxOffsetPx(density, body)
         SelectionMotion.validate(body, protection, excluded, density, maxOffset)?.let { return it }
@@ -101,7 +102,8 @@ class LiveFrameFingerprint private constructor(
         }
         return try {
             SelectionMotion.search(body, encoded,
-                SelectionMotion.FingerprintPixels(other.encoded), protection, excluded, maxOffset)
+                SelectionMotion.FingerprintPixels(other.encoded), protection, excluded, maxOffset,
+                allowTranslation = allowTranslation)
         } catch (_: RuntimeException) {
             SelectionMotion.rejected(FrameMatchKind.UNAVAILABLE,
                 FrameMatchReason.INVALID_GEOMETRY, protection, maxOffset)
@@ -116,7 +118,8 @@ class LiveFrameFingerprint private constructor(
     fun matchBoundedPlane(
         width: Int, height: Int, body: PixelBox, rowStride: Int, pixelStride: Int,
         buffer: java.nio.ByteBuffer, protection: PixelBox, density: Float,
-        excluded: List<PixelBox> = emptyList()
+        excluded: List<PixelBox> = emptyList(), allowTranslation: Boolean = true,
+        stillObserving: () -> Boolean = { true }
     ): FrameMatch {
         val maxOffset = SelectionMotion.maxOffsetPx(density, body)
         SelectionMotion.validate(body, protection, excluded, density, maxOffset)?.let { return it }
@@ -128,7 +131,7 @@ class LiveFrameFingerprint private constructor(
         return try {
             SelectionMotion.search(body, encoded,
                 SelectionMotion.PlanePixels(rowStride, pixelStride, buffer),
-                protection, excluded, maxOffset)
+                protection, excluded, maxOffset, allowTranslation, stillObserving)
         } catch (_: RuntimeException) {
             SelectionMotion.rejected(FrameMatchKind.UNAVAILABLE,
                 FrameMatchReason.PLANE_UNREADABLE, protection, maxOffset)
@@ -144,11 +147,13 @@ class LiveFrameFingerprint private constructor(
      * of the visible page must prove a unique whole-page translation. No fingerprint, bitmap or
      * text is retained; the caller only keeps the resulting shift as timing/coordinate evidence.
      * A blank page, too few anchors, an ambiguous shift or any unreadable plane is returned as
-     * unaccepted and must be treated as doubt, never as zero movement.
+     * unaccepted and must be treated as doubt, never as zero movement. Once the owner ends,
+     * [stillObserving] can stop the expensive shift search without accepting a partial match.
      */
     fun probeBoundedPlane(
         width: Int, height: Int, body: PixelBox, rowStride: Int, pixelStride: Int,
-        buffer: java.nio.ByteBuffer, density: Float, excluded: List<PixelBox> = emptyList()
+        buffer: java.nio.ByteBuffer, density: Float, excluded: List<PixelBox> = emptyList(),
+        stillObserving: () -> Boolean = { true }
     ): FrameMatch {
         val maxOffset = SelectionMotion.maxOffsetPx(density, body)
         if (!density.isFinite() || density <= 0f) {
@@ -163,7 +168,7 @@ class LiveFrameFingerprint private constructor(
         return try {
             SelectionMotion.search(body, encoded,
                 SelectionMotion.PlanePixels(rowStride, pixelStride, buffer),
-                null, excluded, maxOffset)
+                null, excluded, maxOffset, stillObserving = stillObserving)
         } catch (_: RuntimeException) {
             SelectionMotion.rejected(FrameMatchKind.UNAVAILABLE,
                 FrameMatchReason.PLANE_UNREADABLE, null, maxOffset)
@@ -363,10 +368,12 @@ class LiveSelectionSession(
     private var motionObservations = 0
     private var motionShift: PageShift? = null
     private var motionShiftStable = true
+    private var motionStartedNanos = 0L
     private var motionLastAttemptNanos = 0L
+    private var motionProbePending = false
 
     /** Starts a fresh evidence window at ACTION_DOWN; earlier taps/frames are forgotten. */
-    fun beginStrokeMotion() {
+    fun beginStrokeMotion(startedNanos: Long = 0L) {
         synchronized(motionLock) {
             motionStarted = true
             motionActive = true
@@ -375,15 +382,16 @@ class LiveSelectionSession(
             motionObservations = 0
             motionShift = null
             motionShiftStable = true
+            motionStartedNanos = startedNanos
             motionLastAttemptNanos = 0L
+            motionProbePending = false
         }
     }
 
     /**
      * Closes the observation window at lift, before the overlay (and its ink) is removed. A frame
-     * still being processed after this point is no longer attributed to the stroke instead of
-     * being compared with the now-removed ink mask and wrongly turning the evidence doubtful.
-     * Observations recorded before this call remain available to [strokeMotionEvidence].
+     * whose probe was already in progress can finish only its reserved observation. A pending
+     * result is not the legacy no-sampled-frame case; until it finishes the stroke is unproven.
      */
     fun endStrokeMotion() {
         synchronized(motionLock) {
@@ -393,16 +401,26 @@ class LiveSelectionSession(
 
     fun isStrokeMotionActive(): Boolean = synchronized(motionLock) { motionActive }
 
+    /** No lift match can recover an observed bad frame or disagreement between shifts. */
+    fun hasUnprovenStrokeMotion(): Boolean = synchronized(motionLock) {
+        motionDoubt || !motionShiftStable || motionProbePending
+    }
+
     /**
      * Reserves one bounded stroke-time comparison for a compositor frame at [timestampNanos].
      *
      * The per-stroke hard budget and minimum time spacing keep the probe from scanning every
-     * frame. A skipped frame is **not** doubt: it simply contributes no evidence, and the README
-     * states that unsampled transients cannot be excluded. The caller must have already attributed
-     * the timestamp to the current stroke (positive and not earlier than ACTION_DOWN).
+     * frame. An unsampled frame carries no evidence; a known unavailable plane is still doubt.
+     * The capture thread must supply the compositor timestamp, not its receipt time.
      */
-    fun beginMotionObservation(timestampNanos: Long): Boolean = synchronized(motionLock) {
-        if (!motionActive || timestampNanos <= 0L) return@synchronized false
+    fun beginMotionObservation(timestampNanos: Long, planeAvailable: Boolean = true): Boolean = synchronized(motionLock) {
+        if (!motionActive || motionDoubt || !motionShiftStable || timestampNanos <= 0L ||
+            timestampNanos < motionStartedNanos) return@synchronized false
+        // A known unreadable plane remains doubt even if regular comparisons hit their cap.
+        if (!planeAvailable) {
+            motionDoubt = true
+            return@synchronized false
+        }
         if (motionAttempts >= MAX_STROKE_MOTION_ATTEMPTS) return@synchronized false
         if (motionLastAttemptNanos > 0L &&
             timestampNanos - motionLastAttemptNanos < MIN_STROKE_OBSERVATION_INTERVAL_NANOS) {
@@ -410,17 +428,26 @@ class LiveSelectionSession(
         }
         motionAttempts += 1
         motionLastAttemptNanos = timestampNanos
+        motionProbePending = true
         true
     }
 
     /**
      * One frame captured while the stroke was active proved [shift] relative to the fixed entry
      * baseline. A different accepted shift later in the same stroke makes a single uniform
-     * screen-coordinate reuse unprovable.
+     * screen-coordinate reuse unprovable. The capture thread supplies the reserved compositor
+     * timestamp; an old probe cannot finish into a subsequent gesture on the same layer.
      */
-    fun noteMotionObservation(shift: PageShift) {
+    fun noteMotionObservation(shift: PageShift?, timestampNanos: Long? = null) {
         synchronized(motionLock) {
-            if (!motionActive) return
+            if (timestampNanos == null) {
+                if (!motionActive) return
+            } else if (!motionProbePending || timestampNanos != motionLastAttemptNanos) return
+            motionProbePending = false
+            if (shift == null) {
+                motionDoubt = true
+                return
+            }
             motionObservations += 1
             val previous = motionShift
             if (previous == null) {
@@ -432,16 +459,12 @@ class LiveSelectionSession(
     }
 
     /** A frame during the stroke was too blank/ambiguous to prove the page; no optimistic default. */
-    fun noteMotionUnavailable() {
-        synchronized(motionLock) {
-            if (motionActive) motionDoubt = true
-        }
-    }
+    fun noteMotionUnavailable() = noteMotionObservation(null)
 
     /** The one shift every usable stroke-time frame agreed on, or null when none was proven. */
     fun observedStrokeShift(): PageShift? = synchronized(motionLock) {
         val observed = motionShift
-        if (!motionStarted || motionDoubt || !motionShiftStable ||
+        if (!motionStarted || motionDoubt || motionProbePending || !motionShiftStable ||
             motionObservations < 1 || observed == null) null else observed
     }
 
@@ -456,7 +479,7 @@ class LiveSelectionSession(
      *   observation with a moved lift) → [StrokeShiftEvidence.StartEndOffsetOnly], which is refused.
      */
     fun strokeMotionEvidence(finalShift: PageShift): StrokeShiftEvidence = synchronized(motionLock) {
-        if (!motionStarted || motionDoubt || !motionShiftStable) {
+        if (!motionStarted || motionDoubt || motionProbePending || !motionShiftStable) {
             return@synchronized StrokeShiftEvidence.StartEndOffsetOnly
         }
         val observed = motionShift
@@ -520,12 +543,13 @@ class LiveSelectionSession(
     fun matchLift(
         frame: LiveFrameFingerprint,
         density: Float,
-        excluded: List<PixelBox> = emptyList()
+        excluded: List<PixelBox> = emptyList(),
+        allowTranslation: Boolean = true
     ): FrameMatch {
         val protection = strokeProtection() ?: return SelectionMotion.rejected(
             FrameMatchKind.UNAVAILABLE, FrameMatchReason.PROTECTION_MISSING, null,
             SelectionMotion.maxOffsetPx(density, body))
-        return entryFingerprint.matchBounded(frame, protection.baseline, density, excluded)
+        return entryFingerprint.matchBounded(frame, protection.baseline, density, excluded, allowTranslation)
     }
 
     /** Plane version of [matchLift] for a fresh RGBA_8888 capture frame. */

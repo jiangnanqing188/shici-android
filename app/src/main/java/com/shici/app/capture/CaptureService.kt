@@ -166,8 +166,8 @@ class CaptureService : Service() {
     @Volatile private var lookupEpoch = 0L
     // Live in-place lookup: entry clean-frame identity plus the transparent gesture layer. Both are
     // removed on lift, cancel, resize, rotation, panel dismissal or service shutdown.
-    private var live: LiveSelectionSession? = null
-    private var liveView: LiveSelectionView? = null
+    @Volatile private var live: LiveSelectionSession? = null
+    @Volatile private var liveView: LiveSelectionView? = null
     // The layer is mounted before the ENTRY request. This bounds layout readiness so a permission
     // or window failure cannot leave a transparent touch barrier on screen indefinitely.
     private var liveReadyTimeout: Runnable? = null
@@ -642,7 +642,7 @@ class CaptureService : Service() {
          * prove" by both callers.
          */
         fun sameAs(baseline: LiveFrameFingerprint, body: PixelBox, protection: PixelBox?,
-                   strict: Boolean): Boolean? = try {
+                   strict: Boolean, stillObserving: () -> Boolean = { true }): Boolean? = try {
             val excluded = pageOverlayExclusions()
             // A selected-word protection region that is covered/masked by our own card cannot be
             // checked for changes. The surrounding page may still match, but the word the user
@@ -657,13 +657,11 @@ class CaptureService : Service() {
             val plane = image.planes.firstOrNull()
             when {
                 plane == null -> null
-                protection != null -> {
-                    val match = baseline.matchBoundedPlane(image.width, image.height, body,
+                protection != null -> !protectionMasked() &&
+                    baseline.matchBoundedPlane(image.width, image.height, body,
                         plane.rowStride, plane.pixelStride, plane.buffer, protection,
-                        resources.displayMetrics.density, excluded)
-                    !protectionMasked() && match.accepted &&
-                        (!strict || (match.dx == 0 && match.dy == 0))
-                }
+                        resources.displayMetrics.density, excluded, allowTranslation = !strict,
+                        stillObserving = stillObserving).accepted
                 else -> baseline.matchesPlane(image.width, image.height, body,
                     plane.rowStride, plane.pixelStride, plane.buffer, excluded) &&
                     baseline.hasIdentityInformation()
@@ -709,35 +707,22 @@ class CaptureService : Service() {
             if (stroke.startedNanos <= 0) return
             if (image.timestamp <= 0) return
             if (image.timestamp < stroke.startedNanos) return
-            val plane = image.planes.firstOrNull()
-            if (plane == null) {
-                session.noteMotionUnavailable()
-                return
-            }
-            if (!session.beginMotionObservation(image.timestamp)) return
             // Exclude only the ink and the two small chips. The page around the stroke remains
             // observable, and no accumulated or whole-page mask is used.
             val excluded = gesture.currentScreenExclusions()
+            val plane = runCatching { image.planes.firstOrNull() }.getOrNull()
+            if (strokeObservation !== stroke ||
+                !session.beginMotionObservation(image.timestamp, planeAvailable = plane != null) || plane == null) return
             val probeStarted = SystemClock.elapsedRealtime()
             val match = try {
                 stroke.baseline.probeBoundedPlane(image.width, image.height, stroke.body,
                     plane.rowStride, plane.pixelStride, plane.buffer,
-                    resources.displayMetrics.density, excluded)
+                    resources.displayMetrics.density, excluded) { strokeObservation === stroke }
             } catch (_: Exception) {
                 null
             }
+            session.noteMotionObservation(match?.takeIf { it.accepted }?.shift, image.timestamp)
             perf.motionProbe(match, SystemClock.elapsedRealtime() - probeStarted)
-            if (match == null) {
-                session.noteMotionUnavailable()
-            } else when (match.kind) {
-                FrameMatchKind.SAME ->
-                    session.noteMotionObservation(PageShift.NONE)
-                FrameMatchKind.MOVED ->
-                    session.noteMotionObservation(match.shift)
-                else ->
-                    // Blank/ambiguous/unreadable/changed plane: not zero movement, not a guess.
-                    session.noteMotionUnavailable()
-            }
             return
         }
         val guard = pageGuard
@@ -804,7 +789,9 @@ class CaptureService : Service() {
         val protection = pageGuardProtection
         // The guard baseline is the lift frame. A strict unchanged frame wins; otherwise only a
         // bounded, protection-verified shift is accepted. Anything unprovable closes the guard.
-        if (sameAs(guard.baseline, guard.body, protection, protection == null) != true) {
+        if (sameAs(guard.baseline, guard.body, protection, protection == null) {
+                pageGuard === guard && guard.isValid && sessionIsActive() && requestedFrame.get() == null
+            } != true) {
             invalidateOnFrameThread(guard)
         }
     }
@@ -1216,7 +1203,8 @@ class CaptureService : Service() {
      * advance before this publish (this request gets a newer, valid token) or observes the published
      * request and leaves it untouched.
      */
-    private fun armFrame(purpose: FramePurpose, body: PixelBox, deadlineMillis: Long): FreshFrameRequest {
+    private fun armFrame(purpose: FramePurpose, body: PixelBox, deadlineMillis: Long,
+                         cleanEntryView: LiveSelectionView? = null): FreshFrameRequest {
         val request = synchronized(pageLock) {
             val published = FreshFrameRequest(gate.next(), deadlineMillis, body)
             framePurpose = purpose
@@ -1235,7 +1223,14 @@ class CaptureService : Service() {
         val choreographer = Choreographer.getInstance()
         choreographer.postFrameCallback {
             if (frameIsCurrent(request)) choreographer.postFrameCallback {
-                if (frameIsCurrent(request)) request.arm(System.nanoTime())
+                if (frameIsCurrent(request)) {
+                    request.arm(System.nanoTime())
+                    // A static page may submit no frame after the first clean traversal, which
+                    // was still outside this request's timestamp window. Ask the still-mounted,
+                    // ink-free layer for one new traversal after arming, not a new frame request.
+                    if (cleanEntryView != null && liveView === cleanEntryView) cleanEntryView.invalidate()
+                    perf.stage(if (purpose == FramePurpose.ENTRY) "entry_frame" else "verify_frame", "armed")
+                }
             }
         }
         return request
@@ -1260,7 +1255,7 @@ class CaptureService : Service() {
             deletionCredential = app.repository.deletions.capture()
             val body = frameBody()
             removeBubble()
-            // The same view identity owns all four callbacks. A retired layer's late stroke,
+            // The same view identity owns the gesture callbacks. A retired layer's late stroke,
             // gesture start, too-short notice or cancel must be a complete no-op, even when a new
             // live session happens to be current. Preparation cancellation is deliberately allowed
             // while live is still null, but only for the origin view that is still mounted.
@@ -1275,7 +1270,8 @@ class CaptureService : Service() {
                 },
                 {
                     if (origin != null && liveView === origin && live != null && sessionIsActive()) {
-                        toast("请沿完整单词一笔划过；轻点不查询")
+                        stopStrokeObservation()
+                        perf.stage("stroke", "too_short")
                     }
                 },
                 { reason ->
@@ -1287,20 +1283,41 @@ class CaptureService : Service() {
                     val session = live
                     if (origin != null && liveView === origin && session != null &&
                         live === session && sessionIsActive()) {
-                        session.beginStrokeMotion()
+                        val startedNanos = System.nanoTime()
+                        session.beginStrokeMotion(startedNanos)
+                        perf.stage("stroke", "started")
                         // The compositor timestamp of a frame must be at/after this point to count
                         // as stroke-time evidence; a queued pre-stroke image is not reused. The
                         // fixed entry identity (never a rebased one) is compared until the lift.
                         strokeObservation = StrokeObservation(
-                            session, session.entryFingerprint, session.body, System.nanoTime())
+                            session, session.entryFingerprint, session.body, startedNanos)
+                    }
+                },
+                { state ->
+                    if (origin != null && liveView === origin && sessionIsActive()) {
+                        if (state == "multi_cancel" || state == "ready_cancel" ||
+                            state == "pointer_lost") stopStrokeObservation()
+                        perf.stage("gesture", state)
                     }
                 })
             origin = view
             if (!addLiveLayer(view)) return
             liveView = view
+            view.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
+                override fun onViewAttachedToWindow(v: View) = Unit
+                override fun onViewDetachedFromWindow(v: View) {
+                    if (liveView !== view) return
+                    stopStrokeObservation()
+                    main.post {
+                        if (liveView === view && sessionIsActive()) {
+                            perf.stage("live_layer", "detached")
+                            cancelLiveMode("划词层已关闭，本次未查询；请点「词」重新划词")
+                        }
+                    }
+                }
+            })
             val readyTimeout = Runnable {
                 if (liveView === view && live == null && requestedFrame.get() == null) {
-                    perf.stage("live_layer", "ready_timeout")
                     failLiveLookup(
                         "划词层未能就绪：透明触摸层没有完成可用布局（不是 OCR 或词库问题）。本次未查询、未收录。请点「重试取词」。",
                         "live_ready_timeout")
@@ -1311,6 +1328,7 @@ class CaptureService : Service() {
             view.awaitWindowReady {
                 if (liveView === view && live == null && sessionIsActive() &&
                     requestedFrame.get() == null) {
+                    perf.stage("live_layer", "layout_ready")
                     // One real compositor boundary lets the preparation prompt become visible
                     // before it is hidden. armFrame then waits its own two traversal boundaries,
                     // so the prompt/cancel/ink cannot enter the entry bitmap.
@@ -1320,7 +1338,7 @@ class CaptureService : Service() {
                             clearLiveReadyTimeout()
                             view.beginCleanEntry()
                             armFrame(FramePurpose.ENTRY, body,
-                                SystemClock.elapsedRealtime() + ENTRY_FRAME_TIMEOUT_MS)
+                                SystemClock.elapsedRealtime() + ENTRY_FRAME_TIMEOUT_MS, view)
                         }
                     }
                 }
@@ -1428,17 +1446,14 @@ class CaptureService : Service() {
         val selection = HighlighterGeometry.selection(listOf(stroke), session.screenWidth, session.screenHeight,
             session.screenWidth, session.screenHeight, resources.displayMetrics.density)
         if (selection == null) {
+            stopStrokeObservation()
             perf.stage("selection", "empty")
             toast("未形成有效划线；没有查询，也没有新增记录")
             return
         }
         removeLiveLayer()
-        // The ink disappeared with the overlay. Close the evidence window before the verify frame
-        // is armed so a late frame is not compared against a mask that no longer exists; evidence
-        // recorded while the finger was down remains available to the lift decision.
-        session.endStrokeMotion()
-        session.selection = selection
         perf.selectionSubmit()
+        session.selection = selection
         val request = armFrame(FramePurpose.VERIFY, session.body,
             SystemClock.elapsedRealtime() + VERIFY_FRAME_TIMEOUT_MS)
         session.verifyToken = request.token
@@ -1465,6 +1480,13 @@ class CaptureService : Service() {
             abortDirectRead(session)
             return
         }
+        if (session.hasUnprovenStrokeMotion()) {
+            bitmap.recycle()
+            // A bad or interrupted probe or disagreement already rules out this stroke. Do not
+            // spend another whole-screen comparison looking for a shift it could not use.
+            failLiveLookup("无法确认划词期间画面与笔迹保持对齐，本次未查询、未收录。请等页面停止滚动，再点「重试取词」重新划词。", "verify_stroke_unproven")
+            return
+        }
         val published = synchronized(pageLock) { pendingPageBaseline }
         val fingerprint = published ?: runCatching {
             LiveFrameFingerprint.sample(bitmap.width, bitmap.height, session.body) { x, y, row ->
@@ -1478,8 +1500,12 @@ class CaptureService : Service() {
             return
         }
         val matchStarted = SystemClock.elapsedRealtime()
-        val match = session.matchLift(fingerprint, resources.displayMetrics.density)
-        perf.motionProbe(match, SystemClock.elapsedRealtime() - matchStarted)
+        // A nonzero shift can only be admitted when actual stroke-time frames agreed on a
+        // nonzero offset. Otherwise only the existing protected zero-shift comparison can pass.
+        val allowTranslation = session.observedStrokeShift()?.let { it != PageShift.NONE } ?: false
+        val match = session.matchLift(fingerprint, resources.displayMetrics.density,
+            allowTranslation = allowTranslation)
+        perf.motionProbe(match, SystemClock.elapsedRealtime() - matchStarted, stage = "verify_match")
         perf.stage("page_match", match.reason.name.lowercase())
         if (!match.accepted) {
             bitmap.recycle()
@@ -1488,7 +1514,7 @@ class CaptureService : Service() {
                 val pageChanged = RecognitionFeedback.notice(RecognitionFailure.PAGE_CHANGED)
                 failLiveLookup(pageChanged.message, "page_changed", pageChanged.nextStep)
             } else {
-                failLiveLookup("本次划选未能与当前画面可靠对齐，未查询、未收录。请重新划词，或使用手动输入。", "verify_unproven")
+                failLiveLookup("本次划选未能与当前画面可靠对齐，未查询、未收录。请等页面停止滚动，再点「重试取词」重新划词，或使用手动输入。", "verify_unproven")
             }
             return
         }
@@ -1775,11 +1801,15 @@ class CaptureService : Service() {
         false
     }
 
-    private fun removeLiveLayer() {
-        // Close the stroke-time evidence window with the layer. Observations recorded while the
-        // finger was down remain in the session for the lift decision; no frame captured after the
-        // ink disappeared may be attributed to the stroke.
+    private fun stopStrokeObservation() {
+        strokeObservation?.session?.endStrokeMotion()
         strokeObservation = null
+    }
+
+    private fun removeLiveLayer() {
+        // Stop reserving probes before removing the ink; an in-flight probe can only finish its
+        // previously reserved timestamp, never read the next gesture's exclusions.
+        stopStrokeObservation()
         clearLiveReadyTimeout()
         liveTimeout?.let { main.removeCallbacks(it) }
         liveTimeout = null

@@ -2,6 +2,7 @@
   "use strict";
 
   var HERO_PHRASE = "阅读不停，生词随手拾起";
+  var RELEASE_REPOSITORY_URL = "https://github.com/jiangnanqing188/shici-android";
   var site = window.SHICI_SITE;
   var pageName = document.documentElement.getAttribute("data-page") || "";
   var LEGACY_HASH_TARGETS = {
@@ -60,38 +61,6 @@
     });
   }
 
-  function safeHttpUrl(value) {
-    var raw = text(value);
-    if (!raw) {
-      return "";
-    }
-    try {
-      var url = new URL(raw);
-      if (url.protocol !== "http:" && url.protocol !== "https:") {
-        return "";
-      }
-      if (url.username || url.password) {
-        return "";
-      }
-      return url.href;
-    } catch (error) {
-      return "";
-    }
-  }
-
-  function isPositiveInteger(value) {
-    var raw = text(value);
-    if (!/^[0-9]+$/.test(raw)) {
-      return false;
-    }
-    var number = Number(raw);
-    return Number.isSafeInteger(number) && number > 0;
-  }
-
-  function isSha256(value) {
-    return /^[0-9a-fA-F]{64}$/.test(text(value));
-  }
-
   function normalisePhrase(value) {
     return text(value).replace(/[\s，。！？、,.!?：:；;“”"'‘’]/g, "");
   }
@@ -111,30 +80,30 @@
   }
 
   function resolveReleaseStatus(release) {
-    if (!release || typeof release !== "object") {
-      return { state: "preparing", version: "" };
+    if (release === null) {
+      return { state: "preparing" };
     }
-    var version = text(release.version);
-    var versionCode = text(release.versionCode);
-    var sizeLabel = text(release.sizeLabel);
-    var checksum = text(release.sha256);
-    var downloadUrl = safeHttpUrl(release.url);
-    var notesUrl = safeHttpUrl(release.releaseNotesUrl);
-    var isComplete = Boolean(version) &&
-      isPositiveInteger(versionCode) &&
-      Boolean(sizeLabel) &&
-      isSha256(checksum) &&
-      text(release.channel) === "test" &&
-      Boolean(downloadUrl);
-
+    if (!release || typeof release !== "object") {
+      return { state: "incomplete" };
+    }
+    var version = release.version;
+    var versionCode = release.versionCode;
+    if (typeof version !== "string" || !/^[0-9]+\.[0-9]+\.[0-9]+$/.test(version) ||
+        !Number.isSafeInteger(versionCode) || versionCode <= 0 || release.channel !== "test") {
+      return { state: "incomplete" };
+    }
+    // 精确匹配规范的设备 Release 页面，不接受跳转参数、替代主机、凭据或附件直链。
+    var releasePrefix = RELEASE_REPOSITORY_URL + "/releases/tag/v" + version;
+    if (release.phoneReleaseUrl !== releasePrefix + "-phone-test" ||
+        release.tabletReleaseUrl !== releasePrefix + "-tablet-test") {
+      return { state: "incomplete" };
+    }
     return {
-      state: isComplete ? "open" : "incomplete",
+      state: "open",
       version: version,
       versionCode: versionCode,
-      sizeLabel: sizeLabel,
-      checksum: checksum,
-      downloadUrl: downloadUrl,
-      notesUrl: notesUrl
+      phoneReleaseUrl: release.phoneReleaseUrl,
+      tabletReleaseUrl: release.tabletReleaseUrl
     };
   }
 
@@ -286,19 +255,9 @@
     container.setAttribute("role", "list");
   }
 
-  function appendMetaRow(list, label, value, monospace) {
-    var clean = text(value);
-    if (!clean) {
-      return;
-    }
+  function appendMetaRow(list, label, value) {
     list.appendChild(element("dt", "", label));
-    var definition = element("dd");
-    if (monospace) {
-      definition.appendChild(element("code", "", clean));
-    } else {
-      definition.textContent = clean;
-    }
-    list.appendChild(definition);
+    list.appendChild(element("dd", "", value));
   }
 
   function renderRequirements(container, statusRequirement) {
@@ -335,37 +294,20 @@
       nodes.meta.replaceChildren();
       nodes.meta.hidden = true;
     }
-    if (nodes.notes) {
-      nodes.notes.replaceChildren();
-      nodes.notes.hidden = true;
-    }
   }
 
-  function androidShareNote(info, available) {
-    var platforms = site.platforms && typeof site.platforms === "object" ? site.platforms : {};
-    var android = platforms.android && typeof platforms.android === "object" ? platforms.android : {};
-    var template = text(available ? android.shareNote : android.shareNoteUnavailable);
-    if (!template) {
-      return "";
-    }
-    return substitute(template, { version: info.version || "" });
-  }
-
-  // 单个平台槽位：仅在发布配置有效时放一个真实 <a download>，否则只显示文字状态。
-  function renderPlatformSlot(slot, label, info, describedBy) {
+  // 只导航到已校验的 Release 页面，不在官网触发附件下载。
+  function renderPlatformSlot(slot, label, releaseUrl) {
     if (!slot) {
       return;
     }
     slot.replaceChildren();
-    if (info.state === "open" && info.downloadUrl) {
-      var downloadLink = element("a", "button button-primary", label);
-      downloadLink.href = info.downloadUrl;
-      downloadLink.rel = "noopener";
-      downloadLink.setAttribute("download", "");
-      if (describedBy) {
-        downloadLink.setAttribute("aria-describedby", describedBy);
-      }
-      slot.appendChild(downloadLink);
+    if (releaseUrl) {
+      var releaseLink = element("a", "button button-primary", label);
+      releaseLink.href = releaseUrl;
+      releaseLink.rel = "noopener";
+      releaseLink.setAttribute("aria-describedby", "android-release-note");
+      slot.appendChild(releaseLink);
     } else {
       slot.appendChild(element("p", "platform-unavailable", "暂未开放下载"));
     }
@@ -374,10 +316,10 @@
 
   function renderRelease(nodes, info, copy) {
     applyReleaseCopy(nodes, copy);
-    renderPlatformSlot(nodes.phoneSlot, nodes.phoneLabel, info, "android-share-note");
-    renderPlatformSlot(nodes.tabletSlot, nodes.tabletLabel, info, "android-share-note");
-    if (nodes.shareNote) {
-      nodes.shareNote.textContent = androidShareNote(info, info.state === "open");
+    renderPlatformSlot(nodes.phoneSlot, nodes.phoneLabel, info.phoneReleaseUrl);
+    renderPlatformSlot(nodes.tabletSlot, nodes.tabletLabel, info.tabletReleaseUrl);
+    if (nodes.releaseNote) {
+      nodes.releaseNote.textContent = nodes.releaseNoteText;
     }
 
     if (info.state !== "open") {
@@ -388,19 +330,8 @@
       var meta = document.createDocumentFragment();
       appendMetaRow(meta, "版本", info.version);
       appendMetaRow(meta, "版本代码", info.versionCode);
-      appendMetaRow(meta, "文件大小", info.sizeLabel);
-      appendMetaRow(meta, "SHA-256", info.checksum, true);
       nodes.meta.replaceChildren(meta);
-      nodes.meta.hidden = !nodes.meta.childElementCount;
-    }
-
-    if (nodes.notes && info.notesUrl) {
-      var notesText = document.createTextNode("更新说明：");
-      var notesLink = element("a", "", "查看本版更新说明");
-      notesLink.href = info.notesUrl;
-      notesLink.rel = "noopener";
-      nodes.notes.replaceChildren(notesText, notesLink);
-      nodes.notes.hidden = false;
+      nodes.meta.hidden = false;
     }
   }
 
@@ -445,12 +376,12 @@
       copy: document.querySelector("[data-release-copy]"),
       phoneSlot: document.querySelector("[data-android-phone]"),
       tabletSlot: document.querySelector("[data-android-tablet]"),
-      phoneLabel: text(android.phoneLabel) || "安卓手机下载",
-      tabletLabel: text(android.tabletLabel) || "安卓平板下载",
-      shareNote: document.querySelector("[data-android-share-note]"),
+      phoneLabel: text(android.phoneLabel) || "打开 GitHub 手机版发布页",
+      tabletLabel: text(android.tabletLabel) || "打开 GitHub 平板版发布页",
+      releaseNote: document.querySelector("[data-android-release-note]"),
+      releaseNoteText: text(info.state === "open" ? android.releaseNote : android.releaseNoteUnavailable),
       verify: document.querySelector("[data-verify-copy]"),
-      meta: document.querySelector("[data-release-meta]"),
-      notes: document.querySelector("[data-release-notes]")
+      meta: document.querySelector("[data-release-meta]")
     }, info, copy);
 
     renderApple(platforms);
@@ -529,18 +460,17 @@
 
   function renderRepository() {
     var container = document.querySelector("[data-footer-repository]");
-    var repositoryUrl = safeHttpUrl(site.repositoryUrl);
     if (!container) {
       return;
     }
-    if (!repositoryUrl) {
+    if (site.repositoryUrl !== RELEASE_REPOSITORY_URL) {
       container.replaceChildren();
       container.hidden = true;
       return;
     }
 
     var link = element("a", "", "查看公开发布仓库");
-    link.href = repositoryUrl;
+    link.href = RELEASE_REPOSITORY_URL;
     link.rel = "noopener";
     container.replaceChildren(document.createTextNode("公开发布仓库："), link);
     container.hidden = false;
@@ -609,7 +539,7 @@
     if (!main || document.querySelector(".load-notice")) {
       return;
     }
-    var notice = element("div", "load-notice", "页面内容暂时无法加载，请稍后刷新重试。下载信息尚未公布，本页不会自动下载任何文件。");
+    var notice = element("div", "load-notice", "页面内容暂时无法加载，请稍后刷新重试。本站暂不显示发布入口，也不会自动下载文件。");
     notice.setAttribute("role", "status");
     main.insertBefore(notice, main.firstChild);
   }
