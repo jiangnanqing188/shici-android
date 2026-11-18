@@ -46,6 +46,9 @@ class LookupScreen(
     /** The real input, clear and query area for the interactive guide. */
     val practiceArea: View
 
+    // Inside the highlighted area, so a failed load can be retried without skipping the guide.
+    val dictionaryStatusHost = context.column()
+
     /** Complete scrollable page body. No sidebar and no root padding; the host body supplies those. */
     val view: View
 
@@ -64,6 +67,7 @@ class LookupScreen(
         practiceArea = card
 
         input = context.inputField("输入英文单词", true)
+        input.isSaveEnabled = false // The Activity owns exact draft persistence, not view state.
         // Restore the draft before the watcher is attached so restoring never looks like a user edit
         // and can never be mistaken for a query.
         input.setText(initialText)
@@ -106,6 +110,7 @@ class LookupScreen(
         card.space(4)
         // Kept visible next to the primary action: a query is a real recording action.
         card.addView(context.text("查询会收录到生词本。", 15f, Paper.secondary))
+        card.addView(dictionaryStatusHost)
         content.addView(card)
         content.space(12)
 

@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      Fixed update channel, decided by the build's own source and never by the device shape,
+      locale or screen size. The tablet build publishes/consumes only "tablet" releases and the
+      phone build only "phone" releases; a value other than those two disables update checks
+      instead of guessing.
+      Not translatable: a values-* locale folder must never be able to change it.
+    -->
+    <string name="update_channel" translatable="false">phone</string>
+</resources>

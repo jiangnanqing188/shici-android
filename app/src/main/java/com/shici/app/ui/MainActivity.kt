@@ -4,8 +4,10 @@ import android.Manifest
 import android.accessibilityservice.AccessibilityServiceInfo
 import android.app.Activity
 import android.app.AlertDialog
+import android.content.ContentResolver
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.database.Cursor
 import android.graphics.Rect
 import android.graphics.Typeface
 import android.media.projection.MediaProjectionConfig
@@ -15,16 +17,22 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
+import android.provider.DocumentsContract
+import android.provider.DocumentsContract.Document
 import android.provider.Settings
 import android.text.Editable
+import android.text.TextUtils
 import android.text.TextWatcher
 import android.view.*
 import android.view.accessibility.AccessibilityManager
 import android.widget.*
 import com.shici.app.ShiciApplication
 import com.shici.app.BuildConfig
+import com.shici.app.R
 import com.shici.app.capture.*
 import com.shici.app.core.*
+import com.shici.app.update.*
 import com.shici.app.data.DeleteOutcome
 import com.shici.app.data.ExactUndoOutcome
 import com.shici.app.data.PreparedUndo
@@ -33,11 +41,14 @@ import com.shici.app.data.RevokeOutcome
 import com.shici.app.data.UndoPrepareOutcome
 import com.shici.app.data.WordDetailSaveOutcome
 import com.shici.app.export.PdfExporter
-import com.shici.app.export.LostPdfFileCleanup
-import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.IOException
+import java.io.InputStream
+import java.io.OutputStream
 import java.time.*
 import java.time.format.DateTimeFormatter
 import java.util.UUID
+import java.util.concurrent.RejectedExecutionException
 
 /**
  * One dictionary read plus the committed revision observed on the worker immediately around it.
@@ -69,6 +80,12 @@ class MainActivity : Activity() {
         // Row-menu item ids for the vocabulary list (see showVocabularyRowMenu).
         private const val MENU_FAVORITE = 1
         private const val MENU_REMOVE = 2
+        private const val VOCABULARY_PAGE_SIZE = 32
+        private const val SAVED_BACKUP_REQUEST_LIMIT = 64
+        private const val DOCUMENT_TIMEOUT_MS = 120_000L
+        private const val BACKUP_PICKER_TIMEOUT_MS = 600_000L
+        private const val DOCUMENT_REJECTED = "文档操作繁忙或此文件仍在使用，本次未处理；请稍后重试"
+        private const val BACKUP_PRIVACY = "备份是未加密的明文。拾词不会主动上传；若选择云盘位置，提供方可能上传或同步文件。敏感备份建议存到本机。"
     }
 
     /**
@@ -119,6 +136,16 @@ class MainActivity : Activity() {
     private val main = Handler(Looper.getMainLooper())
     private lateinit var root: LinearLayout
     private lateinit var body: LinearLayout
+    // ---- Update check ------------------------------------------------------------------------
+    // The coordinator owns the network thread, the persisted interval and every piece of update
+    // state. This Activity only renders it: a non-blocking bar above the page body and the section
+    // in 设置 → 关于. None of this touches lookup, study, backup or SQLite state.
+    private var updateCenter: UpdateCenter? = null
+    private lateinit var updateBannerHost: LinearLayout
+    private var updateStateView: TextView? = null
+    // Dismissal is per version for this Activity; the settings entry is never removed.
+    private var dismissedUpdateVersion = -1
+    private var pendingUpdateScroll = false
     @Volatile private var page = MainPage.HOME
     // True while this Activity is started. Favorite writes are admitted on the worker thread and use
     // this plus [interactionEpoch] to refuse a mutation queued by a page that has since stopped or
@@ -140,6 +167,7 @@ class MainActivity : Activity() {
     // `true` and [exportSelection] is the explicit allow-list: an empty set is an explicit zero and
     // must never fall back to "all". Only the visible "use all current results" action resets it.
     private var exportSelectionExplicit = false
+    private var exportScopeNotRestored = false
     // Compact vocabulary filter/sort/manage toolbar and the collapsible export-selection panel.
     // [vocabularyManaging] only decides whether the export controls and row checkboxes are shown; it
     // never edits the selection intent, the search/favorite filter or any learning data.
@@ -149,6 +177,14 @@ class MainActivity : Activity() {
     // split layout). Used only to bring the panel into view when managing starts.
     private var vocabularyScroll: ScrollView? = null
     private var vocabularyManaging = false
+    private var vocabularyPage = 0
+    private var vocabularyPageAnchor: String? = null
+    private var restoredVocabularyScroll: Int? = null
+    private var hasLearningSnapshot = false
+    private class VocabularyFilter(val source: List<LearnedWord>, val search: String, val favorites: Boolean,
+                                   val matches: List<LearnedWord>)
+    private var vocabularyFilter: VocabularyFilter? = null
+    private var vocabularyOrder: Pair<VocabularySort, List<LearnedWord>>? = null
     // The single live animated guide page. Only one may exist: a rebuild/re-entry pauses and closes
     // the old one before a new screen is created, so no detached instance keeps animating.
     private var guideScreen: UsageGuideScreen? = null
@@ -156,6 +192,7 @@ class MainActivity : Activity() {
     private var practiceStep: PracticeStep? = null
     private var practiceCoach: PracticeCoach? = null
     private var practiceGeneration = 0L
+    private class PracticeLookupOwner(val generation: Long, val target: View)
     private var pendingCapturePractice = false
     // Translation page draft and the single owner of its ML Kit session. The draft survives page
     // switches and rotation; the translator itself is closed on leave/stop/destroy and is recreated
@@ -181,6 +218,10 @@ class MainActivity : Activity() {
     private var wordsVersion = 0L
     private var stats = LearningStats(0, 0, 0, 0, 0)
     private var search = ""
+    private var draftOwner = UUID.randomUUID().toString()
+    private var draftSnapshotId: String? = null
+    private data class RetainedDraft(val owner: String, val id: String, val state: ActivityDraftState)
+    private var retainedDraft: RetainedDraft? = null
     // Lookup page draft: the text and selection live in fields so a background snapshot refresh
     // (which deliberately does not re-render this page) and rotation cannot destroy the user's input.
     private var lookupQuery = ""
@@ -195,10 +236,6 @@ class MainActivity : Activity() {
         val entryKey: String, val headword: String, val raw: String,
         val original: DictionaryEntry?, var user: UserDictionaryEntry?,
         val credential: Long, var readRevision: Long, val newHeadword: Boolean
-    )
-    private data class PersonalEntryDraft(
-        val headword: String, val pos: String, val meaning: String,
-        val baseUpdatedAt: Long, val newHeadword: Boolean
     )
     private class PersonalDraftConfirm(val source: PersonalEntrySource, val draft: PersonalEntryDraft)
     private var personalSource: PersonalEntrySource? = null
@@ -231,10 +268,14 @@ class MainActivity : Activity() {
     // One persistent study surface so an in-flight feedback commit is not orphaned by a tab switch.
     private val studyScreenDelegate = lazy { StudyScreen(app, this, { render() }, { toast(it) }) }
     private val studyScreen by studyScreenDelegate
-    // Document request codes whose picker was open when the activity was recreated. Frozen backup
-    // state is in memory only, so these results can no longer be applied: reserve the codes (never
-    // reuse) and just tell the user to restart, without touching any file.
-    private val interruptedDocumentRequests = mutableSetOf<Int>()
+    private enum class BackupPicker(val stateKey: String) {
+        IMPORT("backup_import_requests"), EXPORT("backup_create_requests"),
+        SAFETY("backup_safety_requests"), LEGACY("backup_requests")
+    }
+    // Only bounded codes and kinds survive recreation, never a URI, payload or private file path.
+    private val interruptedDocumentRequests = mutableMapOf<Int, BackupPicker>()
+    private val documentOperations = mutableMapOf<Int, DocumentOperation>()
+    private var backupRequestHighWatermark = -1
     private var backupExportButton: Button? = null
     private var restoreButton: Button? = null
     private var backupStatusView: TextView? = null
@@ -320,6 +361,11 @@ class MainActivity : Activity() {
     private var dictionaryDetail = "校验完成后显示词头与词形别名数量。"
     private var dictionaryStatusView: TextView? = null
     private var dictionaryDetailView: TextView? = null
+    private var dictionaryRetryButton: Button? = null
+    private var lookupDictionaryHost: LinearLayout? = null
+    private var dictionaryAttempt: ShiciApplication.LookupDictionaryAttempt? = null
+    private var dictionaryStatusLoading = false
+    private var lookupDictionaryRetryShown = false
     private var activeDialog: AlertDialog? = null
     // Height guard of the dialog currently shown. It is replaced with each new dialog and detached
     // by its own dismiss listener, so a dismissed dialog can never re-lay out over its successor.
@@ -384,11 +430,24 @@ class MainActivity : Activity() {
             ?: savedInstanceState?.let { if (it.containsKey("tab")) MainPage.fromLegacyTab(it.getInt("tab")) else null }
             ?: MainPage.HOME
         currentTab = page.legacyTab
-        search = savedInstanceState?.getString("search") ?: ""
-        lookupQuery = savedInstanceState?.getString("lookup_query") ?: ""
+        val savedDraftOwner = savedInstanceState?.getString("draft_owner")
+        val savedDraftId = savedInstanceState?.getString("draft_snapshot")
+        val usesDraftStore = savedInstanceState?.containsKey("draft_snapshot") == true
+        val restored = if (savedDraftId != null && savedDraftOwner != null &&
+            runCatching { UUID.fromString(savedDraftOwner).toString() == savedDraftOwner }.getOrDefault(false)) {
+            draftOwner = savedDraftOwner
+            draftSnapshotId = savedDraftId
+            val retained = lastNonConfigurationInstance as? RetainedDraft
+            retained?.takeIf { it.owner == draftOwner && it.id == savedDraftId }?.state
+                ?: ActivityDraftState.Store(this, draftOwner).read(savedDraftId)
+        } else null
+        val searchNotRestored = usesDraftStore && restored?.search == null &&
+            savedInstanceState?.getBoolean("draft_search_empty") != true
+        search = (if (usesDraftStore) restored?.search else savedInstanceState?.getString("search")) ?: ""
+        lookupQuery = (if (usesDraftStore) restored?.lookup else savedInstanceState?.getString("lookup_query")) ?: ""
         lookupSelectionStart = savedInstanceState?.getInt("lookup_sel_start", lookupQuery.length) ?: lookupQuery.length
         lookupSelectionEnd = savedInstanceState?.getInt("lookup_sel_end", lookupSelectionStart) ?: lookupSelectionStart
-        translationInput = savedInstanceState?.getString("translation_draft") ?: ""
+        translationInput = (if (usesDraftStore) restored?.translation else savedInstanceState?.getString("translation_draft")) ?: ""
         translationSelectionStart = savedInstanceState?.getInt(
             "translation_sel_start", translationInput.length
         ) ?: translationInput.length
@@ -410,7 +469,16 @@ class MainActivity : Activity() {
             ?.let { name -> VocabularySort.entries.firstOrNull { it.name == name } }
             ?: VocabularySort.RECENT_FIRST
         vocabularyManaging = savedInstanceState?.getBoolean("vocabulary_managing", false) ?: false
-        savedInstanceState?.getStringArrayList("export_selection")?.let { exportSelection.addAll(it) }
+        vocabularyPage = if (searchNotRestored) 0 else savedInstanceState?.getInt("vocabulary_page", 0) ?: 0
+        vocabularyPageAnchor = restored?.pageAnchor?.takeUnless { searchNotRestored }
+        restoredVocabularyScroll = if (searchNotRestored) null else savedInstanceState
+            ?.takeIf { it.containsKey("vocabulary_scroll") }?.getInt("vocabulary_scroll")
+        selectedKey = restored?.selectedKey
+        val restoredSelection = if (usesDraftStore) {
+            if (savedInstanceState?.getBoolean("draft_selection_empty") == true) emptySet()
+            else restored?.exportSelection
+        } else savedInstanceState?.getStringArrayList("export_selection")
+        restoredSelection?.let { exportSelection.addAll(it) }
         // Old bundles carried no intent flag: a restored non-empty list was the historical explicit
         // allow-list, while a restored empty list meant the default "current filter" scope. New
         // bundles carry the flag explicitly, so an intentionally emptied selection restores as an
@@ -422,22 +490,29 @@ class MainActivity : Activity() {
                 exportSelection.isNotEmpty()
             }
         } ?: false
-        personalHeadword = savedInstanceState?.getString("pe_headword") ?: ""
+        exportScopeNotRestored = savedInstanceState?.getBoolean("export_scope_not_restored") == true ||
+            searchNotRestored || (usesDraftStore && exportSelectionExplicit && restoredSelection == null)
+        if (exportScopeNotRestored) {
+            exportSelection.clear()
+            exportSelectionExplicit = true
+        }
+        personalHeadword = (if (usesDraftStore) restored?.personalHeadword else savedInstanceState?.getString("pe_headword")) ?: ""
         if (page == MainPage.PERSONAL_ENTRY) {
             val hasDraft = savedInstanceState?.getBoolean("pe_has_draft", false) == true
             if (hasDraft) {
-                val draft = PersonalEntryDraft(
+                val draft = if (usesDraftStore) restored?.personalDraft else PersonalEntryDraft(
                     savedInstanceState.getString("pe_draft_headword") ?: personalHeadword,
                     savedInstanceState.getString("pe_draft_pos") ?: "",
                     savedInstanceState.getString("pe_draft_meaning") ?: "",
                     savedInstanceState.getLong("pe_draft_base", 0L),
                     savedInstanceState.getBoolean("pe_draft_new", false)
                 )
-                personalHeadword = draft.headword
+                if (draft != null) personalHeadword = draft.headword
                 // A restored draft is never an automatic write identity: the old editor/lease is
                 // gone, so the page asks for a fresh user-triggered read before any editing.
                 personalRestoredDraft = draft
-                personalStatusText = "页面已重建，草稿已保留；请重新读取当前词义再确认。"
+                personalStatusText = if (draft != null) "页面已重建，草稿已保留；请重新读取当前词义再确认。"
+                    else "未能恢复补词草稿；请重新输入，不会自动保存。"
             } else if (personalHeadword.isNotBlank()) {
                 personalStatusText = "页面已重建，请重新读取当前词义再继续。"
             }
@@ -445,57 +520,37 @@ class MainActivity : Activity() {
         consentGeneration = savedInstanceState?.getLong("consent", -1L) ?: -1L
         lostExportRequestCode = savedInstanceState?.getInt("export_request", -1) ?: -1
         if (lostExportRequestCode >= 0) LearningExportSession.reserveRequestCode(lostExportRequestCode)
-        savedInstanceState?.getIntArray("backup_requests")?.forEach { code ->
-            if (code >= 0) { interruptedDocumentRequests += code; LearningExportSession.reserveRequestCode(code) }
+        backupRequestHighWatermark = savedInstanceState?.getInt("backup_request_high_watermark", -1) ?: -1
+        if (backupRequestHighWatermark >= 0) LearningExportSession.reserveRequestCode(backupRequestHighWatermark)
+        BackupPicker.entries.forEach { picker ->
+            savedInstanceState?.getIntArray(picker.stateKey)?.forEach { code ->
+                if (code >= 0) {
+                    LearningExportSession.reserveRequestCode(code)
+                    backupRequestHighWatermark = maxOf(backupRequestHighWatermark, code)
+                    if (interruptedDocumentRequests.size < SAVED_BACKUP_REQUEST_LIMIT) {
+                        interruptedDocumentRequests.putIfAbsent(code, picker)
+                    }
+                }
+            }
         }
         buildShell()
-        // A fresh launch may carry the capture card's explicit "手动查词" request. A recreated
-        // Activity (savedInstanceState != null) never replays it over the restored draft.
-        if (savedInstanceState == null) applyManualLookupIntent(intent)
-    }
-    /**
-     * Explicit capture-card exit received while this Activity is already alive (CLEAR_TOP/SINGLE_TOP).
-     * Only navigates/prefills; it never submits a query, records a word or replays an old capture.
-     */
-    override fun onNewIntent(intent: Intent) {
-        super.onNewIntent(intent)
-        setIntent(intent)
-        applyManualLookupIntent(intent)
-    }
-    /**
-     * Consumes [CaptureService.ACTION_MANUAL_LOOKUP] exactly once. Only the optional original text is
-     * used as a draft prefill; no frame, OCR data, credential or admission is accepted. Creating the
-     * page does not query or collect anything, and the action/extra are removed so rotation or a
-     * later re-entry cannot replay the old request.
-     */
-    private fun applyManualLookupIntent(intent: Intent?) {
-        val request = intent ?: return
-        if (request.action != CaptureService.ACTION_MANUAL_LOOKUP) return
-        val prefill = request.getStringExtra(CaptureService.EXTRA_MANUAL_LOOKUP_TEXT).orEmpty()
-        request.removeExtra(CaptureService.EXTRA_MANUAL_LOOKUP_TEXT)
-        request.removeExtra(CaptureService.EXTRA_MANUAL_LOOKUP)
-        request.action = null
-        if (prefill.isNotEmpty()) {
-            lookupQuery = prefill
-            lookupSelectionStart = prefill.length
-            lookupSelectionEnd = prefill.length
-        }
-        if (page == MainPage.LOOKUP) {
-            // The page is already mounted and its watcher only mirrors the draft; update the input
-            // and caret without submitting. An empty prefill keeps the user's existing draft.
-            if (prefill.isNotEmpty()) {
-                lookupInputView?.setText(prefill)
-                lookupInputView?.setSelection(prefill.length)
+        if (usesDraftStore) {
+            val lost = buildList {
+                if (restored?.lookup == null) add("查词草稿")
+                if (restored?.translation == null) add("翻译草稿")
+                if (searchNotRestored) add("生词筛选")
+                if (restored == null || restored.personalHeadword == null ||
+                    (savedInstanceState?.getBoolean("pe_has_draft") == true && restored.personalDraft == null)) add("补词草稿")
+                if (exportScopeNotRestored) add("PDF 范围（未恢复时不导出）")
             }
-        } else {
-            // selectPage performs the original page cleanup and retires old async owners; render
-            // builds LOOKUP from lookupQuery (the prefilled draft when one was supplied).
-            selectPage(MainPage.LOOKUP)
+            if (lost.isNotEmpty()) toast("未能恢复：${lost.joinToString("、")}。请重新输入或选择。")
         }
     }
     override fun onStart() {
         super.onStart()
         foreground = true
+        // Handler delays use uptime; reconcile elapsed deadlines after sleep/backgrounding too.
+        documentOperations.values.toList().forEach { if (!it.isCurrent()) it.timeout.run() }
         refreshGate.start()
         CaptureStatus.observe(statusListener)
         app.repository.changes.observe(dataListener)
@@ -530,6 +585,12 @@ class MainActivity : Activity() {
         if (page == MainPage.GUIDE) guideScreen?.onHostResume()
         refresh()
         loadDictionaryStatus()
+        // Foreground-only, frequency-limited version check on its own thread. It never blocks this
+        // page, never opens a modal and never touches lookup/study/backup state.
+        updateCenter().onForeground()
+        renderUpdateBanner()
+        // Returning from the system "install unknown apps" page may have changed the decision.
+        if (page == MainPage.SETTINGS) renderUpdateSection()
     }
     override fun onStop() {
         // No coach can cover another app or a system permission window.
@@ -560,13 +621,18 @@ class MainActivity : Activity() {
         app.repository.changes.remove(dataListener)
         refreshGate.stop()
         if (exportSession.cancelPreparation()) { exportDialog?.dismiss(); updateExportButton() }
-        // A backup/restore picker (AWAIT_IMPORT/AWAIT_SAFETY) stops this activity itself, so only the
-        // non-picker preparations are cancelled here; a live picker and an in-flight apply are kept.
+        // A live system picker stops this Activity itself. Retire only the pre-picker snapshot
+        // and import/preview preparations here; writes/apply have their own deadline and owner.
+        backupExportSession.preparingRequestCode?.let { documentOperations[it]?.let(::cancelDocument) }
         if (backupExportSession.cancelPreparation()) updateBackupButtons()
+        restoreSession.readingRequestCode?.let { documentOperations[it]?.let(::cancelDocument) }
         if (restoreSession.cancelPreparation()) {
             restorePreviewDialog?.dismiss(); restorePreviewDialog = null; updateBackupButtons()
         }
         CaptureStatus.remove(statusListener)
+        // Leaving the app drops any in-flight check result and cancels a running download; the
+        // partial file is deleted and the release stays offerable after the next check.
+        updateCenter?.onBackground()
         super.onStop()
     }
     override fun onDestroy() {
@@ -579,6 +645,7 @@ class MainActivity : Activity() {
         closeTranslationOwner()
         refreshGate.stop(); exportSession.clear(); manualGate.next()
         backupExportSession.clear(); restoreSession.clear()
+        documentOperations.values.toList().forEach(::cancelDocument)
         personalGate.next(); personalOpenGate.next()
         closeDeleteFlow()
         cancelPendingPersonalHandoff()
@@ -592,9 +659,12 @@ class MainActivity : Activity() {
         guideScreen?.close(); guideScreen = null
         restorePreviewDialog?.dismiss(); restorePreviewDialog = null
         activeDialog?.dismiss(); activeDialog = null
+        // Rotation and a stopped task still own their saved state. A genuine finish retires it.
+        if (isFinishing && draftSnapshotId != null) ActivityDraftState.Store(this, draftOwner).delete()
+        updateCenter?.close(); updateCenter = null
         super.onDestroy()
     }
-    @Deprecated("Legacy Activity back handling is retained; no AndroidX dependency is added")
+    @Deprecated("Legacy Activity back handling is retained")
     override fun onBackPressed() {
         if (practiceStep != null) { endPractice(false); return }
         // Back from any functional page returns home and closes that page's editor generation;
@@ -606,16 +676,32 @@ class MainActivity : Activity() {
         @Suppress("DEPRECATION")
         super.onBackPressed()
     }
-    override fun onSaveInstanceState(outState: Bundle) {        captureLookupDraft()
+    private fun captureDraftState(): ActivityDraftState {
+        captureLookupDraft()
+        captureTranslationDraft()
+        return ActivityDraftState(search, lookupQuery, translationInput, personalHeadword,
+            if (page == MainPage.PERSONAL_ENTRY) personalDraft ?: personalRestoredDraft ?: personalDraftConfirm?.draft else null,
+            exportSelection.toSet(), selectedKey, vocabularyPageAnchor)
+    }
+
+    override fun onRetainNonConfigurationInstance(): Any? = retainedDraft
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        val state = captureDraftState()
+        val id = UUID.randomUUID().toString()
+        draftSnapshotId = id
+        retainedDraft = RetainedDraft(draftOwner, id, state)
+        ActivityDraftState.Store(this, draftOwner).write(id, state)
+        outState.putString("draft_owner", draftOwner)
+        outState.putString("draft_snapshot", id)
+        // These two small facts are exact even if the cache file cannot be read.
+        outState.putBoolean("draft_search_empty", search.isEmpty())
+        outState.putBoolean("draft_selection_empty", exportSelection.isEmpty())
         outState.putString("page", page.name)
         // Historical state writer retained for old readers: only the five original indices exist.
         outState.putInt("tab", page.legacyTab)
-        outState.putString("search", search)
-        outState.putString("lookup_query", lookupQuery)
         outState.putInt("lookup_sel_start", lookupSelectionStart)
         outState.putInt("lookup_sel_end", lookupSelectionEnd)
-        captureTranslationDraft()
-        outState.putString("translation_draft", translationInput)
         outState.putInt("translation_sel_start", translationSelectionStart)
         outState.putInt("translation_sel_end", translationSelectionEnd)
         outState.putBoolean("favorites_only", onlyFavorites)
@@ -623,33 +709,37 @@ class MainActivity : Activity() {
         // Local display state only: whether the export-selection panel is open. The selection and
         // its explicit-zero intent are saved separately and are never derived from this flag.
         outState.putBoolean("vocabulary_managing", vocabularyManaging)
-        outState.putStringArrayList("export_selection", ArrayList(exportSelection))
+        outState.putInt("vocabulary_page", vocabularyPage)
+        (restoredVocabularyScroll ?: vocabularyScroll?.scrollY)?.let { outState.putInt("vocabulary_scroll", it) }
         // The intent is part of the selection identity: an explicit empty selection is 0 words, not
         // the default "all". Old readers without this key keep their historical interpretation.
         outState.putBoolean("export_selection_explicit", exportSelectionExplicit)
-        outState.putString("pe_headword", personalHeadword)
-        val draft = personalDraft ?: personalRestoredDraft ?: personalDraftConfirm?.draft
-        if (page == MainPage.PERSONAL_ENTRY && draft != null) {
-            outState.putBoolean("pe_has_draft", true)
-            outState.putString("pe_draft_headword", draft.headword)
-            outState.putString("pe_draft_pos", draft.pos)
-            outState.putString("pe_draft_meaning", draft.meaning)
-            outState.putLong("pe_draft_base", draft.baseUpdatedAt)
-            outState.putBoolean("pe_draft_new", draft.newHeadword)
-        }
+        outState.putBoolean("export_scope_not_restored", exportScopeNotRestored)
+        outState.putBoolean("pe_has_draft", state.personalDraft != null)
         outState.putLong("consent", consentGeneration)
         outState.putInt("export_request", exportSession.fileRequestCode ?: lostExportRequestCode)
-        val pendingBackupRequests = ArrayList<Int>()
-        backupExportSession.fileRequestCode?.let { pendingBackupRequests += it }
-        restoreSession.importRequestCode?.let { pendingBackupRequests += it }
-        restoreSession.safetyRequestCode?.let { pendingBackupRequests += it }
-        pendingBackupRequests += interruptedDocumentRequests
-        outState.putIntArray("backup_requests", pendingBackupRequests.toIntArray())
+        val pendingBackupRequests = mutableMapOf<Int, BackupPicker>()
+        fun rememberBackupRequest(code: Int, picker: BackupPicker) {
+            if (pendingBackupRequests.size < SAVED_BACKUP_REQUEST_LIMIT) pendingBackupRequests[code] = picker
+            backupRequestHighWatermark = maxOf(backupRequestHighWatermark, code)
+        }
+        restoreSession.importRequestCode?.let { rememberBackupRequest(it, BackupPicker.IMPORT) }
+        backupExportSession.fileRequestCode?.let { rememberBackupRequest(it, BackupPicker.EXPORT) }
+        restoreSession.safetyRequestCode?.let { rememberBackupRequest(it, BackupPicker.SAFETY) }
+        interruptedDocumentRequests.forEach { (code, picker) -> rememberBackupRequest(code, picker) }
+        // Overflowed codes still cannot bind a new picker; the combined arrays are capped at 64.
+        outState.putInt("backup_request_high_watermark", backupRequestHighWatermark)
+        BackupPicker.entries.forEach { picker ->
+            outState.putIntArray(picker.stateKey, pendingBackupRequests.filterValues { it == picker }.keys.toIntArray())
+        }
         super.onSaveInstanceState(outState)
     }
 
     private fun buildShell() {
         root = if (wide) row() else column()
+        // The programmatic view tree is recreated from explicit state; never parcel its text a
+        // second time via automatic EditText/view-hierarchy saving.
+        root.isSaveFromParentEnabled = false
         root.setBackgroundColor(Paper.background)
         root.setOnApplyWindowInsetsListener { view, insets ->
             if (Build.VERSION.SDK_INT >= 30) {
@@ -671,6 +761,13 @@ class MainActivity : Activity() {
             insets
         }
         body = column().apply { setPadding(dp(if (wide) 32 else 20), dp(16), dp(if (wide) 32 else 20), dp(12)) }
+        // The version notice is a plain bar in the layout flow — never an overlay — so it cannot
+        // cover the guide, an editor or a system permission window. It lives in its own wrapper so
+        // the original body keeps its scroll, padding and insets handling unchanged.
+        updateBannerHost = column().apply { visibility = View.GONE }
+        val bodyWrapper = column()
+        bodyWrapper.addView(updateBannerHost, LinearLayout.LayoutParams(-1, -2))
+        bodyWrapper.addView(body, LinearLayout.LayoutParams(-1, 0, 1f))
         // One navigation component owns both layouts. Its ids are the stable MainPage names, so a
         // restored/legacy selection never depends on display order or a child index.
         navigation = MainNavigation(
@@ -683,9 +780,9 @@ class MainActivity : Activity() {
         )
         if (wide) {
             root.addView(navigation.view, LinearLayout.LayoutParams(dp(216), -1))
-            root.addView(body, LinearLayout.LayoutParams(0, -1, 1f))
+            root.addView(bodyWrapper, LinearLayout.LayoutParams(0, -1, 1f))
         } else {
-            root.addView(body, LinearLayout.LayoutParams(-1, 0, 1f))
+            root.addView(bodyWrapper, LinearLayout.LayoutParams(-1, 0, 1f))
             root.addView(navigation.view, LinearLayout.LayoutParams(-1, -2))
             if (Build.VERSION.SDK_INT < 30) installLegacyKeyboardProbe()
         }
@@ -794,6 +891,7 @@ class MainActivity : Activity() {
                     }
                     words = snapshot.words; stats = snapshot.stats
                     wordsCredential = snapshot.deletionCredential; wordsVersion = snapshot.version
+                    hasLearningSnapshot = true
                     dialogDetail?.update(words.firstOrNull { it.entry.key == dialogDetail?.key })
                     when (page) {
                         MainPage.VOCABULARY -> { renderWords(preserveDetail = true); updateExportButton() }
@@ -809,11 +907,18 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun loadDictionaryStatus() {
+    private fun loadDictionaryStatus(retryOf: ShiciApplication.LookupDictionaryAttempt? = null) {
+        if (dictionaryStatusLoading) return
+        dictionaryStatusLoading = true
+        if (retryOf != null) lookupDictionaryRetryShown = true
+        updateDictionaryStatusViews()
         app.worker.execute {
-            val result = app.lookupDictionary
+            val attempt = app.lookupDictionaryAttempt(retryOf)
             main.post {
                 if (isDestroyed) return@post
+                dictionaryAttempt = attempt
+                dictionaryStatusLoading = false
+                val result = attempt.result
                 // The first screen shows one short status; the full counts stay available in the
                 // collapsed "词库校验详情" next to it. A failure stays fully visible, never hidden.
                 dictionarySummary = result.fold(
@@ -822,20 +927,41 @@ class MainActivity : Activity() {
                 dictionaryDetail = result.fold(
                     { "已校验 ${it.entryCount} 个可检索词头 · ${it.aliasCount} 组词形关系（仅格式与完整性校验）" },
                     { "词库不可用：${it.message}；不会生成释义或新增查询记录" })
-                dictionaryStatusView?.text = dictionarySummary
-                dictionaryDetailView?.text = dictionaryDetail
+                updateDictionaryStatusViews()
             }
         }
     }
 
-    private fun dictionaryStatus(): View {
+    private fun updateDictionaryStatusViews() {
+        dictionaryStatusView?.text = dictionarySummary
+        dictionaryDetailView?.text = dictionaryDetail
+        val failed = dictionaryAttempt?.result?.isFailure == true
+        dictionaryRetryButton?.apply {
+            visibility = if (failed) View.VISIBLE else View.GONE
+            isEnabled = failed && !dictionaryStatusLoading
+            text = if (dictionaryStatusLoading) "正在重试词库加载…" else "重试词库加载"
+        }
+        // The lookup card stays unchanged in the ordinary successful state. Settings always
+        // exposes the full verification details, and a retry success remains visible on lookup.
+        lookupDictionaryHost?.visibility = if (failed || lookupDictionaryRetryShown) View.VISIBLE else View.GONE
+    }
+
+    private fun dictionaryStatus(showDetails: Boolean = true): View {
         val container = column()
         dictionaryStatusView = text(dictionarySummary, 16f, Paper.secondary)
         container.addView(dictionaryStatusView)
-        container.addView(helpDisclosure("词库校验详情") {
+        val retry = button("重试词库加载") {
+            if (!foreground || !container.isAttachedToWindow ||
+                (page != MainPage.LOOKUP && page != MainPage.SETTINGS)) return@button
+            dictionaryAttempt?.takeIf { it.result.isFailure }?.let { loadDictionaryStatus(it) }
+        }
+        dictionaryRetryButton = retry
+        container.addView(retry)
+        if (showDetails) container.addView(helpDisclosure("词库校验详情") {
             dictionaryDetailView = text(dictionaryDetail, 15f, Paper.secondary)
             addView(dictionaryDetailView)
         })
+        updateDictionaryStatusViews()
         return container
     }
 
@@ -850,10 +976,12 @@ class MainActivity : Activity() {
         // A rebuild never leaves an old translator alive behind detached views. Except for the
         // translation page itself (rebuilt immediately below), this is the page-leave path.
         if (translationScreen != null) { captureTranslationDraft(); closeTranslationOwner() }
+        if (hasLearningSnapshot && restoredVocabularyScroll == null) restoredVocabularyScroll = vocabularyScroll?.scrollY
         floatingSwitch = null; floatingText = null; stopCaptureButton = null; searchList = null; detailPanel = null
         wordListHeader = null; vocabularyCountView = null
         exportButton = null; inlineDetail = null
         dictionaryStatusView = null; dictionaryDetailView = null
+        dictionaryRetryButton = null; lookupDictionaryHost = null
         backupExportButton = null; restoreButton = null; backupStatusView = null
         settingsScreen = null
         lookupInputView = null; lookupPracticeArea = null; personalStatusView = null
@@ -875,6 +1003,7 @@ class MainActivity : Activity() {
             MainPage.GUIDE -> guidePage()
         }
         updatePracticeCoach()
+        renderUpdateBanner()
     }
     private fun scrolled(): LinearLayout {
         val content = column()
@@ -1052,12 +1181,20 @@ class MainActivity : Activity() {
             onTargetGone = { if (owner == practiceGeneration) endPractice(false) })
     }
 
-    override fun onWindowFocusChanged(hasFocus: Boolean) {
-        super.onWindowFocusChanged(hasFocus)
-        // A cancelled candidate/missing card resumes real input, never fabricates a successful step.
-        if (hasFocus && foreground && practiceStep == PracticeStep.WAIT_RESULT && activeDialog?.isShowing != true) {
-            practiceStep = PracticeStep.INPUT; updatePracticeCoach()
+    private fun isPracticeLookupOwner(owner: PracticeLookupOwner?): Boolean =
+        owner != null && owner.generation == practiceGeneration && foreground && !isFinishing && !isDestroyed &&
+            page == MainPage.LOOKUP && lookupPracticeArea === owner.target && owner.target.isAttachedToWindow
+
+    private fun isWaitingForPracticeLookup(owner: PracticeLookupOwner?, token: Long): Boolean =
+        isPracticeLookupOwner(owner) && practiceStep == PracticeStep.WAIT_RESULT && manualGate.accepts(token)
+
+    private fun resumePracticeInput(owner: PracticeLookupOwner?, token: Long) {
+        if (!isWaitingForPracticeLookup(owner, token) || activeDialog?.isShowing == true) return
+        practiceStep = PracticeStep.INPUT
+        lookupPracticeArea?.let { area ->
+            area.requestRectangleOnScreen(android.graphics.Rect(0, 0, area.width, dp(48)), true)
         }
+        updatePracticeCoach()
     }
 
     private fun vocabulary() {
@@ -1087,6 +1224,7 @@ class MainActivity : Activity() {
         toolbar.setState(onlyFavorites, vocabularySort, vocabularyManaging)
         toolbar.onFilterChanged = { value ->
             onlyFavorites = value
+            resetVocabularyPage()
             renderWords(preserveDetail = true)
             updateExportButton()
         }
@@ -1132,8 +1270,10 @@ class MainActivity : Activity() {
         input.addTextChangedListener(object : TextWatcher {
             override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
             override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
-                search = s.toString(); updateExportButton()
+                search = s.toString()
+                resetVocabularyPage()
                 renderWords(preserveDetail = true)
+                updateExportButton()
             }
             override fun afterTextChanged(s: Editable?) {}
         })
@@ -1208,10 +1348,39 @@ class MainActivity : Activity() {
     private fun vocabularyCountText(): String =
         if (words.isEmpty()) ""
         else "共 ${words.size} 个词 · 待复习 ${words.count { !it.mastered }} 个"
-    private fun filteredWords() = words.filter { word ->
-        (!onlyFavorites || word.favorite) && (search.isBlank() ||
-            listOf(word.entry.headword, word.entry.meaning, word.lastForm, word.note)
-                .any { it.contains(search.trim(), true) })
+    private fun filteredWords(): List<LearnedWord> {
+        val query = search.trim()
+        vocabularyFilter?.let {
+            if (it.source === words && it.search == query && it.favorites == onlyFavorites) return it.matches
+        }
+        val matches = if (query.isEmpty() && !onlyFavorites) words else words.filter { word ->
+            (!onlyFavorites || word.favorite) && (query.isEmpty() ||
+                word.entry.headword.contains(query, true) || word.entry.meaning.contains(query, true) ||
+                word.lastForm.contains(query, true) || word.note.contains(query, true))
+        }
+        vocabularyFilter = VocabularyFilter(words, query, onlyFavorites, matches)
+        vocabularyOrder = null
+        return matches
+    }
+
+    private fun orderedVocabulary(): List<LearnedWord> {
+        val matches = filteredWords()
+        return vocabularyOrder?.takeIf { it.first == vocabularySort }?.second
+            ?: VocabularyOrdering.apply(matches, vocabularySort).also { vocabularyOrder = vocabularySort to it }
+    }
+
+    private fun resetVocabularyPage() {
+        vocabularyPage = 0
+        vocabularyPageAnchor = null
+        restoredVocabularyScroll = null
+        // Leave the search/filter controls reachable, including while editing with the IME.
+        vocabularyScroll?.scrollTo(0, 0)
+    }
+
+    private fun scrollToVocabularyRows() {
+        val scroll = vocabularyScroll ?: return
+        val rows = searchList ?: return
+        scroll.post { if (vocabularyScroll === scroll && searchList === rows) scroll.scrollTo(0, rows.top) }
     }
     /**
      * The frozen scope for one request. `null` is the untouched default ("all rows of the current
@@ -1237,8 +1406,9 @@ class MainActivity : Activity() {
         // currently surviving search + "仅收藏". Hidden words are never added, and a later narrower
         // filter or deletion intersects this list instead of widening it back to everything.
         exportSelection.clear()
-        exportSelection.addAll(filteredWords().map { it.entry.key })
+        filteredWords().forEach { exportSelection += it.entry.key }
         exportSelectionExplicit = true
+        exportScopeNotRestored = false
         renderWords(preserveDetail = true)
         updateExportButton()
     }
@@ -1246,6 +1416,7 @@ class MainActivity : Activity() {
         // Clearing is itself an explicit choice: zero words, never an implicit "all".
         exportSelection.clear()
         exportSelectionExplicit = true
+        exportScopeNotRestored = false
         renderWords(preserveDetail = true)
         updateExportButton()
     }
@@ -1254,8 +1425,30 @@ class MainActivity : Activity() {
         // mistaken for "all". This is a visible user action, not a side effect of clearing.
         exportSelection.clear()
         exportSelectionExplicit = false
+        exportScopeNotRestored = false
         renderWords(preserveDetail = true)
         updateExportButton()
+    }
+
+    private fun addVocabularyPager(index: Int, count: Int, total: Int, start: Int, end: Int) {
+        val owner = searchList ?: return
+        val pager = column()
+        fun move(target: Int) {
+            if (page != MainPage.VOCABULARY || searchList !== owner || !pager.isAttachedToWindow ||
+                index != vocabularyPage) return
+            if (target !in 0 until count) return
+            vocabularyPage = target
+            vocabularyPageAnchor = null
+            renderWords(preserveDetail = true)
+            scrollToVocabularyRows()
+        }
+        pager.addView(text("第 ${index + 1} / $count 页 · 第 ${start + 1}–$end 个，共 $total 个", 13f, Paper.secondary))
+        pager.addView(pair(
+            button("上一页") { move(index - 1) }.apply { isEnabled = index > 0 },
+            button("下一页") { move(index + 1) }.apply { isEnabled = index + 1 < count },
+            horizontal = inlineAt(if (splitContent) (contentWidthDp * 0.44f).toInt() else contentWidthDp), gap = 8
+        ))
+        owner.addView(pager)
     }
     /**
      * Rebuilds rows and (in split layout) the detail. [explicitSelection] is the exact row snapshot
@@ -1266,7 +1459,21 @@ class MainActivity : Activity() {
     private fun renderWords(preserveDetail: Boolean = false, explicitSelection: LearnedWord? = null) {
         // Same filtered membership as the export scope, only the display order changes. Export
         // selection stays keyed by entry.key, so reordering never adds, drops or widens a check.
-        val list = VocabularyOrdering.apply(filteredWords(), vocabularySort)
+        val list = orderedVocabulary()
+        val pageCount = if (list.isEmpty()) 1 else (list.lastIndex / VOCABULARY_PAGE_SIZE) + 1
+        val anchor = explicitSelection?.entry?.key ?: vocabularyPageAnchor
+        val oldPageStart = vocabularyPage.toLong() * VOCABULARY_PAGE_SIZE
+        val anchoredIndex = if (anchor != null && oldPageStart in 0L until list.size.toLong() &&
+            list[oldPageStart.toInt()].entry.key == anchor) oldPageStart.toInt()
+        else anchor?.let { key -> list.indexOfFirst { it.entry.key == key } } ?: -1
+        val pageIndex = if (anchoredIndex >= 0) anchoredIndex / VOCABULARY_PAGE_SIZE
+            else vocabularyPage.coerceIn(0, pageCount - 1)
+        val start = pageIndex * VOCABULARY_PAGE_SIZE
+        val end = start + minOf(VOCABULARY_PAGE_SIZE, list.size - start)
+        if (hasLearningSnapshot) {
+            vocabularyPage = pageIndex
+            vocabularyPageAnchor = if (anchoredIndex >= 0) anchor else list.getOrNull(start)?.entry?.key
+        }
         vocabularyCountView?.text = vocabularyCountText()
         searchList?.removeAllViews()
         val summary = listSummary(list)
@@ -1280,18 +1487,29 @@ class MainActivity : Activity() {
         // of choice, followed by the second dangerous confirmation for the whole-word scope.
         if (list.isEmpty()) searchList?.addView(
             text(
-                if (words.isEmpty()) "还没有生词。成功查询后会自动收录。"
-                else "没有匹配的生词。试试清空搜索或切回「全部」。",
+                when {
+                    !hasLearningSnapshot -> "正在读取生词本…"
+                    words.isEmpty() -> "还没有生词。成功查询后会自动收录。"
+                    else -> "没有匹配的生词。试试清空搜索或切回「全部」。"
+                },
                 18f
             ).apply { setPadding(0, dp(16), 0, dp(8)) }
         )
-        list.forEach { word ->
+        if (pageCount > 1) addVocabularyPager(pageIndex, pageCount, list.size, start, end)
+        for (index in start until end) {
+            val word = list[index]
             searchList?.addView(vocabularyRow(word) {
                 openVocabularySnapshot(word.entry.key)
             }.apply {
                 if (splitContent && selectedKey == word.entry.key) background = shape(Paper.lightGreen, 8)
             })
             searchList?.divider()
+        }
+        if (pageCount > 1) addVocabularyPager(pageIndex, pageCount, list.size, start, end)
+        if (hasLearningSnapshot) restoredVocabularyScroll?.let { position ->
+            restoredVocabularyScroll = null
+            val scroll = vocabularyScroll
+            scroll?.post { if (vocabularyScroll === scroll && vocabularyPage == pageIndex) scroll.scrollTo(0, position) }
         }
         detailPanel?.let { detail ->
             if (preserveDetail && explicitSelection == null && inlineDetail != null) {
@@ -1331,6 +1549,7 @@ class MainActivity : Activity() {
         // it is spelled out so "everything currently shown" is never guessed. Any explicit
         // allow-list — above all an explicit zero — is always spelled out.
         val scope = when {
+            exportScopeNotRestored -> "上次 PDF 范围未恢复：不会导出；请重新勾选或明确选择恢复全部"
             !exportSelectionExplicit ->
                 if (vocabularyManaging && list.isNotEmpty()) "导出当前筛选全部（${list.size} 个）" else ""
             exportSelection.isEmpty() -> "已清空勾选：导出 0 个"
@@ -1378,10 +1597,11 @@ class MainActivity : Activity() {
                 // allow-list: unchecking the last row stays an explicit 0, never "all".
                 if (!exportSelectionExplicit) {
                     exportSelection.clear()
-                    exportSelection.addAll(filteredWords().map { it.entry.key })
+                    filteredWords().forEach { exportSelection += it.entry.key }
                     exportSelectionExplicit = true
                 }
                 if (checked) exportSelection += word.entry.key else exportSelection -= word.entry.key
+                exportScopeNotRestored = false
                 refreshListSummary()
                 updateExportButton()
             }
@@ -1521,27 +1741,34 @@ class MainActivity : Activity() {
     private fun lookupPage() {
         // View-only component. Its callbacks feed the existing fields/pipeline below; it never
         // resolves a word, records an event or opens a second gate.
-        val screen = LookupScreen(
+        lateinit var screen: LookupScreen
+        screen = LookupScreen(
             context = this,
             initialText = lookupQuery,
             selectionStart = lookupSelectionStart,
             selectionEnd = lookupSelectionEnd,
-            onTextChanged = { text -> lookupQuery = text },
-            onQuery = { text ->
+            onTextChanged = { text -> if (lookupInputView === screen.input) lookupQuery = text },
+            onQuery = query@{ text ->
+                if (!foreground || page != MainPage.LOOKUP || lookupInputView !== screen.input ||
+                    !screen.input.isAttachedToWindow) return@query
                 // Keep the original draft/revision/credential chain: capture the caret first, then
                 // run the same manualLookup that button/IME submissions always used.
                 lookupQuery = text
                 captureLookupDraft()
-                if (practiceStep == PracticeStep.INPUT && page == MainPage.LOOKUP) {
+                if (practiceStep == PracticeStep.INPUT) {
                     practiceStep = PracticeStep.WAIT_RESULT; closePracticeCoach()
                 }
-                manualLookup(text)
+                val owner = if (practiceStep == PracticeStep.WAIT_RESULT)
+                    PracticeLookupOwner(practiceGeneration, screen.practiceArea) else null
+                manualLookup(text, practiceOwner = owner)
             },
             onOpenPersonalEntry = { selectPage(MainPage.PERSONAL_ENTRY) }
         )
         // onSaveInstanceState, page switches and rotation capture the draft through this field.
         lookupInputView = screen.input
         lookupPracticeArea = screen.practiceArea
+        lookupDictionaryHost = screen.dictionaryStatusHost
+        screen.dictionaryStatusHost.addView(dictionaryStatus(showDetails = false))
         body.addView(screen.view, LinearLayout.LayoutParams(-1, -1))
     }
 
@@ -2980,7 +3207,206 @@ class MainActivity : Activity() {
         screen.captureActionHost.addView(stopButton, LinearLayout.LayoutParams(-1, -2))
 
         statusListener(CaptureStatus.state)
+
+        // Version update status/actions. The coordinator stays the single owner of network,
+        // download and install state; these views are rebuilt from it on every page build.
+        renderUpdateSection()
+        if (pendingUpdateScroll) {
+            pendingUpdateScroll = false
+            scrollToUpdateSection()
+        }
     }
+
+    // ---- Update check -------------------------------------------------------------------------
+
+    /**
+     * Lazily created foreground-only coordinator. It owns its own thread and all update state and
+     * needs no service, notification permission or background scheduling; the Activity only renders
+     * what it publishes, and only while this Activity is started.
+     */
+    private fun updateCenter(): UpdateCenter = updateCenter ?: UpdateCenter(
+        activity = this,
+        channel = UpdateChannel.fromId(getString(R.string.update_channel)),
+        installedVersionCode = BuildConfig.VERSION_CODE,
+        listener = {
+            if (!isFinishing && !isDestroyed) {
+                renderUpdateBanner()
+                if (page == MainPage.SETTINGS) renderUpdateSection()
+            }
+        }
+    ).also { updateCenter = it }
+
+    /**
+     * Non-blocking notice above the page body. It is part of the layout (not an overlay), so it can
+     * never cover the guide, an editor or a system permission window; "稍后" hides it for this
+     * version only, and 设置 → 关于 keeps the manual entry either way.
+     */
+    private fun renderUpdateBanner() {
+        val host = updateBannerHost
+        val available = updateCenter?.state as? UpdateState.Available
+        if (available == null || page == MainPage.SETTINGS || practiceStep != null ||
+            available.release.versionCode == dismissedUpdateVersion) {
+            host.removeAllViews()
+            host.visibility = View.GONE
+            return
+        }
+        val release = available.release
+        host.removeAllViews()
+        host.visibility = View.VISIBLE
+        host.setBackgroundColor(Paper.lightGreen)
+        host.setPadding(dp(16), dp(6), dp(8), dp(6))
+        val bar = row().apply { gravity = Gravity.CENTER_VERTICAL }
+        bar.addView(
+            text(
+                "新版本 ${release.versionName}（${release.versionCode}）· ${formatBytes(release.sizeBytes)}",
+                15f, Paper.green, true
+            ).apply {
+                maxLines = 3
+                ellipsize = TextUtils.TruncateAt.END
+            },
+            LinearLayout.LayoutParams(0, -2, 1f)
+        )
+        bar.addView(button("稍后") {
+            dismissedUpdateVersion = release.versionCode
+            renderUpdateBanner()
+        }, LinearLayout.LayoutParams(-2, -2))
+        bar.addView(button("查看", true) {
+            dismissedUpdateVersion = release.versionCode
+            pendingUpdateScroll = true
+            selectPage(MainPage.SETTINGS)
+        }, LinearLayout.LayoutParams(-2, -2).apply { marginStart = dp(6) })
+        host.addView(bar, LinearLayout.LayoutParams(-1, -2))
+    }
+
+    /** Rebuilds only the 关于 update block from the coordinator's current state. */
+    private fun renderUpdateSection() {
+        val host = settingsScreen?.updateHost ?: return
+        val state = updateCenter?.state ?: UpdateState.Idle
+        host.removeAllViews()
+        val status = text(updateStatusText(state), 16f, updateStatusColor(state))
+        updateStateView = status
+        host.addView(status)
+        host.addView(
+            text(
+                "当前版本 ${BuildConfig.VERSION_NAME}（${BuildConfig.VERSION_CODE}）。" +
+                    "更新只读取 GitHub 上的公开测试发布列表，不发送设备或使用数据。",
+                15f, Paper.secondary
+            )
+        )
+        when (state) {
+            is UpdateState.Available -> host.addView(
+                text(
+                    "下载并通过校验后，仍需在系统安装器中确认才会安装。",
+                    15f, Paper.secondary
+                )
+            )
+            is UpdateState.Downloading -> host.addView(
+                text(
+                    "离开应用会中止本次下载并删除未完成的文件，回来后可在本页重新下载。",
+                    15f, Paper.secondary
+                )
+            )
+            is UpdateState.Ready -> host.addView(
+                text(
+                    "已校验的文件只保存在本应用私有缓存，并通过只读内容 URI 交给系统安装器。",
+                    15f, Paper.secondary
+                )
+            )
+            is UpdateState.InstallBlocked -> host.addView(
+                text(
+                    "系统不会自动放开安装权限：请点“打开未知来源设置”，允许后返回本页再点安装。",
+                    15f, Paper.warning
+                )
+            )
+            else -> Unit
+        }
+        val actions = column()
+        fun action(label: String, primary: Boolean = false, enabled: Boolean = true, tap: () -> Unit) {
+            actions.addView(
+                button(label, primary, tap).apply { isEnabled = enabled },
+                LinearLayout.LayoutParams(-1, -2)
+            )
+            actions.space(8)
+        }
+        when (state) {
+            UpdateState.Idle -> action("检查更新", true) { updateCenter().checkNow() }
+            UpdateState.Checking -> action("正在检查…", enabled = false) {}
+            UpdateState.UpToDate, UpdateState.NoRelease ->
+                action("再次检查更新") { updateCenter().checkNow() }
+            is UpdateState.Available -> {
+                action("下载更新（${formatBytes(state.release.sizeBytes)}）", true) {
+                    updateCenter().download()
+                }
+                action("再次检查更新") { updateCenter().checkNow() }
+            }
+            is UpdateState.Downloading ->
+                action("取消下载") { updateCenter().cancelDownload() }
+            is UpdateState.Ready -> action("安装", true) { updateCenter().install() }
+            is UpdateState.InstallBlocked -> {
+                action("打开未知来源设置", true) { updateCenter().openUnknownSourcesSettings() }
+                action("我已允许，重试安装") { updateCenter().install() }
+            }
+            is UpdateState.InstallerOpened -> action("再次打开安装器") { updateCenter().install() }
+            is UpdateState.InstallFailed -> {
+                if (state.file.isFile) {
+                    action("重试安装", true) { updateCenter().install() }
+                } else {
+                    action("重新检查更新", true) { updateCenter().checkNow() }
+                }
+            }
+            is UpdateState.Failure -> action("重试检查", true) { updateCenter().checkNow() }
+            UpdateState.Disabled -> Unit
+        }
+        host.addView(actions)
+    }
+
+    private fun updateStatusText(state: UpdateState): String = when (state) {
+        UpdateState.Idle -> "尚未检查更新。启动时会限频检查（约每 24 小时一次），也可现在手动检查。"
+        UpdateState.Checking -> "正在检查新版本…"
+        UpdateState.UpToDate -> "已是最新版本。"
+        UpdateState.NoRelease -> "发布页目前还没有本渠道的测试版。"
+        is UpdateState.Available ->
+            "发现新版本 ${state.release.versionName}（${state.release.versionCode}）·" +
+                " 安装包 ${formatBytes(state.release.sizeBytes)}。"
+        is UpdateState.Failure -> state.message
+        is UpdateState.Downloading ->
+            "正在下载 ${formatBytes(state.bytes)} / ${formatBytes(state.total)}…"
+        is UpdateState.Ready -> "已下载，并通过大小、SHA-256 与签名校验。"
+        is UpdateState.InstallBlocked ->
+            "系统当前未允许本应用安装应用。" + (state.notice?.let { " $it" } ?: "")
+        is UpdateState.InstallerOpened -> "已打开系统安装器：在系统里确认后才算安装；未确认前不算已安装。"
+        is UpdateState.InstallFailed -> state.message
+        UpdateState.Disabled -> "本构建未配置更新渠道，更新检查已停用。"
+    }
+
+    private fun updateStatusColor(state: UpdateState): Int = when (state) {
+        is UpdateState.Failure -> Paper.error
+        is UpdateState.Available, is UpdateState.Ready, is UpdateState.UpToDate -> Paper.green
+        is UpdateState.InstallBlocked, is UpdateState.InstallFailed -> Paper.warning
+        else -> Paper.secondary
+    }
+
+    /** Scrolls the settings page to the update block after the banner's "查看" tap. */
+    private fun scrollToUpdateSection() {
+        val screen = settingsScreen ?: return
+        val target = updateStateView ?: return
+        val scroll = screen.view as? ScrollView ?: return
+        val content = scroll.getChildAt(0) ?: return
+        // Offsets are only meaningful after layout, so the walk happens inside the posted runnable.
+        scroll.post {
+            if (settingsScreen !== screen || !target.isAttachedToWindow) return@post
+            var offset = 0
+            var node: View? = target
+            while (node != null && node !== content) {
+                offset += node.top
+                node = node.parent as? View
+            }
+            scroll.smoothScrollTo(0, (offset - dp(16)).coerceAtLeast(0))
+        }
+    }
+
+    private fun formatBytes(bytes: Long): String =
+        "%.1f MiB".format(java.util.Locale.US, bytes / (1024.0 * 1024.0))
 
     /** Build-time badge snapshot; onStart refreshes it after a system settings round-trip. */
     private fun overlayPermissionStatus(): SettingsScreen.PermissionStatus {
@@ -3146,36 +3572,41 @@ class MainActivity : Activity() {
                         .onFailure { permissionError("无法启动捕获服务：${it.message}") }
                 } else permissionError("已取消屏幕捕获，查词未开启")
             }
-            else -> if (interruptedDocumentRequests.remove(requestCode)) {
-                // Frozen backup/restore state does not survive recreation: never auto-apply from the
-                // URI or touch any file; the reserved request code is now consumed for good.
-                toast("上次的备份或恢复操作已中断，请重新开始；未改动任何文件")
-                updateBackupButtons()
-            } else if (lostExportRequestCode >= 0 && requestCode == lostExportRequestCode) {
-                // Consume before IO: another recreation must not wait for this result again.
-                lostExportRequestCode = -1
-                if (resultCode != RESULT_OK) { toast("已取消导出"); updateExportButton() }
-                else if (data?.data == null) { toast(PdfPlaceholderCleanup.Result.NO_URI.message); updateExportButton() }
-                else cleanLostPdf(data.data!!)
-            } else if (requestCode == exportSession.fileRequestCode) {
-                val snapshot = exportSession.takeResult(requestCode) ?: return
-                if (resultCode == RESULT_OK && data?.data != null) savePdf(data.data!!, snapshot, requestCode)
-                else {
-                    exportSession.cancel(requestCode); toast("已取消导出"); updateExportButton()
+            else -> {
+                if (isFinishing || isDestroyed) return
+                if (requestCode == backupExportSession.fileRequestCode || requestCode == restoreSession.importRequestCode ||
+                    requestCode == restoreSession.safetyRequestCode) {
+                    documentOperations[requestCode]?.let { picker ->
+                        if (picker.isCurrent()) cancelDocument(picker) else picker.timeout.run()
+                    }
                 }
-            } else if (requestCode == backupExportSession.fileRequestCode) {
-                handleBackupExportResult(requestCode, resultCode, data)
-            } else if (requestCode == restoreSession.importRequestCode) {
-                handleRestoreImportResult(requestCode, resultCode, data)
-            } else if (requestCode == restoreSession.safetyRequestCode) {
-                handleRestoreSafetyResult(requestCode, resultCode, data)
+                if (consumeInterruptedBackup(requestCode, resultCode)) return
+                if (lostExportRequestCode >= 0 && requestCode == lostExportRequestCode) {
+                    // Consume before IO: another recreation must not wait for this result again.
+                    lostExportRequestCode = -1
+                    if (resultCode != RESULT_OK) { toast("已取消导出"); updateExportButton() }
+                    else if (data?.data == null) { toast(PdfPlaceholderCleanup.Result.NO_URI.message); updateExportButton() }
+                    else cleanLostPdf(data.data!!, requestCode)
+                } else if (requestCode == exportSession.fileRequestCode) {
+                    val snapshot = exportSession.takeResult(requestCode) ?: return
+                    if (resultCode == RESULT_OK && data?.data != null) savePdf(data.data!!, snapshot, requestCode)
+                    else {
+                        exportSession.cancel(requestCode); toast("已取消导出"); updateExportButton()
+                    }
+                } else if (requestCode == backupExportSession.fileRequestCode) {
+                    handleBackupExportResult(requestCode, resultCode, data)
+                } else if (requestCode == restoreSession.importRequestCode) {
+                    handleRestoreImportResult(requestCode, resultCode, data)
+                } else if (requestCode == restoreSession.safetyRequestCode) {
+                    handleRestoreSafetyResult(requestCode, resultCode, data)
+                }
             }
         }
     }
     private fun permissionError(message: String) { endPractice(false); stopCapture(); CaptureStatus.update(CapturePhase.ERROR, message); toast(message) }
 
     private fun manualLookup(raw: String, replaces: String? = null, originalRaw: String = raw,
-                             credentialOverride: Long? = null) {
+                             credentialOverride: Long? = null, practiceOwner: PracticeLookupOwner? = null) {
         val token = manualGate.next()
         // Captured at query start and carried through display, save and retry; never refreshed later.
         // An explicit retry/collect from a still-current card may pass its own query credential.
@@ -3198,34 +3629,41 @@ class MainActivity : Activity() {
             }
             main.post {
                 if (isDestroyed || page != MainPage.LOOKUP || !manualGate.accepts(token)) return@post
+                fun noCard(message: String) {
+                    toast(message)
+                    resumePracticeInput(practiceOwner, token)
+                }
                 lookup.onSuccess { read ->
                     val result = read.result
                     when (result) {
-                        LookupResult.Invalid -> toast("请输入一个有效英文词头")
+                        LookupResult.Invalid -> noCard("请输入一个有效英文词头")
                         is LookupResult.Missing -> {
                             // The result belongs to the world the query started in. A restore/delete
                             // that committed while the worker ran must reject it explicitly instead of
                             // displaying a card whose save would bind to the new world.
                             if (app.repository.deletions.isStale(result.form, deletionCredential)) {
-                                toast("查询已失效（词条已删除或数据已恢复），请重新查询")
+                                noCard("查询已失效（词条已删除或数据已恢复），请重新查询")
                             } else if (!read.isCurrent(app.repository.changes.version)) {
                                 // A supplement (or any committed data) changed after this read: drawing
                                 // the old result would hide the current user meaning, so no card is made.
-                                showManualLookupExpired()
-                            } else showManualMissing(result.form, raw, replaces, deletionCredential, read.revision)
+                                showManualLookupExpired { resumePracticeInput(practiceOwner, token) }
+                            } else showManualMissing(result.form, raw, replaces, deletionCredential, read.revision,
+                                practiceOwner, token)
                         }
                         is LookupResult.Match -> {
                             fun deliver(entry: DictionaryEntry) {
                                 if (isDestroyed || page != MainPage.LOOKUP || !manualGate.accepts(token)) return
                                 if (app.repository.deletions.isStale(entry.key, deletionCredential)) {
-                                    toast("查询已失效（词条已删除或数据已恢复），请重新查询")
+                                    noCard("查询已失效（词条已删除或数据已恢复），请重新查询")
                                 } else if (!read.isCurrent(app.repository.changes.version)) {
-                                    showManualLookupExpired()
+                                    showManualLookupExpired { resumePracticeInput(practiceOwner, token) }
                                 } else showManualDefinition(originalRaw, result.form, entry, read.users[entry.key],
-                                    replaces, deletionCredential, read.revision)
+                                    replaces, deletionCredential, read.revision,
+                                    practiceOwner.takeIf { isWaitingForPracticeLookup(it, token) })
                             }
-                            if (!read.isCurrent(app.repository.changes.version)) showManualLookupExpired()
-                            else if (result.entries.size == 1) deliver(result.entries.first())
+                            if (!read.isCurrent(app.repository.changes.version)) {
+                                showManualLookupExpired { resumePracticeInput(practiceOwner, token) }
+                            } else if (result.entries.size == 1) deliver(result.entries.first())
                             else {
                                 val content = panel()
                                 content.addView(text("「${result.form}」请选择词义", 22f, bold = true))
@@ -3243,11 +3681,13 @@ class MainActivity : Activity() {
                                 })
                                 content.addView(button("取消") { choices.dismiss() })
                                 choices = paperDialog(content)
-                                showPaperDialog(choices, 640)
+                                showPaperDialog(choices, 640) {
+                                    if (!selected) resumePracticeInput(practiceOwner, token)
+                                }
                             }
                         }
                     }
-                }.onFailure { toast("词库不可用：${it.message}；未生成释义或新增记录") }
+                }.onFailure { noCard("词库不可用：${it.message}；未生成释义或新增记录") }
             }
         }
     }
@@ -3257,7 +3697,7 @@ class MainActivity : Activity() {
      * the separately captured user row) could hide a current supplement. This window is read-only and
      * requires a fresh explicit query.
      */
-    private fun showManualLookupExpired() {
+    private fun showManualLookupExpired(onDismiss: () -> Unit) {
         val content = panel()
         content.addView(text("查询已失效", 20f, bold = true))
         content.addView(text("查询期间词条或本机补充已更新。为避免显示或保存过期释义，本次旧结果已丢弃；请重新查询。", 16f, Paper.warning))
@@ -3265,7 +3705,7 @@ class MainActivity : Activity() {
         lateinit var dialog: AlertDialog
         content.addView(button("关闭") { dialog.dismiss() })
         dialog = paperDialog(content)
-        showPaperDialog(dialog, 640)
+        showPaperDialog(dialog, 640, onDismiss)
     }
 
     /**
@@ -3274,10 +3714,11 @@ class MainActivity : Activity() {
      * action after a successful save enters the normal matched-card flow.
      */
     private fun showManualMissing(form: String, raw: String, replaces: String?, deletionCredential: Long,
-                                  readRevision: Long) {
+                                  readRevision: Long, practiceOwner: PracticeLookupOwner?, token: Long) {
         // Display-entry check: a stale query must not create any writable card at all.
         if (app.repository.deletions.isStale(form, deletionCredential)) {
             toast("查询已失效（词条已删除或数据已恢复），请重新查询")
+            resumePracticeInput(practiceOwner, token)
             return
         }
         var sourceRevision = readRevision
@@ -3307,11 +3748,12 @@ class MainActivity : Activity() {
             if (app.repository.deletions.isStale(form, deletionCredential)) {
                 invalidateManualMissing(guard); return@button
             }
-            dialog.dismiss()
             // This is an explicit, user-initiated active query in the card's still-current world and
             // may enter personal vocabulary. It keeps the original query credential instead of
             // recapturing, so a later restore cannot be laundered into a fresh write identity.
-            manualLookup(form, replaces, raw, deletionCredential)
+            manualLookup(form, replaces, raw, deletionCredential,
+                practiceOwner.takeIf { isWaitingForPracticeLookup(it, token) })
+            dialog.dismiss()
         }.apply { visibility = View.GONE }
         lateinit var add: Button
         if (canAdd) {
@@ -3366,6 +3808,8 @@ class MainActivity : Activity() {
             cancelPendingPersonalHandoff(handoffToken)
             closeSupplementEditorOwner(editorOwner)
             if (manualMissingGuard === guard) manualMissingGuard = null
+            if (activeDialog === dialog) activeDialog = null
+            resumePracticeInput(practiceOwner, token)
         }
         activeDialog?.dismiss(); activeDialog = dialog
         dialog.show()
@@ -3374,8 +3818,7 @@ class MainActivity : Activity() {
 
     private fun showManualDefinition(raw: String, form: String, entry: DictionaryEntry,
                                       initialUser: UserDictionaryEntry?, replaces: String?,
-                                      deletionCredential: Long, readRevision: Long) {
-        val practiceOwner = practiceGeneration
+                                      deletionCredential: Long, readRevision: Long, practiceOwner: PracticeLookupOwner?) {
         var sourceRevision = readRevision
         val content = panel()
         content.addView(text(entry.headword, 28f, bold = true).apply { typeface = Typeface.create("serif", Typeface.BOLD) })
@@ -3437,10 +3880,15 @@ class MainActivity : Activity() {
         activeDialog?.dismiss(); activeDialog = dialog
         val token = manualGate.next()
         guard = ManualGuard(entry.key, deletionCredential, status, undo, correct, retry, supplement)
+        fun ownsPracticeCard(): Boolean = isPracticeLookupOwner(practiceOwner) && practiceStep == PracticeStep.CLOSE_RESULT &&
+            activeDialog === dialog && manualGate.accepts(token)
         dialog.setOnDismissListener {
-            if (practiceOwner == practiceGeneration && practiceStep == PracticeStep.CLOSE_RESULT && activeDialog === dialog) {
+            if (ownsPracticeCard()) {
                 closePracticeCoach(); practiceStep = PracticeStep.VOCABULARY
-                main.post { if (practiceOwner == practiceGeneration && page == MainPage.LOOKUP) updatePracticeCoach() }
+                main.post {
+                    if (isPracticeLookupOwner(practiceOwner) &&
+                        practiceStep == PracticeStep.VOCABULARY && activeDialog?.isShowing != true) updatePracticeCoach()
+                }
             }
             // Closing this card window closes only the editors it opened; a newer card's editor lease
             // stays live, so its own save is still admitted on its owner.
@@ -3450,16 +3898,13 @@ class MainActivity : Activity() {
             if (manualGate.accepts(token)) manualGate.next()
         }
         dialog.show()
-        if (practiceOwner == practiceGeneration && practiceStep == PracticeStep.WAIT_RESULT) {
+        if (isWaitingForPracticeLookup(practiceOwner, token)) {
             practiceStep = PracticeStep.CLOSE_RESULT
             practiceCoach = PracticeCoach(dialog.window!!.decorView as ViewGroup,
                 dialog.getButton(AlertDialog.BUTTON_NEGATIVE), "这是真实词义与收录状态。看完点「关闭」，继续查看生词本。",
-                onSkip = { if (practiceOwner == practiceGeneration) endPractice(true) },
-                onNext = {
-                    if (practiceOwner == practiceGeneration && practiceStep == PracticeStep.CLOSE_RESULT &&
-                        activeDialog === dialog && dialog.isShowing) dialog.dismiss()
-                },
-                onTargetGone = { if (practiceOwner == practiceGeneration) endPractice(false) })
+                onSkip = { if (ownsPracticeCard()) endPractice(true) },
+                onNext = { if (ownsPracticeCard() && dialog.isShowing) dialog.dismiss() },
+                onTargetGone = { if (ownsPracticeCard() && dialog.isShowing) endPractice(false) })
         }
         manualGuard = guard
         val event = QueryEvent(UUID.randomUUID().toString(), entry.key, raw, entry.key, System.currentTimeMillis())
@@ -3873,127 +4318,371 @@ class MainActivity : Activity() {
         exportDialog = dialog
         updateSummary(optionsView.readOptions())
     }
-    private fun cleanLostPdf(uri: Uri) {
-        cleaningLostExport = true
-        updateExportButton()
-        val resolver = applicationContext.contentResolver
-        app.worker.execute {
-            val result = LostPdfFileCleanup.clean(resolver, uri)
-            main.post {
-                if (isDestroyed || isFinishing) return@post
-                cleaningLostExport = false
-                toast(result.message)
-                updateExportButton()
+    private fun consumeInterruptedBackup(code: Int, resultCode: Int): Boolean {
+        val picker = interruptedDocumentRequests.remove(code) ?: return false
+        toast(when {
+            resultCode != RESULT_OK -> "已取消文件选择"
+            picker == BackupPicker.IMPORT -> "恢复请求已失效，本次未读取备份、未恢复学习数据；请重新开始"
+            picker == BackupPicker.LEGACY -> "文件请求已失效，本次未读取或写入备份，也未恢复学习数据；若选择了创建文件，目标位置可能留下空文件"
+            else -> "保存请求已失效，本次未写入备份内容，也未恢复学习数据；目标位置可能留下空文件，请检查后重新开始"
+        })
+        return true
+    }
+
+    // Main owns the operation table and Task handle; workers only read the cancellation/deadline.
+    private class DocumentOperation(val code: Int, timeoutMs: Long) {
+        val deadline = SystemClock.elapsedRealtime() + timeoutMs
+        @Volatile var cancelled = false
+        var task: DocumentIo.Task? = null
+        lateinit var timeout: Runnable
+        fun isCurrent() = !cancelled && SystemClock.elapsedRealtime() < deadline
+        fun checkCurrent() { if (!isCurrent()) throw IOException("文档操作已结束") }
+    }
+
+    private fun beginDocument(code: Int, apply: LearningRestoreSession.ApplyHandle? = null,
+                              timeoutMs: Long = DOCUMENT_TIMEOUT_MS, onTimeout: () -> Unit): DocumentOperation {
+        val operation = DocumentOperation(code, timeoutMs)
+        operation.timeout = Runnable {
+            if (documentOperations[code] !== operation) return@Runnable
+            // The final DB transaction may finish after the deadline once admitted.
+            if (apply != null && !apply.cancelBeforeAdmission()) return@Runnable
+            cancelDocument(operation)
+            if (!isDestroyed && !isFinishing) onTimeout()
+        }
+        documentOperations[code] = operation
+        main.postDelayed(operation.timeout, timeoutMs)
+        return operation
+    }
+
+    private fun cancelDocument(operation: DocumentOperation) {
+        if (documentOperations[operation.code] !== operation) return
+        documentOperations.remove(operation.code)
+        operation.cancelled = true
+        main.removeCallbacks(operation.timeout)
+        operation.task?.cancel()
+        operation.task = null
+    }
+
+    private fun launchBackupPicker(code: Int, kind: BackupPicker, intent: Intent,
+                                   cancel: () -> Boolean, errorPrefix: String) {
+        val operation = beginDocument(code, timeoutMs = BACKUP_PICKER_TIMEOUT_MS) {
+            if (cancel()) {
+                // No URI yet. Remember just the retired kind if the still-open picker returns.
+                if (interruptedDocumentRequests.size == SAVED_BACKUP_REQUEST_LIMIT) {
+                    interruptedDocumentRequests.remove(interruptedDocumentRequests.keys.first())
+                }
+                interruptedDocumentRequests[code] = kind
+                backupRequestHighWatermark = maxOf(backupRequestHighWatermark, code)
+                updateBackupButtons()
+            }
+        }
+        runCatching { startActivityForResult(intent, code) }.onFailure {
+            cancelDocument(operation)
+            if (cancel()) {
+                updateBackupButtons(); toast("$errorPrefix：${it.message}")
             }
         }
     }
-    private fun savePdf(uri: Uri, snapshot: LearningExportSnapshot, requestCode: Int) {
-        app.worker.execute {
-            val error = runCatching {
-                val output = contentResolver.openOutputStream(uri, "wt") ?: error("无法写入所选位置")
-                output.use { PdfExporter.write(snapshot, it) }
-            }.exceptionOrNull()
-            main.post { if (!isDestroyed && exportSession.cancel(requestCode)) {
-                toast(if (error == null) "PDF 已写入所选位置" else "导出失败：${error.message}；目标文件可能不完整，请删除后重试")
-                updateExportButton()
-            } }
+
+    private fun <T> runDocument(operation: DocumentOperation, uri: Uri, discard: () -> Unit = {},
+                                discardResult: (T) -> Unit = {}, work: (() -> Unit) -> T,
+                                complete: (Result<T>) -> Unit) {
+        if (!operation.isCurrent()) {
+            discard()
+            operation.timeout.run()
+            return
+        }
+        val task = DocumentIo.submit(onSkipped = discard, target = uri.toString()) { task ->
+            val checkCurrent = {
+                if (task.isCancelled) throw IOException("文档操作已结束")
+                operation.checkCurrent()
+            }
+            val result = try {
+                runCatching { checkCurrent(); work(checkCurrent) }
+            } finally {
+                discard()
+            }
+            // Until delivery, this callback owns any result resource, even if post loses a race
+            // with cancellation or the Activity is destroyed before the callback can consume it.
+            if (task.isCancelled || !operation.isCurrent() || !main.post {
+                    if (documentOperations[operation.code] === operation && operation.isCurrent() && !isDestroyed && !isFinishing) {
+                        operation.task = null
+                        complete(result)
+                    } else result.onSuccess(discardResult)
+                }) result.onSuccess(discardResult)
+        }
+        if (task == null) {
+            discard() // Rejection did not take ownership.
+            complete(Result.failure(IOException(DOCUMENT_REJECTED)))
+        } else operation.task = task
+    }
+
+    private fun guardedInput(input: InputStream, checkpoint: () -> Unit) = object : InputStream() {
+        override fun read(): Int {
+            checkpoint(); return input.read().also { checkpoint() }
+        }
+        override fun read(bytes: ByteArray, offset: Int, count: Int): Int {
+            checkpoint(); return input.read(bytes, offset, count).also { checkpoint() }
         }
     }
+
+    private fun guardedOutput(output: OutputStream, checkpoint: () -> Unit) = object : OutputStream() {
+        override fun write(value: Int) { checkpoint(); output.write(value); checkpoint() }
+        override fun write(bytes: ByteArray, offset: Int, count: Int) {
+            checkpoint(); output.write(bytes, offset, count); checkpoint()
+        }
+        override fun flush() { checkpoint(); output.flush(); checkpoint() }
+    }
+
+    private fun cleanLostPdf(uri: Uri, requestCode: Int) {
+        cleaningLostExport = true
+        updateExportButton()
+        fun finish(message: String) {
+            cleaningLostExport = false
+            toast(message)
+            updateExportButton()
+        }
+        val operation = beginDocument(requestCode) {
+            finish("PDF 占位文件检查超时，未确认清理结果，请检查所选位置；提供方可能仍在处理")
+        }
+        val resolver = applicationContext.contentResolver
+        runDocument(operation, uri, work = { checkpoint ->
+            // Keep the existing PDF-only URI/metadata guards. Check cancellation again before
+            // delete: metadata query or cursor close itself may have outlived the operation.
+            PdfPlaceholderCleanup.clean(uri, { target ->
+                require(target.scheme == ContentResolver.SCHEME_CONTENT && !target.authority.isNullOrEmpty())
+                val path = target.pathSegments
+                require((path.size == 2 && path[0] == "document") ||
+                    (path.size == 4 && path[0] == "tree" && path[2] == "document"))
+                require(DocumentsContract.getDocumentId(target).isNotEmpty())
+                checkpoint()
+                resolver.query(target, arrayOf(Document.COLUMN_SIZE, Document.COLUMN_FLAGS,
+                    Document.COLUMN_MIME_TYPE), null, null, null)?.use { cursor ->
+                    checkpoint()
+                    val single = cursor.count == 1
+                    checkpoint()
+                    if (!single || !cursor.moveToFirst()) PdfPlaceholderCleanup.Metadata(null, false)
+                    else {
+                        checkpoint()
+                        val sizeIndex = cursor.getColumnIndex(Document.COLUMN_SIZE)
+                        val size = if (sizeIndex >= 0 && cursor.getType(sizeIndex) == Cursor.FIELD_TYPE_INTEGER) cursor.getLong(sizeIndex) else null
+                        val flagsIndex = cursor.getColumnIndex(Document.COLUMN_FLAGS)
+                        val flags = if (flagsIndex >= 0 && cursor.getType(flagsIndex) == Cursor.FIELD_TYPE_INTEGER) cursor.getInt(flagsIndex) else 0
+                        val mimeIndex = cursor.getColumnIndex(Document.COLUMN_MIME_TYPE)
+                        val isFile = mimeIndex >= 0 && !cursor.isNull(mimeIndex) && cursor.getString(mimeIndex) != Document.MIME_TYPE_DIR
+                        PdfPlaceholderCleanup.Metadata(size, isFile && (flags and Document.FLAG_SUPPORTS_DELETE) != 0)
+                    }
+                } ?: PdfPlaceholderCleanup.Metadata(null, false)
+            }, { target ->
+                checkpoint()
+                DocumentsContract.deleteDocument(resolver, target)
+            })
+        }) { result ->
+            cancelDocument(operation)
+            finish(result.fold({ it.message }, { "未清理 PDF 占位文件：${it.message}" }))
+        }
+    }
+
+    private fun savePdf(uri: Uri, snapshot: LearningExportSnapshot, requestCode: Int) {
+        val operation = beginDocument(requestCode) {
+            if (exportSession.cancel(requestCode)) {
+                updateExportButton()
+                toast("PDF 导出超时，未确认保存成功；提供方可能仍在处理，请检查目标文件")
+            }
+        }
+        val resolver = applicationContext.contentResolver
+        runDocument(operation, uri, work = { checkpoint ->
+            checkpoint()
+            val output = resolver.openOutputStream(uri, "wt") ?: error("无法写入所选位置")
+            output.use {
+                checkpoint()
+                val guarded = guardedOutput(it, checkpoint)
+                PdfExporter.write(snapshot, guarded)
+                guarded.flush()
+            }
+        }) { result ->
+            cancelDocument(operation)
+            if (exportSession.cancel(requestCode)) {
+                updateExportButton()
+                toast(result.fold({ "PDF 已写入所选位置" }, { "导出失败：${it.message}；请检查目标文件" }))
+            }
+        }
+    }
+
     private fun updateBackupButtons() {
         val busy = backupExportSession.busy || restoreSession.busy
         backupExportButton?.isEnabled = !busy
         restoreButton?.isEnabled = !busy
         backupStatusView?.text = when {
-            restoreSession.busy -> "正在处理恢复：读取并校验备份、准备安全备份和原子覆盖，请勿离开本页"
-            backupExportSession.busy -> "正在准备备份文件，请稍候"
-            else -> "仅本地备份，不联网、不上传。"
+            restoreSession.busy -> "正在恢复：准备并读回校验安全副本后才会覆盖；已开始的数据库覆盖将原子完成"
+            backupExportSession.busy -> "正在准备或校验备份；文件读写最多等待 2 分钟"
+            else -> BACKUP_PRIVACY
         }
     }
+
     private fun exportLearningBackup() {
         if (backupExportSession.busy || restoreSession.busy) return
         if (lostExportRequestCode >= 0 || cleaningLostExport) { toast("请先完成或取消当前 PDF 导出"); return }
+        val content = panel()
+        val dialog = paperDialog(content)
+        content.addView(text("导出学习数据备份", 22f, bold = true))
+        content.space(12)
+        content.addView(text(BACKUP_PRIVACY, 16f, Paper.warning))
+        content.space(12)
+        content.addView(button("继续并选择备份位置", true) {
+            if (activeDialog !== dialog || !dialog.isShowing || isFinishing || isDestroyed) return@button
+            dialog.dismiss()
+            prepareBackupExport()
+        })
+        content.addView(button("取消") { dialog.dismiss() })
+        showPaperDialog(dialog, 520)
+    }
+
+    private fun prepareBackupExport() {
+        if (restoreSession.busy) return
         val id = backupExportSession.begin() ?: return
         updateBackupButtons()
-        app.worker.execute {
-            val result = runCatching {
-                val snapshot = app.repository.backupSnapshot()
-                LearningBackupCodec.encode(snapshot.data, BuildConfig.VERSION_NAME, BuildConfig.VERSION_CODE, System.currentTimeMillis())
+        val operation = beginDocument(id) {
+            if (backupExportSession.cancelPreparation(id)) {
+                updateBackupButtons(); toast("准备备份超时，未创建备份文件")
             }
-            main.post {
-                if (isDestroyed) return@post
-                result.onSuccess { bytes ->
-                    if (!backupExportSession.freeze(id, bytes)) return@onSuccess
-                    updateBackupButtons()
-                    val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE)
-                        .setType(LearningBackupCodec.MIME_TYPE)
-                        .putExtra(Intent.EXTRA_TITLE, "拾词-学习数据备份-${LocalDate.now()}${LearningBackupCodec.FILE_SUFFIX}")
-                    runCatching { startActivityForResult(intent, id) }.onFailure {
-                        backupExportSession.cancel(id); updateBackupButtons()
-                        toast("无法打开文件保存：${it.message}")
-                    }
-                }.onFailure {
-                    backupExportSession.cancel(id); updateBackupButtons()
-                    toast("准备备份失败：${it.message}")
+        }
+        freezeBackup(operation) { result ->
+            cancelDocument(operation)
+            result.onSuccess { snapshot ->
+                if (!backupExportSession.freezeFile(id, snapshot)) {
+                    snapshot.discard()
+                    return@onSuccess
+                }
+                updateBackupButtons()
+                val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE)
+                    .setType(LearningBackupCodec.MIME_TYPE)
+                    .putExtra(Intent.EXTRA_TITLE, "拾词-学习数据备份-${LocalDate.now()}${LearningBackupCodec.FILE_SUFFIX}")
+                launchBackupPicker(id, BackupPicker.EXPORT, intent, { backupExportSession.cancel(id) }, "无法打开文件保存")
+            }.onFailure {
+                if (backupExportSession.cancelPreparation(id)) {
+                    updateBackupButtons(); toast("准备备份失败：${it.message}")
                 }
             }
         }
     }
+
+    private fun freezeBackup(operation: DocumentOperation, complete: (Result<FrozenLearningBackupFile>) -> Unit) {
+        val application = app
+        application.worker.execute {
+            if (!operation.isCurrent()) return@execute
+            val result = runCatching {
+                val file = File.createTempFile("shici-backup-write-", ".tmp", application.cacheDir)
+                var transferred = false
+                try {
+                    operation.checkCurrent()
+                    val frozen = application.repository.writeBackupSnapshot(file, BuildConfig.VERSION_NAME,
+                        BuildConfig.VERSION_CODE, System.currentTimeMillis())
+                    FrozenLearningBackupFile(file, frozen.fingerprint, frozen.revision).also { transferred = true }
+                } finally {
+                    if (!transferred) file.delete()
+                }
+            }
+            // Until the main callback takes ownership, only this handoff may delete the file.
+            if (!operation.isCurrent() || !main.post {
+                    if (documentOperations[operation.code] === operation && operation.isCurrent() && !isDestroyed && !isFinishing) {
+                        complete(result)
+                    } else result.getOrNull()?.discard()
+                }) result.getOrNull()?.discard()
+        }
+    }
+
+    private fun writeVerifiedBackup(uri: Uri, snapshot: FrozenLearningBackupFile, checkpoint: () -> Unit) {
+        val resolver = applicationContext.contentResolver
+        checkpoint()
+        snapshot.file.inputStream().use { input ->
+            checkpoint()
+            val output = resolver.openOutputStream(uri, "wt") ?: error("无法写入所选备份位置")
+            output.use {
+                val guarded = guardedOutput(it, checkpoint)
+                guardedInput(input, checkpoint).copyTo(guarded, 64 * 1024)
+                guarded.flush()
+            }
+        }
+        checkpoint() // Reopen only after write, flush and both closes succeeded.
+        val input = resolver.openInputStream(uri) ?: error("无法读回所选备份文件")
+        val verified = input.use { LearningBackupCodec.verifyExactBytes(guardedInput(it, checkpoint), snapshot.fingerprint) }
+        check(verified) { "备份文件读回校验不一致" }
+    }
+
     private fun handleBackupExportResult(requestCode: Int, resultCode: Int, data: Intent?) {
         if (backupExportSession.fileRequestCode != requestCode) return
-        if (resultCode != RESULT_OK || data?.data == null) {
+        val uri = data?.data
+        if (resultCode != RESULT_OK || uri == null) {
             backupExportSession.cancel(requestCode); updateBackupButtons(); toast("已取消备份"); return
         }
-        val bytes = backupExportSession.takeResult(requestCode) ?: return
-        val uri = data.data!!
-        app.worker.execute {
-            val error = runCatching {
-                val output = contentResolver.openOutputStream(uri, "wt") ?: error("无法写入所选位置")
-                output.use { it.write(bytes); it.flush() }
-            }.exceptionOrNull()
-            main.post {
-                if (isDestroyed) return@post
-                backupExportSession.cancel(requestCode)
+        val snapshot = backupExportSession.takeFileResult(requestCode) ?: return
+        val operation = beginDocument(requestCode) {
+            if (backupExportSession.cancel(requestCode)) {
                 updateBackupButtons()
-                toast(if (error == null) "学习数据备份已写入所选位置" else "备份失败：${error.message}；目标文件可能不完整，请删除后重试")
+                toast("备份超时，未确认保存成功；提供方可能仍在处理，请检查目标文件")
+            }
+        }
+        runDocument(operation, uri, discard = snapshot::discard,
+            work = { writeVerifiedBackup(uri, snapshot, it) }) { result ->
+            cancelDocument(operation)
+            if (backupExportSession.cancel(requestCode)) {
+                updateBackupButtons()
+                toast(result.fold({ "学习数据备份已保存并读回校验一致" }, { "备份失败：${it.message}；请检查目标文件" }))
             }
         }
     }
+
     private fun startRestore() {
         if (backupExportSession.busy || restoreSession.busy) return
         if (lostExportRequestCode >= 0 || cleaningLostExport) { toast("请先完成或取消当前 PDF 导出"); return }
         val id = restoreSession.beginImport() ?: return
         updateBackupButtons()
         val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*")
-        runCatching { startActivityForResult(intent, id) }.onFailure {
-            restoreSession.cancelImport(id); updateBackupButtons()
-            toast("无法打开文件选择：${it.message}")
-        }
+        launchBackupPicker(id, BackupPicker.IMPORT, intent, { restoreSession.cancelImport(id) }, "无法打开文件选择")
     }
+
     private fun handleRestoreImportResult(requestCode: Int, resultCode: Int, data: Intent?) {
         if (restoreSession.importRequestCode != requestCode) return
-        if (resultCode != RESULT_OK || data?.data == null) {
+        val uri = data?.data
+        if (resultCode != RESULT_OK || uri == null) {
             restoreSession.cancelImport(requestCode); updateBackupButtons(); toast("已取消恢复"); return
         }
-        val uri = data.data!!
         if (!restoreSession.beginReading(requestCode, uri.toString())) return
         updateBackupButtons()
-        app.worker.execute {
-            // Read and validate the whole file first; the frozen payload is never re-read at apply time.
-            val result = runCatching { LearningBackupCodec.decode(readBoundedBytes(uri)) }
-            main.post {
-                if (isDestroyed) return@post
-                result.onSuccess { backup ->
-                    if (!restoreSession.freezeImport(requestCode, backup)) return@onSuccess
+        val operation = beginDocument(requestCode) {
+            if (restoreSession.cancelPreparation(requestCode)) {
+                updateBackupButtons(); toast("读取备份超时，未恢复学习数据；提供方可能仍在处理")
+            }
+        }
+        val application = app
+        runDocument(operation, uri, discardResult = LearningBackupCodec.StagedImport::close, work = { checkpoint ->
+            LearningBackupCodec.stageImport(application.cacheDir, checkpoint) {
+                application.contentResolver.openInputStream(uri) ?: throw BackupFormatException("无法读取所选文件")
+            }
+        }) { result ->
+            cancelDocument(operation)
+            result.onSuccess { source ->
+                if (!restoreSession.freezeStagedImport(requestCode, source)) {
+                    source.close()
+                    return@onSuccess
+                }
+                try {
                     updateBackupButtons()
-                    showRestorePreview(backup)
-                }.onFailure {
-                    restoreSession.cancelImport(requestCode); updateBackupButtons()
-                    toast("无法读取备份：${it.message}")
+                    showRestorePreview(source.preview)
+                } catch (e: Exception) {
+                    restoreSession.cancelPreview()
+                    updateBackupButtons(); toast("无法显示恢复预览：${e.message}")
+                }
+            }.onFailure {
+                if (restoreSession.cancelPreparation(requestCode)) {
+                    updateBackupButtons(); toast("无法读取备份：${it.message}")
                 }
             }
         }
     }
-    private fun showRestorePreview(backup: LearningBackup) {
+
+    private fun showRestorePreview(backup: LearningBackupPreview) {
         val content = panel()
         val dialog = paperDialog(content)
         content.addView(text("从备份完整恢复", 24f, bold = true)); content.space(12)
@@ -4006,7 +4695,7 @@ class MainActivity : Activity() {
             content.addView(text("这是旧版格式（v1）备份：只含生词与查询记录，不含复习进度和个人补充词库。", 16f, Paper.warning, true))
             content.addView(text("恢复后复习进度为空、个人补充词库为空，所选范围与每日目标恢复为默认值。", 16f, Paper.warning))
         } else {
-            content.addView(text("复习进度：已学 ${backup.stateCount} 词 · 反馈 ${backup.reviewCount} 条${if (backup.data.session != null) " · 含 1 张未答卡" else ""}", 18f))
+            content.addView(text("复习进度：已学 ${backup.stateCount} 词 · 反馈 ${backup.reviewCount} 条${if (backup.hasSession) " · 含 1 张未答卡" else ""}", 18f))
             if (backup.noPersonalDictionary) {
                 content.addView(text("这是 v2 备份：不含个人补充词库。恢复会清空当前本机补充词条，不会与备份隐式合并。", 16f, Paper.warning, true))
             } else {
@@ -4021,107 +4710,100 @@ class MainActivity : Activity() {
             setPadding(dp(16), dp(12), dp(16), dp(12)); background = shape(Paper.background, 8)
             addView(text(if (backup.wordCount == 0 && backup.eventCount == 0 &&
                     backup.stateCount == 0 && backup.userEntryCount == 0 &&
-                    backup.favoriteCount == 0 && backup.data.session == null)
+                    backup.favoriteCount == 0 && !backup.hasSession)
                 "这是一个空备份：确认恢复后会清空当前全部学习数据、收藏星标和个人补充词库。" else
                 "恢复会用备份内容完整替换当前全部学习数据、收藏星标与个人补充词库（不合并、不猜测冲突）；备份里没有的词、查询记录、收藏和补充词条也会被移除。",
                 16f, Paper.warning, true))
             addView(text("恢复前必须先把当前数据另存为一个安全备份文件；只有写入关闭并读回校验一致、且数据未在此期间变化时才会覆盖。", 16f, Paper.secondary))
-            addView(text("备份是本地明文个人数据，未加密、不防恶意篡改。", 16f, Paper.secondary))
+            addView(text(BACKUP_PRIVACY + " 备份不防恶意篡改。", 16f, Paper.secondary))
         }
         content.addView(warning); content.space(24)
         val cancel = button("取消") { dialog.dismiss() }.apply { background = shape(Paper.background, 8); setTextColor(Paper.ink) }
         val confirm = button("继续并选择安全备份位置", true) {
+            if (restorePreviewDialog !== dialog || !dialog.isShowing || isFinishing || isDestroyed) return@button
             val safetyId = restoreSession.confirm() ?: return@button
             dialog.dismiss()
             updateBackupButtons()
             val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE)
                 .setType(LearningBackupCodec.MIME_TYPE)
                 .putExtra(Intent.EXTRA_TITLE, "拾词-恢复前安全备份-${LocalDate.now()}${LearningBackupCodec.FILE_SUFFIX}")
-            runCatching { startActivityForResult(intent, safetyId) }.onFailure {
-                restoreSession.cancelSafety(safetyId); updateBackupButtons()
-                toast("无法打开安全备份保存位置：${it.message}")
-            }
+            launchBackupPicker(safetyId, BackupPicker.SAFETY, intent,
+                { restoreSession.cancelSafety(safetyId) }, "无法打开安全备份保存位置")
         }
         content.addView(pair(cancel, confirm, inlineAt(minOf(resources.configuration.screenWidthDp - 32, 560) - 48), 12))
         showPaperDialog(dialog, 560) {
-            if (restorePreviewDialog === dialog) restorePreviewDialog = null
-            if (restoreSession.cancelPreview()) updateBackupButtons()
+            if (restorePreviewDialog === dialog) {
+                restorePreviewDialog = null
+                if (restoreSession.cancelPreview()) updateBackupButtons()
+            }
         }
         restorePreviewDialog = dialog
     }
     private fun handleRestoreSafetyResult(requestCode: Int, resultCode: Int, data: Intent?) {
         if (restoreSession.safetyRequestCode != requestCode) return
-        if (resultCode != RESULT_OK || data?.data == null) {
+        val safetyUri = data?.data
+        if (resultCode != RESULT_OK || safetyUri == null) {
             restoreSession.cancelSafety(requestCode); updateBackupButtons(); toast("已取消恢复：未选择安全备份位置"); return
         }
-        val safetyUri = data.data!!
-        val importUri = restoreSession.pendingImportUri
-        if (importUri != null && safetyUri.toString() == importUri) {
+        if (safetyUri.toString() == restoreSession.pendingImportUri) {
             restoreSession.cancelSafety(requestCode); updateBackupButtons()
             toast("安全备份位置不能与导入的备份文件相同，已取消恢复"); return
         }
-        val backup = restoreSession.beginApply(requestCode) ?: return
-        // Cross-thread cancellation identity for exactly this apply. onDestroy (through restoreSession.clear),
-        // a replaced session or an invalidated apply must not let this queued worker overwrite the database.
-        val apply = restoreSession.applyHandle ?: return
+        val backup = restoreSession.beginStagedApply(requestCode) ?: return
+        val apply = checkNotNull(restoreSession.applyHandle)
         updateBackupButtons()
-        app.worker.execute {
-            // Revalidate on the worker thread before any I/O: an apply invalidated while this task was
-            // queued (destroyed/replaced session) must not even write the safety backup.
-            if (!apply.isActive()) return@execute
-            val result = runCatching {
-                val pre = app.repository.backupSnapshot()
-                val encoded = LearningBackupCodec.encode(pre.data, BuildConfig.VERSION_NAME, BuildConfig.VERSION_CODE, System.currentTimeMillis())
-                if (!writeSafetyBackup(safetyUri, encoded)) error("恢复前安全备份未能读回校验一致")
-                // Same worker and pre-transaction check: a change since the snapshot must not be overwritten.
-                // This is also the last admission gate: admit() is linearized against session invalidation, so
-                // a destroy/clear before it must not write, while an already admitted transaction is allowed to
-                // commit atomically — no half-write, no false cancellation claim, no forced mid-commit rollback.
-                if (!apply.admit()) return@runCatching null
-                app.repository.restoreBackup(backup.data, pre.revision)
-            }
-            main.post {
-                if (isDestroyed) return@post
-                // Settle only this operation; finish() is request/phase guarded, so a replaced session
-                // keeps its own busy state and a late callback cannot end the new session.
-                restoreSession.finish(requestCode)
+        val operation = beginDocument(requestCode, apply) {
+            if (restoreSession.finish(requestCode)) {
                 updateBackupButtons()
-                result.onSuccess { outcome ->
-                    when (outcome) {
-                        RestoreOutcome.RESTORED -> {
-                            restorePreviewDialog?.dismiss(); restorePreviewDialog = null
-                            toast("已完整恢复：替换为备份中的 ${backup.wordCount} 个词、${backup.eventCount} 条事件、${backup.userEntryCount} 条用户补充")
-                        }
-                        RestoreOutcome.REVISION_CHANGED ->
-                            toast("学习数据在准备期间有新变化，本次未覆盖；请重新开始恢复")
-                        else -> Unit
+                toast("安全备份等待超时，未覆盖学习数据；提供方可能仍在处理，请检查目标文件")
+            }
+        }
+        fun finish(result: Result<RestoreOutcome>) {
+            if (documentOperations[requestCode] !== operation || restoreSession.applyHandle !== apply ||
+                isDestroyed || isFinishing || (!apply.isAdmitted && !operation.isCurrent())) return
+            cancelDocument(operation)
+            if (!restoreSession.finish(requestCode)) return
+            updateBackupButtons()
+            result.onSuccess { outcome ->
+                when (outcome) {
+                    RestoreOutcome.RESTORED ->
+                        toast("已完整恢复：替换为备份中的 ${backup.wordCount} 个词、${backup.eventCount} 条事件、${backup.userEntryCount} 条用户补充")
+                    RestoreOutcome.REVISION_CHANGED ->
+                        toast("学习数据在准备期间有新变化，本次未覆盖；请重新开始恢复")
+                }
+            }.onFailure { toast("恢复失败，学习数据未改变：${it.message}；请检查安全备份位置") }
+        }
+        val application = app
+        try {
+            freezeBackup(operation) { frozen ->
+                frozen.onSuccess { snapshot ->
+                    val revision = snapshot.revision
+                    runDocument(operation, safetyUri, discard = snapshot::discard,
+                        work = { writeVerifiedBackup(safetyUri, snapshot, it) }) { verified ->
+                        verified.onSuccess {
+                            try {
+                                application.worker.execute {
+                                    if (!apply.isActive() || !operation.isCurrent()) return@execute
+                                    val result = runCatching {
+                                        val repository = application.repository
+                                        if (repository.changes.version != revision) return@runCatching RestoreOutcome.REVISION_CHANGED
+                                        // Admission takes ownership in the same critical section. Clear
+                                        // can retire the UI, but cannot unlink this worker's source.
+                                        val source = apply.admitStaged(operation::isCurrent) ?: return@execute
+                                        source.use { repository.restoreBackup(it, revision) }
+                                    }
+                                    main.post { finish(result) }
+                                }
+                            } catch (e: RejectedExecutionException) {
+                                finish(Result.failure(e))
+                            }
+                        }.onFailure { finish(Result.failure(it)) }
                     }
-                }.onFailure { toast("恢复失败，学习数据未改变：${it.message}") }
+                }.onFailure { finish(Result.failure(it)) }
             }
+        } catch (e: RejectedExecutionException) {
+            finish(Result.failure(e))
         }
-    }
-    /** Reads at most the backup size cap + 1 byte so a huge or endless stream cannot allocate freely. */
-    private fun readBoundedBytes(uri: Uri): ByteArray {
-        val input = contentResolver.openInputStream(uri) ?: throw BackupFormatException("无法读取所选文件")
-        return input.use { stream ->
-            val out = ByteArrayOutputStream()
-            val buffer = ByteArray(64 * 1024)
-            var total = 0L
-            while (true) {
-                val read = stream.read(buffer)
-                if (read < 0) break
-                total += read
-                if (total > LearningBackupCodec.MAX_FILE_BYTES) throw BackupFormatException("备份文件超过 ${LearningBackupCodec.MAX_BYTES_LABEL} 上限")
-                out.write(buffer, 0, read)
-            }
-            out.toByteArray()
-        }
-    }
-    /** Writes the pre-restore snapshot, then reads it back and requires byte-identical content. */
-    private fun writeSafetyBackup(uri: Uri, bytes: ByteArray): Boolean {
-        val output = contentResolver.openOutputStream(uri, "wt") ?: throw java.io.IOException("无法写入所选安全备份位置")
-        output.use { it.write(bytes); it.flush() }
-        return readBoundedBytes(uri).contentEquals(bytes)
     }
     private fun date(time: Long) = Instant.ofEpochMilli(time).atZone(ZoneId.systemDefault()).format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm"))
     private fun toast(message: String) { Toast.makeText(this, message, Toast.LENGTH_LONG).show() }

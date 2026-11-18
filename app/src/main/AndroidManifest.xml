@@ -8,6 +8,16 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Declared so Android can list this app under "install unknown apps" and so a user-tapped,
+         already verified APK can reach the system package installer. The app never installs
+         silently: every install goes through the system installer's own confirmation. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.INSTALL_PACKAGE" />
+            <data android:scheme="content" android:mimeType="application/vnd.android.package-archive" />
+        </intent>
+    </queries>
     <application
         android:name=".ShiciApplication"
         android:allowBackup="false"
@@ -40,5 +50,17 @@
         </service>
         <service android:name=".capture.CaptureService" android:exported="false"
             android:foregroundServiceType="mediaProjection" />
+        <meta-data android:name="com.shici.app.UPDATE_CHANNEL" android:value="@string/update_channel" />
+        <!-- Shares exactly one private cache sub-directory (a verified update APK) read-only with
+             the system installer, through a granted content URI. Nothing else is exposed. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.updates"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/update_file_paths" />
+        </provider>
     </application>
 </manifest>

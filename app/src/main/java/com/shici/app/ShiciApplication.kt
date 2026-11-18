@@ -16,8 +16,19 @@ import java.util.concurrent.Executors
 class ShiciApplication : Application() {
     val worker = Executors.newSingleThreadExecutor()
     val repository by lazy { LearningRepository(this) }
-    // Access only from worker: cache both a fully validated dictionary and an explicit load failure.
-    val lookupDictionary: Result<DictionaryStore> by lazy { runCatching { EcdictDictionary.open(this) } }
+    // Worker-only. Reads reuse the last outcome, including a failure; only an explicit retry of
+    // the still-current failed attempt can open the asset again. A validated store never reopens.
+    internal class LookupDictionaryAttempt(val result: Result<DictionaryStore>)
+    private var dictionaryAttempt: LookupDictionaryAttempt? = null
+    private fun openLookupDictionary() = LookupDictionaryAttempt(runCatching { EcdictDictionary.open(this) })
+        .also { dictionaryAttempt = it }
+
+    internal fun lookupDictionaryAttempt(retryOf: LookupDictionaryAttempt? = null): LookupDictionaryAttempt {
+        val current = dictionaryAttempt ?: return openLookupDictionary()
+        return if (current === retryOf && current.result.isFailure) openLookupDictionary() else current
+    }
+
+    val lookupDictionary: Result<DictionaryStore> get() = lookupDictionaryAttempt().result
     // Original fixed exam-book entries are retained only for study membership fallback.
     val dictionary: Result<RawKajwebDictionary> by lazy {
         runCatching {

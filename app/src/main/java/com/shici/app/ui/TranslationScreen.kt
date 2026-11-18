@@ -281,6 +281,7 @@ class TranslationScreen(
                 InputType.TYPE_TEXT_FLAG_MULTI_LINE or
                 InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
             // Restore/paste the caller's text and caret without submitting or translating it.
+            isSaveEnabled = false // The Activity owns exact draft persistence, not view state.
             setText(initialText)
             setSelection(clampedSelection(initialText, initialSelectionStart, initialSelectionEnd).first,
                 clampedSelection(initialText, initialSelectionStart, initialSelectionEnd).second)

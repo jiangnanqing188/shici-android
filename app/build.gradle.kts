@@ -11,8 +11,8 @@ android {
         applicationId = "com.shici.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 55
-        versionName = "2.8.0"
+        versionCode = 56
+        versionName = "2.9.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
     buildFeatures { buildConfig = true }
@@ -22,7 +22,10 @@ android {
     }
     kotlinOptions { jvmTarget = "17" }
     buildTypes {
-        release { isMinifyEnabled = false }
+        release {
+            isDebuggable = false
+            isMinifyEnabled = false
+        }
     }
     lint { abortOnError = true }
 }
@@ -32,6 +35,9 @@ dependencies {
     // Optional on-device English -> Chinese component. Models are downloaded only after the
     // user's explicit confirmation in TranslationScreen; text is processed on the device.
     implementation("com.google.mlkit:translate:17.0.3")
+    // FileProvider only (verified-update content URI for the system installer). Pinned to the
+    // androidx.core version already present in this project's offline dependency cache.
+    implementation("androidx.core:core:1.9.0")
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test:runner:1.6.2")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")

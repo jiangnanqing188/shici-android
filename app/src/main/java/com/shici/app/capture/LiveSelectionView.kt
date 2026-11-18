@@ -31,7 +31,8 @@ class LiveSelectionView(
     private val onStroke: (HighlighterStroke) -> Unit,
     private val onTooShort: () -> Unit,
     private val onCancel: (String) -> Unit,
-    private val onGestureStart: () -> Unit = {}
+    private val onGestureStart: () -> Unit = {},
+    private val onGestureState: (String) -> Unit = {}
 ) : View(context) {
     private enum class Stage { PREPARING, SAMPLING, READY }
     private val density = resources.displayMetrics.density
@@ -108,7 +109,8 @@ class LiveSelectionView(
     }
 
     /** True only after the window is attached, laid out with a real size, and visible. */
-    fun isWindowReady(): Boolean = isAttachedToWindow && isShown && width > 0 && height > 0
+    fun isWindowReady(): Boolean =
+        isAttachedToWindow && isShown && windowVisibility == VISIBLE && width > 0 && height > 0
 
     /** Paints the redraw notice inside the transparent layer, avoiding a Toast in either sample. */
     private fun showNotice(message: String) {
@@ -255,6 +257,11 @@ class LiveSelectionView(
         if (visibility == View.VISIBLE) reportWindowReady()
     }
 
+    override fun onDetachedFromWindow() {
+        cancelWindowReadiness()
+        super.onDetachedFromWindow()
+    }
+
     private fun cancelRect(): RectF {
         val halfWidth = (chipText.measureText("取消取词") + 32f * density) / 2f
         val chipHeight = 44f * density
@@ -335,9 +342,14 @@ class LiveSelectionView(
         }
     }
 
-    private fun appendEvent(event: MotionEvent) {
+    private fun appendStrokeEvent(event: MotionEvent): Boolean {
         val index = event.findPointerIndex(pointerId)
-        if (index < 0) { cancelCurrentStroke(); return }
+        if (index < 0) {
+            onGestureState("pointer_lost")
+            cancelCurrentStroke()
+            showNotice("笔迹手势已中断，请重新划一笔")
+            return false
+        }
         // Coalesced history belongs to any event, not only ACTION_MOVE. A fast two-sample stroke
         // can carry its whole back-and-forth path in the lift event's history; dropping it would
         // turn a real word stroke into a straight jump between the first and last point.
@@ -345,6 +357,7 @@ class LiveSelectionView(
             appendPoint(event.getHistoricalX(index, history), event.getHistoricalY(index, history))
         }
         appendPoint(event.getX(index), event.getY(index))
+        return true
     }
 
     /** View-local coordinates are translated to screen pixels; the overlay is display-aligned. */
@@ -388,15 +401,17 @@ class LiveSelectionView(
                 downX = event.x
                 downY = event.y
                 if (!cancelPressed) {
-                    // Opens a fresh page-observation window for this stroke. The capture thread
-                    // only records evidence while this window is active.
-                    onGestureStart()
+                    // Publish the initial ink geometry before opening the observation window.
                     beginStroke(event)
+                    onGestureStart()
                 }
             }
-            MotionEvent.ACTION_MOVE -> if (!cancelPressed && !interrupted) appendEvent(event)
+            MotionEvent.ACTION_MOVE -> if (!cancelPressed && !interrupted && currentPoints != null) {
+                appendStrokeEvent(event)
+            }
             MotionEvent.ACTION_POINTER_DOWN, MotionEvent.ACTION_POINTER_UP -> {
                 // Any second pointer makes this attempt ambiguous: never bridge or submit it.
+                if (!interrupted) onGestureState("multi_cancel")
                 interrupted = true
                 cancelCurrentStroke()
             }
@@ -416,19 +431,20 @@ class LiveSelectionView(
                     onCancel("检测到多指操作，本次未查询")
                     return true
                 }
-                // A lift without an active stroke belongs to a cancelled attempt (for example
-                // ACTION_CANCEL followed by the system's final UP). It must not turn into a
-                // spurious "too short" notice or a new query.
+                // A lift without an active stroke belongs to a discarded touch stream. It must
+                // not turn into a spurious "too short" notice or a new query.
                 if (currentPoints == null) {
+                    onGestureState("lift_without_down")
+                    showNotice("本次未收到完整手势，请重新划一笔")
                     invalidate()
                     return true
                 }
-                appendEvent(event)
-                val points = currentPoints?.toList() ?: emptyList()
+                if (!appendStrokeEvent(event)) return true
+                val points = currentPoints.orEmpty()
                 if (points.size < 2 || strokeLength(points) < HighlighterTuning.MIN_STROKE_LENGTH_DP * density) {
-                    cancelCurrentStroke()
-                    invalidate()
                     onTooShort()
+                    cancelCurrentStroke()
+                    showNotice("轻点未提交，请沿完整单词一笔划过")
                     return true
                 }
                 // Keep the final ink/chip exclusion snapshot published while the synchronous
@@ -444,6 +460,7 @@ class LiveSelectionView(
             MotionEvent.ACTION_CANCEL -> {
                 interrupted = false
                 cancelPressed = false
+                onGestureState("ready_cancel")
                 cancelCurrentStroke()
                 invalidate()
                 onCancel("取词手势已中断，本次未查询")
@@ -490,15 +507,19 @@ class LiveSelectionView(
                 val cancel = isCancelTap(event)
                 val multi = preparationMulti
                 resetPreparationGesture()
+                if (!cancel) onGestureState(if (currentStage == Stage.PREPARING) "preparing_drop" else "sampling_drop")
                 when {
                     cancel -> onCancel("已取消取词")
                     multi -> showNotice("多指未提交，请重新完整划一笔")
-                    else -> showNotice("划词层尚未就绪，请就绪后重新划一笔")
+                    else -> showNotice("等出现「抬笔即查」，再完整划一笔")
                 }
             }
             MotionEvent.ACTION_CANCEL -> {
                 resetPreparationGesture()
-                onCancel("取词准备已中断，本次未查询")
+                // This cancels a touch stream, not the preparation owner. Explicit cancel still
+                // exits via the chip; detach, resize and preparation timeouts retire the layer.
+                onGestureState("pre_ready_cancel")
+                showNotice("准备期间手势已中断，就绪后请重划")
             }
         }
     }
@@ -515,6 +536,7 @@ class LiveSelectionView(
                 val cancel = isCancelTap(event)
                 val multi = preparationMulti
                 resetPreparationGesture()
+                if (!cancel) onGestureState("cross_ready_drop")
                 when {
                     cancel -> onCancel("已取消取词")
                     multi -> showNotice("多指未提交，请用单指重新划一笔")
@@ -523,6 +545,7 @@ class LiveSelectionView(
             }
             MotionEvent.ACTION_CANCEL -> {
                 resetPreparationGesture()
+                onGestureState("cross_ready_cancel")
                 showNotice("手势在准备切换时中断，请重划")
             }
         }
