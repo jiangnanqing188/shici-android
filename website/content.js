@@ -2,13 +2,13 @@ window.SHICI_SITE = {
   name: '拾词',
   tagline: '阅读不停，生词随手拾起',
   description: '拾词是一款面向安卓手机和平板的阅读查词工具：开启悬浮查词后，在屏幕上划一笔，抬起即可查询；把生词、笔记和复习进度留在本机。本站不提供账号、云同步或上传功能。',
-  internalVersion: '2.6.2',
-  internalVersionCode: 53,
+  internalVersion: '2.9.0',
+  internalVersionCode: 56,
   publicRelease: {
-    version: '2.8.0',
-    versionCode: 55,
-    phoneReleaseUrl: 'https://github.com/jiangnanqing188/shici-android/releases/tag/v2.8.0-phone-test',
-    tabletReleaseUrl: 'https://github.com/jiangnanqing188/shici-android/releases/tag/v2.8.0-tablet-test',
+    version: '2.9.0',
+    versionCode: 56,
+    phoneReleaseUrl: 'https://github.com/jiangnanqing188/shici-android/releases/tag/v2.9.0-phone-test',
+    tabletReleaseUrl: 'https://github.com/jiangnanqing188/shici-android/releases/tag/v2.9.0-tablet-test',
     channel: 'test'
   },
   repositoryUrl: null,
@@ -75,7 +75,7 @@ window.SHICI_SITE = {
       footerStatus: '公开测试版 {version} · GitHub 发布',
       channel: '公开测试版',
       title: '{name} {version}',
-      copy: '{version} 公开测试包使用 Debug 签名，不是正式发行版。手机和平板分别发布，安装前请备份学习数据。已知问题：大幅滚屏后的再次划词可能失败或不显示笔迹，可先用手动输入。',
+      copy: '{version} 为不可调试的安卓测试版，沿用旧测试包签名。手机和平板分别发布。旧版用户请先备份，再下载对应安装包覆盖安装，不要卸载旧版。',
       verify: '请从已知的 GitHub 仓库 jiangnanqing188/shici-android 打开对应设备的 HTTPS Release 页面，核对 APK 附件、文件大小和 SHA256SUMS.txt。本站仍通过 HTTP 访问，页面与链接可能被篡改，不能作为独立核验依据。'
     }
   },
@@ -126,11 +126,15 @@ window.SHICI_SITE = {
   faq: [
     {
       question: '拾词是不是完整离线？',
-      answer: '内置词库查词、生词本和背词不依赖网络，学习数据保存在本机。备份与恢复通过系统文件选择器读写；如果选择云盘，能否离线读写取决于文件提供方。可选“离线 AI 翻译”组件初装不下载，只有你明确确认后才由 Google ML Kit 在设备上下载英译中模型（约 30 MB 为估计值，以系统为准，采用 Wi-Fi 条件），设备需支持 Google Play 服务。ML Kit 可能为模型更新、诊断和统计与 Google 通信并发送性能/使用指标，因此不是“完全不联网”；不下载该组件不影响查词、收藏、复习、PDF 与备份。'
+      answer: '内置词库查词、生词本和背词不依赖网络，学习数据保存在本机。2.9.0 起，应用在启动或回到前台时限频联网检查 GitHub 发布，不上传学习数据。备份与恢复通过系统文件选择器读写；如果选择云盘，能否离线读写取决于文件提供方。可选“离线 AI 翻译”组件初装不下载，只有你明确确认后才由 Google ML Kit 在设备上下载英译中模型（约 30 MB 为估计值，以系统为准，采用 Wi-Fi 条件），设备需支持 Google Play 服务。ML Kit 可能为模型更新、诊断和统计与 Google 通信并发送性能/使用指标，因此不是“完全不联网”；不下载该组件不影响查词、收藏、复习、PDF 与备份。'
     },
     {
       question: '能不能完全代替词典？',
       answer: '不能。原始离线词库未逐条核对，只查原词头、不猜词形；正式词典、发音和例句尚未实现。拾词适合阅读时快速查词和积累生词，权威释义请以正式词典为准。'
+    },
+    {
+      question: '怎么升级到 2.9.0？',
+      answer: '2.8.0 及更早版本没有应用内更新。请先备份，再从 GitHub 对应的手机或平板发布页下载 2.9.0，直接覆盖安装，不要卸载旧版。装上 2.9.0 后，可以在“设置 → 关于”检查后续更新；下载须手动点按，安装仍由系统确认。'
     },
     {
       question: '安装或升级前需要备份吗？',
@@ -151,7 +155,7 @@ window.SHICI_SITE = {
   ],
   privacy: {
     summary: '学习数据与查询记录保存在本机，拾词不主动上传或云同步学习数据，也没有账号功能。若将备份保存到云盘，文件提供方可能上传或同步备份。屏幕画面只在本机内存中短暂识别，不写截图文件、不上传。',
-    details: '悬浮窗权限只用于在其他应用上显示查词浮层；屏幕捕获只在你主动开启查词时申请，画面仅在内存中短暂读取并由本机识别。查询记录、释义快照、笔记、收藏、掌握状态与背词进度保存在本机数据库。PDF 导出和备份读写均通过系统文件选择器，文件位置由你指定。普通备份和恢复前安全备份均为未加密的明文；如果选择云盘，提供方可能上传或同步文件，敏感数据建议保存到本机。可选“离线 AI 翻译”由 Google ML Kit 在设备本机翻译，本应用不上传原文或译文；但该 SDK 可能为模型更新、诊断统计与 Google 通信并发送性能/使用指标，清单中的网络权限仅用于该组件。'
+    details: '悬浮窗权限只用于在其他应用上显示查词浮层；屏幕捕获只在你主动开启查词时申请，画面仅在内存中短暂读取并由本机识别。查询记录、释义快照、笔记、收藏、掌握状态与背词进度保存在本机数据库。PDF 导出和备份读写均通过系统文件选择器，文件位置由你指定。普通备份和恢复前安全备份均为未加密的明文；如果选择云盘，提供方可能上传或同步文件，敏感数据建议保存到本机。可选“离线 AI 翻译”由 Google ML Kit 在设备本机翻译，本应用不上传原文或译文；但该 SDK 可能为模型更新、诊断统计与 Google 通信并发送性能/使用指标，应用也会使用网络检查 GitHub 发布；只有你点按下载才会下载安装包，不上传学习数据。'
   },
   requirements: [
     'Android 8.0（API 26）或更高版本的手机或平板。',

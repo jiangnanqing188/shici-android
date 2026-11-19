@@ -1,12 +1,18 @@
-# 拾词官网（私有开发目录）
+# 拾词官网
 
-## A01：官网 APK 明文分发止血（2026-11-17，本地候选，未上线）
+## 当前线上版本：2.9.0 / 56 双端公开测试版（2026-11-19）
+
+- 安卓手机和安卓平板分别打开 `v2.9.0-phone-test`、`v2.9.0-tablet-test` 的 GitHub HTTPS 发布页；不会直接下载。iPhone、iPad 暂未提供。本批分发使用不可调试的构建，并沿用公开 2.8.0 的签名证书，真机保数据升级和大幅滚屏后重划仍待验证。
+- 官网仍只提供 HTTP；请从已知 GitHub 仓库独立进入设备对应的发布页并核对 `SHA256SUMS.txt`。此前的 `/downloads/shici-2.6.1-52.apk` 已撤下公开路由，生产 GET、HEAD 和 Range 均实测返回 404，服务器原文件未删除。
+- 四页共享资源缓存标记为 `20261119a`。七个线上静态文件与本批候选逐字节核对通过；仅更新 HTTP 站点和重载 nginx，未变更 443 服务。
+
+## 历史候选：A01 官网 APK 明文分发止血（2026-11-17，当时未上线）
 
 - 下载页仅导航到 `jiangnanqing188/shici-android` 的 HTTPS Release 页面：安卓手机 `v2.8.0-phone-test`，安卓平板 `v2.8.0-tablet-test`。均为 2.8.0 / 55 Debug 测试包，但附件不同；点按只打开发布页，不自动下载。版本及附件核对依据见 `../工作记录/20261117-2-A01与A03首批修复任务单.md` 的 A01；该证据仅为 Release 元数据核对，不代表重新下载或哈希整包。
 - 官网页面仍为 HTTP，内容和链接都可能被篡改。应从已知的 GitHub 仓库独立打开对应设备的 Release，核对附件、大小和 `SHA256SUMS.txt`；不把官网或同页校验值当作信任锚。本候选不迁移站点 HTTPS。Apple 仍为纯文字；安装前备份及大幅滚屏后划词失败的已知问题提示继续保留。
 - 四页共享资源引用统一为 `20261117a`。候选 `deploy/nginx.conf` 移除 `/downloads/shici-2.6.1-52.apk` 的精确路由；该路径的 GET/HEAD 在候选中应落入 404，不删除原文件。保留原七个静态文件及首页 `/` 别名、GET/HEAD 限制和 443 边界；未运行安装脚本，未探测、变更或重载生产站点。
 
-下面的日期章节是各批历史记录，不代表本地候选或已完成线上止血。
+下面的日期章节保留各批当时的状态，以本页开头的当前上线状态为准。
 
 ## 新版 Logo（2026-11-08）
 
@@ -242,14 +248,14 @@ systemctl daemon-reload
 
 ## 上线时需要填写的字段
 
-本地候选的 `publicRelease` 如下。替换为新版本前，先独立确认两个设备的 Release 页面和附件：
+当前上线的 `publicRelease` 如下。替换为新版本前，先独立确认两个设备的 Release 页面和附件：
 
 ```js
 publicRelease: {
-  version: '2.8.0',
-  versionCode: 55,
-  phoneReleaseUrl: 'https://github.com/jiangnanqing188/shici-android/releases/tag/v2.8.0-phone-test',
-  tabletReleaseUrl: 'https://github.com/jiangnanqing188/shici-android/releases/tag/v2.8.0-tablet-test',
+  version: '2.9.0',
+  versionCode: 56,
+  phoneReleaseUrl: 'https://github.com/jiangnanqing188/shici-android/releases/tag/v2.9.0-phone-test',
+  tabletReleaseUrl: 'https://github.com/jiangnanqing188/shici-android/releases/tag/v2.9.0-tablet-test',
   channel: 'test'
 }
 ```

@@ -12,16 +12,16 @@
 
 ## 下载与版本
 
-目前已发布的两端 2.8.0 / 55 都是 **Debug 签名、可调试的测试包**，尚未发布应用商店正式版。Android 8.0（API 26）及以上；暂不支持 iPhone、iPad。
+目前已发布的两端 **2.9.0 / 56 是不可调试的测试包**，沿用公开 2.8.0 测试包的签名证书，尚未发布应用商店正式版。Android 8.0（API 26）及以上；暂不支持 iPhone、iPad。
 
 | 设备与分支 | 最新测试包 | 当前区别 |
 | --- | --- | --- |
-| 平板：[codex/android-mvp](https://github.com/jiangnanqing188/shici-android/tree/codex/android-mvp) | [2.8.0 / 55](https://github.com/jiangnanqing188/shici-android/releases/tag/v2.8.0-tablet-test) | 宽屏侧栏直接入口、列表与详情分栏、真实界面动画引导和“下一步” |
-| 手机：[codex/phone-adaptation](https://github.com/jiangnanqing188/shici-android/tree/codex/phone-adaptation) | [2.8.0 / 55](https://github.com/jiangnanqing188/shici-android/releases/tag/v2.8.0-phone-test) | 保留固定四入口、紧凑布局与键盘适配；同步真实界面引导、下一步与锚定“更多”菜单 |
+| 平板：[codex/android-mvp](https://github.com/jiangnanqing188/shici-android/tree/codex/android-mvp) | [2.9.0 / 56](https://github.com/jiangnanqing188/shici-android/releases/tag/v2.9.0-tablet-test) | 宽屏侧栏直接入口、列表与详情分栏、真实界面动画引导和“下一步” |
+| 手机：[codex/phone-adaptation](https://github.com/jiangnanqing188/shici-android/tree/codex/phone-adaptation) | [2.9.0 / 56](https://github.com/jiangnanqing188/shici-android/releases/tag/v2.9.0-phone-test) | 保留固定四入口、紧凑布局与键盘适配；同步真实界面引导、下一步与锚定“更多”菜单 |
 
 从 Release 的 **Assets** 下载对应的 `.apk`；`Source code` 压缩包是源码，不能直接安装。每个 Release 提供安装包大小与 SHA-256 校验文件。
 
-两个包共用应用 ID `com.shici.app`，不能并排安装。升级前先在“设置 → 备份与恢复”导出 `.shicibackup`；已装 2.8 的设备不要尝试覆盖较旧的 2.7，也不要为降级卸载而丢失学习数据。官网现有下载仍是旧的 2.6.1 通用包，最新两端包请以 GitHub Releases 为准。
+两个包共用应用 ID `com.shici.app`，不能并排安装。升级前先在“设置 → 备份与恢复”导出 `.shicibackup`，再用对应设备的包覆盖安装，不要卸载旧版。2.8.0 没有内置更新器；2.9.0 可在设置中连接 GitHub 检查同渠道更新，不上传学习记录。真机保数据升级仍待验证。官网仅提供 GitHub 发布页入口，不再直接提供 APK。
 
 ## 能做什么
 
