@@ -2,13 +2,13 @@ window.SHICI_SITE = {
   name: '拾词',
   tagline: '阅读不停，生词随手拾起',
   description: '拾词是一款面向安卓手机和平板的阅读查词工具：开启悬浮查词后，在屏幕上划一笔，抬起即可查询；把生词、笔记和复习进度留在本机。本站不提供账号、云同步或上传功能。',
-  internalVersion: '2.9.0',
-  internalVersionCode: 56,
+  internalVersion: '2.9.2',
+  internalVersionCode: 58,
   publicRelease: {
-    version: '2.9.0',
-    versionCode: 56,
-    phoneReleaseUrl: 'https://github.com/jiangnanqing188/shici-android/releases/tag/v2.9.0-phone-test',
-    tabletReleaseUrl: 'https://github.com/jiangnanqing188/shici-android/releases/tag/v2.9.0-tablet-test',
+    version: '2.9.2',
+    versionCode: 58,
+    phoneReleaseUrl: 'https://github.com/jiangnanqing188/shici-android/releases/tag/v2.9.2-phone-test',
+    tabletReleaseUrl: 'https://github.com/jiangnanqing188/shici-android/releases/tag/v2.9.2-tablet-test',
     channel: 'test'
   },
   repositoryUrl: null,
@@ -133,8 +133,8 @@ window.SHICI_SITE = {
       answer: '不能。原始离线词库未逐条核对，只查原词头、不猜词形；正式词典、发音和例句尚未实现。拾词适合阅读时快速查词和积累生词，权威释义请以正式词典为准。'
     },
     {
-      question: '怎么升级到 2.9.0？',
-      answer: '2.8.0 及更早版本没有应用内更新。请先备份，再从 GitHub 对应的手机或平板发布页下载 2.9.0，直接覆盖安装，不要卸载旧版。装上 2.9.0 后，可以在“设置 → 关于”检查后续更新；下载须手动点按，安装仍由系统确认。'
+      question: '怎么升级到 2.9.2？',
+      answer: '2.8.0 及更早版本没有应用内更新。请先备份。若已装 2.9.0 或更新版本，可在“设置 → 关于”检查更新。更早的版本请从 GitHub 对应的手机或平板发布页下载 2.9.2，直接覆盖安装，不要卸载旧版。下载须手动点按，安装仍由系统确认。'
     },
     {
       question: '安装或升级前需要备份吗？',

@@ -1,6 +1,12 @@
 # 拾词官网
 
-## 当前线上版本：2.9.0 / 56 双端公开测试版（2026-11-19）
+## 当前线上版本：2.9.2 / 58 双端公开测试版（2026-11-26）
+
+- 安卓手机和平板分别打开 `v2.9.2-phone-test`、`v2.9.2-tablet-test` 的 GitHub HTTPS 发布页；iPhone 和 iPad 仍无下载入口。平板首屏优先展示悬浮划词，手机保留独立布局。
+- 四页共享资源缓存标记为 `20261126a`。生产七个静态文件与候选逐字节核对通过；旧 HTTP APK 路径 GET、HEAD 均返回 404。仅替换四个 HTML 和 `content.js`，未更改 nginx 或 443 服务。
+- 先确认双端发布页、APK 附件状态和 `SHA256SUMS.txt` 后再切换官网。仍是测试版本；真机保数据升级以及大幅滚屏后的划词尚未验证。
+
+## 历史发布：2.9.0 / 56 双端公开测试版（2026-11-19）
 
 - 安卓手机和安卓平板分别打开 `v2.9.0-phone-test`、`v2.9.0-tablet-test` 的 GitHub HTTPS 发布页；不会直接下载。iPhone、iPad 暂未提供。本批分发使用不可调试的构建，并沿用公开 2.8.0 的签名证书，真机保数据升级和大幅滚屏后重划仍待验证。
 - 官网仍只提供 HTTP；请从已知 GitHub 仓库独立进入设备对应的发布页并核对 `SHA256SUMS.txt`。此前的 `/downloads/shici-2.6.1-52.apk` 已撤下公开路由，生产 GET、HEAD 和 Range 均实测返回 404，服务器原文件未删除。
@@ -252,10 +258,10 @@ systemctl daemon-reload
 
 ```js
 publicRelease: {
-  version: '2.9.0',
-  versionCode: 56,
-  phoneReleaseUrl: 'https://github.com/jiangnanqing188/shici-android/releases/tag/v2.9.0-phone-test',
-  tabletReleaseUrl: 'https://github.com/jiangnanqing188/shici-android/releases/tag/v2.9.0-tablet-test',
+  version: '2.9.2',
+  versionCode: 58,
+  phoneReleaseUrl: 'https://github.com/jiangnanqing188/shici-android/releases/tag/v2.9.2-phone-test',
+  tabletReleaseUrl: 'https://github.com/jiangnanqing188/shici-android/releases/tag/v2.9.2-tablet-test',
   channel: 'test'
 }
 ```
