@@ -256,8 +256,8 @@ object GuideAnimation {
             steps = listOf(
                 Step(
                     "capture_enable", Demo.CAPTURE, Kind.ENTRY,
-                    "① 在首页打开「悬浮查词」开关。",
-                    "第一步，演示在首页打开悬浮查词开关；演示不会申请权限。", 1300
+                    "① 在首屏点「开启悬浮划词」。",
+                    "第一步，演示点按开启悬浮划词；演示不会申请权限。", 1300
                 ),
                 Step(
                     "capture_tap", Demo.CAPTURE, Kind.TAP_BUBBLE,

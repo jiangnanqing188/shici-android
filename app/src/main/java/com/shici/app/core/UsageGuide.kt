@@ -10,7 +10,7 @@ package com.shici.app.core
  * downloads a model, deletes anything, restores a backup or writes `guide_seen_v1`.
  */
 object GuideRoutes {
-    /** Stable page ids; they intentionally equal the Activity's private MainPage enum names. */
+    /** Stable page ids; HOME is retained as an alias for the combined lookup page. */
     const val HOME = "HOME"
     const val LOOKUP = "LOOKUP"
     const val TRANSLATION = "TRANSLATION"
@@ -23,7 +23,7 @@ object GuideRoutes {
 
 /** A user-initiated page hand-off. [route] is a stable string, never a private enum instance. */
 enum class GuideAction(val route: String, val label: String) {
-    OPEN_HOME(GuideRoutes.HOME, "去首页"),
+    OPEN_HOME(GuideRoutes.HOME, "去划词与查词"),
     OPEN_LOOKUP(GuideRoutes.LOOKUP, "去查词"),
     OPEN_PERSONAL_ENTRY(GuideRoutes.PERSONAL_ENTRY, "去添加/补词"),
     OPEN_VOCABULARY(GuideRoutes.VOCABULARY, "去生词本"),
@@ -82,14 +82,14 @@ object UsageGuide {
     const val LONG_HELP_TITLE = "完整说明与边界"
     const val LONG_HELP_DESCRIPTION = "逐页文字说明、权限边界和危险操作细节；默认收起，需要时再展开。"
     const val NO_PERMISSION_FALLBACK =
-        "没有悬浮窗或屏幕捕获权限时，仍可打开「查词」页手动输入单词查询；手动查词不依赖投影。"
+        "没有悬浮窗或屏幕捕获权限时，仍可打开「划词与查词」页手动输入单词查询；手动查词不依赖投影。"
     const val NO_AUTOMATION =
         "引导只做说明，不会自动替你开启权限、发起查询、下载模型、删除记录或恢复备份。"
     const val BACK_LABEL = "返回"
 
     const val FIRST_RUN_TITLE = "第一次使用拾词？"
     const val FIRST_RUN_MESSAGE =
-        "建议先看首页如何开启悬浮查词，再看划词与手动查词、补词和生词本的区别、复习、PDF 与备份、" +
+        "建议先看如何开启悬浮划词，再看划词与手动查词、补词和生词本的区别、复习、PDF 与备份、" +
             "可选离线翻译。非阻塞，可随时跳过；以后还能重新打开。"
     const val FIRST_RUN_SKIP_LABEL = "跳过引导"
     const val FIRST_RUN_DONE_LABEL = "看完了，不再自动提示"
@@ -97,7 +97,7 @@ object UsageGuide {
     // One short sentence on the HOME card; the full steps stay in the guide page, which the card's
     // own "查看使用引导" action opens.
     const val HOME_CARD_MESSAGE =
-        "先从首页开启悬浮查词，再划词或手动查词；随时可看完整引导。"
+        "可用悬浮划词，也可直接手动查词；随时可看完整引导。"
     const val HOME_CARD_OPEN_LABEL = "查看使用引导"
     const val HOME_CARD_DISMISS_LABEL = "跳过，不再提示"
     const val SETTINGS_ENTRY_TITLE = "使用引导"
@@ -117,17 +117,17 @@ object UsageGuide {
     val topics: List<GuideTopic> = listOf(
         GuideTopic(
             id = "start_capture",
-            title = "1. 首页：开启悬浮查词（一次同意）",
-            summary = "开启入口只在首页；不点开关就不会申请权限，也不会开始查询。",
+            title = "1. 在「划词与查词」开启悬浮划词",
+            summary = "点「开启悬浮划词」才进入授权流程，不会自动申请权限。",
             steps = listOf(
-                "在首页找到「悬浮查词」开关并打开。",
-                "系统会按顺序请求悬浮窗、屏幕捕获（投影）和通知权限；按系统提示明确同意一次，本次开启期间生效；重新开启时系统可能再次询问。",
+                "打开「划词与查词」，点首屏的「开启悬浮划词」。",
+                "按提示确认悬浮窗、通知和屏幕捕获等权限；重新开启时系统可能再次询问。",
                 "拒绝、取消或中途返回都会让查词保持关闭，不会偷偷重试。",
                 "开启后点悬浮「词」，在原页面沿一个完整英文单词划一笔；松手（抬笔）即在本机识别并查询。",
-                "划词时原页面始终显示，只有透明笔迹层在这次取词期间接收手势；关闭首页开关或通知里的「停止」会释放捕获和浮层。"
+                "划词时原页面始终显示，只有透明笔迹层在这次取词期间接收手势；点页面上的「关闭悬浮划词」或通知里的「停止」会释放捕获和浮层。"
             ),
             notes = listOf(
-                "关闭开关不会撤销系统悬浮窗权限；需要撤销时请到系统设置操作。",
+                "关闭悬浮划词不会撤销系统悬浮窗权限；需要撤销时请到系统设置操作。",
                 "屏幕画面只在内存中短暂读取并本机识别，不写截图文件、不上传。"
             ),
             actions = listOf(GuideAction.OPEN_HOME, GuideAction.OPEN_SETTINGS)
@@ -139,11 +139,11 @@ object UsageGuide {
             steps = listOf(
                 "点悬浮「词」→ 沿一个完整英文单词划一笔 → 松手自动查询；轻点、多指或取消不查询。",
                 "一次划过多个词时，先选择要查的一个词；多词原文卡还可选择「翻译整句」，前提是可选离线翻译组件已经就绪。",
-                "没有悬浮窗或屏幕捕获权限、或不想开启时：打开「查词」页输入单词，点「查询」或键盘搜索键提交。",
+                "没有悬浮窗或屏幕捕获权限、或不想开启时：打开「划词与查词」页输入单词，点「查询」或键盘搜索键提交。",
                 "只有真实查询成功才形成本地记录；未识别、失败或词库未命中不会生成释义，也不会收录。"
             ),
             notes = listOf("手动查词是权限被拒或某些应用无法识别时的正式回退路径，不是降级开关。"),
-            actions = listOf(GuideAction.OPEN_LOOKUP, GuideAction.OPEN_HOME)
+            actions = listOf(GuideAction.OPEN_LOOKUP)
         ),
         GuideTopic(
             id = "lookup_supplement_vocabulary",
@@ -246,22 +246,21 @@ object UsageGuide {
                 "看结果卡提示：采集异常、OCR 空结果、黑帧或页面变化都会明确说明“本次未查询、未收录”，不会复用旧截图。",
                 "点「重试取词（重新划词）」，等页面稳定后沿一个完整英文单词重新划；锁屏或禁止截图的页面无法取词。",
                 "换个页面、滚动到文字清晰处，或避开动画和弹窗后再试。",
-                "仍识别不到时，直接去「查词」页手动输入单词查询；手动查词不依赖屏幕捕获。",
+                "仍识别不到时，直接去「划词与查词」页手动输入单词查询；手动查词不依赖屏幕捕获。",
                 "多词时先选择要查的单个词；不确定就把整句留给可选翻译，不要把一个短语当成一个单词提交。"
             ),
             notes = listOf(
                 "不承诺所有第三方应用都能识别，也不承诺黑帧或安全页面会被修复；这些情况请走手动查词。",
                 "重试只重新取词，不会自动删除或改写已有记录。"
             ),
-            actions = listOf(GuideAction.OPEN_LOOKUP, GuideAction.OPEN_HOME)
+            actions = listOf(GuideAction.OPEN_LOOKUP)
         ),
         GuideTopic(
             id = "page_roles",
             title = "10. 每一页负责什么",
             summary = "按职责使用页面，避免把补词、查询、收藏和备份混在一起。",
             steps = listOf(
-                "首页：唯一开启/关闭悬浮查词的入口；也是新手卡和主要功能入口。",
-                "查词：手动输入与真实查询；失败时可重试或改用手动输入。",
+                "划词与查词：上方开启或关闭悬浮划词，下方直接手动查词。",
                 "添加/补词：只维护本机个人词性/释义，不收录、不计查询次数、不进入复习。",
                 "生词本：查看、搜索、收藏、按明确范围移除，以及导出 PDF；不在这里新增词义。",
                 "复习：统一队列、四选一作答与对错反馈；统计：本机查询与复习进度聚合。",

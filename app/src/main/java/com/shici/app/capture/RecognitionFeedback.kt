@@ -25,7 +25,7 @@ enum class RecognitionFailure {
     PAGE_CHANGED,
     /** The local OCR task threw or reported a failure. */
     OCR_UNAVAILABLE,
-    /** OCR completed, but no recognized word intersected the stroke area. */
+    /** OCR completed, but no selectable text was found for the stroke. */
     OCR_EMPTY,
     /** OCR produced text, but none of it is a queryable English word. */
     NO_ENGLISH_WORD
@@ -90,7 +90,7 @@ object RecognitionFeedback {
         )
         RecognitionFailure.OCR_EMPTY -> RecognitionNotice(
             failure,
-            "没有识别到笔迹附近的文字（OCR 结果为空，不是词库未命中）。本次未查询、未收录。",
+            "没有选中可用文字（不是词库未命中）。本次未查询、未收录。",
             "请沿完整英文单词重划一笔；$MANUAL_INPUT_HINT"
         )
         RecognitionFailure.NO_ENGLISH_WORD -> RecognitionNotice(

@@ -5,6 +5,7 @@ import android.text.Editable
 import android.text.TextWatcher
 import android.view.KeyEvent
 import android.view.View
+import android.view.ViewGroup
 import android.view.inputmethod.EditorInfo
 import android.widget.EditText
 import android.widget.LinearLayout
@@ -21,6 +22,9 @@ import android.widget.ScrollView
  * [onTextChanged] mirrors ordinary edits so the Activity can keep its draft fields in sync without
  * re-rendering this page. Nothing is submitted while constructing or restoring the draft.
  *
+ * @param capturePanel Activity-owned capture actions, shown first without taking over authorization.
+ * @param inlineActions whether the manual controls fit on one row at the current font scale.
+ * @param guideReminder optional existing guide entry, after both lookup actions.
  * @param initialText restored draft text (may be empty).
  * @param selectionStart restored selection start; negative or reversed values are clamped.
  * @param selectionEnd restored selection end; negative or reversed values are clamped.
@@ -30,6 +34,9 @@ import android.widget.ScrollView
  */
 class LookupScreen(
     context: Context,
+    capturePanel: View,
+    inlineActions: Boolean,
+    guideReminder: View?,
     initialText: String,
     selectionStart: Int,
     selectionEnd: Int,
@@ -54,17 +61,20 @@ class LookupScreen(
 
     init {
         val content = context.column()
-        content.addView(context.text("查词", 28f, bold = true))
-        content.space(8)
+        content.addView(context.text("划词与查词", 28f, bold = true))
+        content.space(12)
+        content.addView(capturePanel, LinearLayout.LayoutParams(-1, -2))
+        content.space(12)
 
-        // Order is deliberate: title, input, the two main actions, then only the two short boundary
-        // lines a user needs before acting. Everything explanatory is folded below.
+        // Manual lookup is immediately below capture. Explanatory and maintenance controls follow.
         val card = context.column().apply {
             setPadding(context.dp(20), context.dp(20), context.dp(20), context.dp(20))
             background = context.shape(Paper.surface, border = true)
         }
 
         practiceArea = card
+        card.addView(context.text("手动查词", 20f, bold = true))
+        card.space(4)
 
         input = context.inputField("例如 evidence、quantum", true)
         input.isSaveEnabled = false // The Activity owns exact draft persistence, not view state.
@@ -107,9 +117,15 @@ class LookupScreen(
             contentDescription = "清空输入，不查询"
         }
         editorRow.addView(clear, LinearLayout.LayoutParams(-2, -2).apply { marginStart = context.dp(6) })
+        val query = context.button("查询") { submit() }
+        if (inlineActions) {
+            editorRow.addView(query, LinearLayout.LayoutParams(-2, -2).apply { marginStart = context.dp(6) })
+        }
         card.addView(editorRow, LinearLayout.LayoutParams(-1, -2))
-        card.space(8)
-        card.addView(context.button("查询", true) { submit() }, LinearLayout.LayoutParams(-1, -2))
+        if (!inlineActions) {
+            card.space(8)
+            card.addView(query, LinearLayout.LayoutParams(-1, -2))
+        }
         card.space(4)
         // Kept visible next to the primary action: a query is a real recording action.
         card.addView(context.text("查询会收录到生词本。", 15f, Paper.secondary))
@@ -117,19 +133,15 @@ class LookupScreen(
         content.addView(card)
         content.space(12)
 
-        val supplement = context.column().apply {
-            setPadding(context.dp(20), context.dp(20), context.dp(20), context.dp(20))
-            background = context.shape(Paper.surface, border = true)
+        guideReminder?.let {
+            content.addView(it, LinearLayout.LayoutParams(-1, -2))
+            content.space(12)
         }
-        supplement.addView(context.text("本机词义", 18f, bold = true))
-        supplement.addView(context.button("添加/补词") { onOpenPersonalEntry() })
-        supplement.addView(context.text("仅保存词义，不加入生词本。", 15f, Paper.secondary))
-        content.addView(supplement)
-        content.space(12)
 
         // Full unknown-word / inflection / provenance / recording rules stay available but folded.
         content.addView(
-            context.helpDisclosure("查词说明") {
+            context.helpDisclosure("查词说明与补词") {
+                addView(context.button("添加/补词") { onOpenPersonalEntry() })
                 addView(
                     context.text(
                         "未知词或未收录词形不生成释义，也不新增记录。词形按本机词库已有词条解释；没有对应词条时按未知词处理。",
@@ -163,6 +175,9 @@ class LookupScreen(
 
         view = ScrollView(context).apply {
             isFillViewport = true
+            // Cold start must show the capture action rather than scroll to an autofocused editor.
+            isFocusableInTouchMode = true
+            descendantFocusability = ViewGroup.FOCUS_BEFORE_DESCENDANTS
             addView(content)
         }
     }

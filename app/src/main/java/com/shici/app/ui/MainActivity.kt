@@ -26,6 +26,7 @@ import android.text.TextWatcher
 import android.view.*
 import android.view.accessibility.AccessibilityManager
 import android.widget.*
+import androidx.core.view.doOnPreDraw
 import com.shici.app.ShiciApplication
 import com.shici.app.BuildConfig
 import com.shici.app.R
@@ -84,15 +85,11 @@ class MainActivity : Activity() {
 
     /**
      * Stable page identity. Navigation, selection, restoration and late-result delivery all compare
-     * this enum; display order is never used as the identity. [legacyTab] is only the historical
-     * instance-state index (0 home, 1 vocabulary, 2 statistics, 3 settings, 4 study), so an old
-     * "tab=3" still restores settings and can never turn into the new lookup page.
+     * this enum; display order is never used as the identity. [legacyTab] preserves the historical
+     * instance-state mapping, with old home (0) now opening the combined lookup page.
      */
     private enum class MainPage(val label: String, val legacyTab: Int) {
-        HOME("首页", 0),
-        LOOKUP("查词", -1),
-        // Stable identity only: the historical tab indices below are untouched, and LOOKUP,
-        // TRANSLATION and PERSONAL_ENTRY never borrow a legacy index.
+        LOOKUP("划词与查词", 0),
         // The navigation label names the optional component explicitly; the stable id stays
         // TRANSLATION so saved state, tests and legacy entry points keep their identity.
         TRANSLATION("离线 AI 翻译", -1),
@@ -111,18 +108,17 @@ class MainActivity : Activity() {
             // name/legacyTab, so only display order changes; settings remains the separate fixed
             // entry supplied by the navigation component.
             val mainPages = listOf(
-                HOME, LOOKUP, VOCABULARY, STUDY, PERSONAL_ENTRY, TRANSLATION, STATISTICS, GUIDE
+                LOOKUP, VOCABULARY, STUDY, PERSONAL_ENTRY, TRANSLATION, STATISTICS, GUIDE
             )
             fun fromLegacyTab(tab: Int): MainPage = when (tab) {
-                0 -> HOME
                 1 -> VOCABULARY
                 2 -> STATISTICS
                 3 -> SETTINGS
                 4 -> STUDY
-                else -> HOME
+                else -> LOOKUP // Includes the old home tab (0).
             }
             fun fromStableName(name: String?): MainPage? =
-                name?.let { runCatching { valueOf(it) }.getOrNull() }
+                if (name == "HOME") LOOKUP else name?.let { runCatching { valueOf(it) }.getOrNull() }
         }
     }
 
@@ -140,7 +136,7 @@ class MainActivity : Activity() {
     // Dismissal is per version for this Activity; the settings entry is never removed.
     private var dismissedUpdateVersion = -1
     private var pendingUpdateScroll = false
-    @Volatile private var page = MainPage.HOME
+    @Volatile private var page = MainPage.LOOKUP
     // True while this Activity is started. Favorite writes are admitted on the worker thread and use
     // this plus [interactionEpoch] to refuse a mutation queued by a page that has since stopped or
     // navigated away. A background snapshot refresh never changes either value.
@@ -182,7 +178,7 @@ class MainActivity : Activity() {
     // The single live animated guide page. Only one may exist: a rebuild/re-entry pauses and closes
     // the old one before a new screen is created, so no detached instance keeps animating.
     private var guideScreen: UsageGuideScreen? = null
-    private enum class PracticeStep { LOOKUP, INPUT, WAIT_RESULT, CLOSE_RESULT, VOCABULARY, STUDY, COMPLETE, CAPTURE }
+    private enum class PracticeStep { INPUT, WAIT_RESULT, CLOSE_RESULT, VOCABULARY, STUDY, COMPLETE, CAPTURE }
     private var practiceStep: PracticeStep? = null
     private var practiceCoach: PracticeCoach? = null
     private var practiceGeneration = 0L
@@ -302,9 +298,8 @@ class MainActivity : Activity() {
         }
         main.post { refresh(version) }
     }
-    private var floatingSwitch: Switch? = null
+    private var floatingAction: Button? = null
     private var floatingText: TextView? = null
-    private var syncSwitch = false
     private var searchList: LinearLayout? = null
     private var wordListHeader: TextView? = null
     private var vocabularyCountView: TextView? = null
@@ -395,10 +390,20 @@ class MainActivity : Activity() {
     private val splitContent get() = wide && contentWidthDp >= 660 * resources.configuration.fontScale
     private fun inlineAt(widthDp: Int) = widthDp >= 440 * resources.configuration.fontScale
     private val statusListener: (CaptureState) -> Unit = { state ->
-        syncSwitch = true
-        floatingSwitch?.isEnabled = state.phase != CapturePhase.STOPPING
-        floatingSwitch?.isChecked = state.phase == CapturePhase.ACTIVE || state.phase == CapturePhase.PREPARING
-        syncSwitch = false
+        floatingAction?.apply {
+            val canStart = state.phase == CapturePhase.CLOSED || state.phase == CapturePhase.ERROR
+            isEnabled = state.phase != CapturePhase.STOPPING
+            text = when (state.phase) {
+                CapturePhase.CLOSED -> "开启悬浮划词"
+                CapturePhase.ERROR -> "重新开启悬浮划词"
+                CapturePhase.PREPARING -> "取消开启"
+                CapturePhase.ACTIVE -> "关闭悬浮划词"
+                CapturePhase.STOPPING -> "正在关闭悬浮划词"
+            }
+            background = shape(if (canStart) Paper.green else Paper.surface, 8, border = !canStart)
+            setTextColor(if (canStart) android.graphics.Color.WHITE else Paper.green)
+            alpha = if (isEnabled) 1f else 0.6f
+        }
         floatingText?.apply {
             text = state.message
             setTextColor(if (state.phase == CapturePhase.ERROR) Paper.error else Paper.secondary)
@@ -419,7 +424,7 @@ class MainActivity : Activity() {
         // New stable key first; the historical "tab" indices remain readable, with tab=3 -> settings.
         page = MainPage.fromStableName(savedInstanceState?.getString("page"))
             ?: savedInstanceState?.let { if (it.containsKey("tab")) MainPage.fromLegacyTab(it.getInt("tab")) else null }
-            ?: MainPage.HOME
+            ?: MainPage.LOOKUP
         currentTab = page.legacyTab
         val savedDraftOwner = savedInstanceState?.getString("draft_owner")
         val savedDraftId = savedInstanceState?.getString("draft_snapshot")
@@ -660,8 +665,8 @@ class MainActivity : Activity() {
         if (practiceStep != null) { endPractice(false); return }
         // Back from any functional page returns home and closes that page's editor generation;
         // pressing back on home keeps the platform exit behavior.
-        if (page != MainPage.HOME) {
-            selectPage(MainPage.HOME)
+        if (page != MainPage.LOOKUP) {
+            selectPage(MainPage.LOOKUP)
             return
         }
         @Suppress("DEPRECATION")
@@ -782,7 +787,6 @@ class MainActivity : Activity() {
     private fun selectPage(target: MainPage) {
         if (target != page) {
             practiceStep = when {
-                practiceStep == PracticeStep.LOOKUP && target == MainPage.LOOKUP -> PracticeStep.INPUT
                 practiceStep == PracticeStep.VOCABULARY && target == MainPage.VOCABULARY -> PracticeStep.STUDY
                 practiceStep == PracticeStep.STUDY && target == MainPage.STUDY -> PracticeStep.COMPLETE
                 else -> null
@@ -906,15 +910,15 @@ class MainActivity : Activity() {
         closePracticeCoach()
         // Compatibility bridge for the historical reflection host and any old caller that still
         // writes the five legacy indices. Product navigation always keeps [currentTab] equal to
-        // [page]'s legacy mirror, so this cannot override an enum-selected page (LOOKUP and
-        // PERSONAL_ENTRY use -1). It is not the page identity.
+        // [page]'s legacy mirror, so this cannot override an enum-selected page. It is not the page
+        // identity.
         if (currentTab != page.legacyTab && currentTab in 0..4) page = MainPage.fromLegacyTab(currentTab)
         if (currentTab != page.legacyTab) currentTab = page.legacyTab
         // A rebuild never leaves an old translator alive behind detached views. Except for the
         // translation page itself (rebuilt immediately below), this is the page-leave path.
         if (translationScreen != null) { captureTranslationDraft(); closeTranslationOwner() }
         if (hasLearningSnapshot && restoredVocabularyScroll == null) restoredVocabularyScroll = vocabularyScroll?.scrollY
-        floatingSwitch = null; floatingText = null; stopCaptureButton = null; searchList = null; detailPanel = null
+        floatingAction = null; floatingText = null; stopCaptureButton = null; searchList = null; detailPanel = null
         wordListHeader = null; vocabularyCountView = null
         exportButton = null; inlineDetail = null
         dictionaryStatusView = null; dictionaryDetailView = null
@@ -929,7 +933,6 @@ class MainActivity : Activity() {
         body.removeAllViews()
         renderNavState()
         when (page) {
-            MainPage.HOME -> home()
             MainPage.LOOKUP -> lookupPage()
             MainPage.TRANSLATION -> translationPage()
             MainPage.VOCABULARY -> vocabulary()
@@ -950,68 +953,30 @@ class MainActivity : Activity() {
     private fun panel(): LinearLayout = column().apply {
         setPadding(dp(24), dp(24), dp(24), dp(24)); background = shape(Paper.surface, border = true)
     }
-    private fun home() {
-        val content = scrolled()
-        content.addView(text("拾词 · 阅读工作台", 26f, Paper.ink, true))
-        content.addView(text("查词、积累、复习，都留在本机。", 15f, Paper.secondary)); content.space(12)
-        content.addView(button("输入单词查词", true) { selectPage(MainPage.LOOKUP) }, LinearLayout.LayoutParams(-1, -2))
-        content.space(12)
-        // Non-blocking first-use recommendation. It never opens by itself, never steals focus and
-        // only writes the independent guide preference when the user taps "跳过，不再提示".
-        if (!guideSeen()) {
-            content.addView(UsageGuideEntries.homeCard(
-                this,
-                onOpenGuide = { selectPage(MainPage.GUIDE) },
-                onDismiss = { markGuideSeen(); render() }
-            ))
-            content.space(16)
-        }
-        val session = panel()
-        val heading = row().apply { gravity = Gravity.CENTER_VERTICAL }
-        heading.addView(text("悬浮查词", 22f, bold = true), LinearLayout.LayoutParams(0, -2, 1f))
-        floatingSwitch = Switch(this).apply {
-            contentDescription = "开启或关闭悬浮查词"; minHeight = dp(48)
-            setOnCheckedChangeListener { _, checked ->
-                if (!syncSwitch) {
-                    if (checked) beginCapture() else stopCapture()
-                }
+    /** The capture service remains the owner of its state and permission flow. */
+    private fun floatingLookupPanel(): View = panel().apply {
+        background = shape(Paper.lightGreen, border = true)
+        addView(text("悬浮划词", 22f, bold = true))
+        val status = text(CaptureStatus.state.message, 15f, Paper.secondary)
+        status.accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
+        floatingText = status
+        addView(status)
+        addView(text("回到阅读或做题页面，点悬浮「词」，划一笔，抬笔即查。", 16f))
+        space(8)
+        val action = button("开启悬浮划词", true) {}
+        action.setOnClickListener { clicked ->
+            if (!this@MainActivity.foreground || page != MainPage.LOOKUP || floatingAction !== clicked ||
+                !clicked.isAttachedToWindow) return@setOnClickListener
+            when (CaptureStatus.state.phase) {
+                CapturePhase.CLOSED, CapturePhase.ERROR -> beginCapture()
+                CapturePhase.PREPARING, CapturePhase.ACTIVE -> stopCapture()
+                CapturePhase.STOPPING -> Unit
             }
         }
-        heading.addView(floatingSwitch)
-        session.addView(heading)
-        floatingText = text(CaptureStatus.state.message, 16f, Paper.secondary)
-        session.addView(floatingText)
-        // One visible sentence on the first screen; the extra wording stays available on demand.
-        session.addView(text("开启后在题目页划一笔即可查词；也可到「查词」页手动输入。", 16f, Paper.secondary))
-        session.addView(helpDisclosure("悬浮查词说明") {
-            addView(text("开启后，点悬浮「词」，直接在题目页面上划一笔查词。", 15f, Paper.secondary))
-            addView(text("不需要悬浮权限时，也可以到「查词」页手动输入。", 15f, Paper.secondary))
-        })
-        content.addView(session); content.space(16)
-        content.addView(text("学习与工具", 20f, bold = true)); content.space(8)
-        // Small pairs are shortcuts only; every destination keeps its original route and owner.
-        content.addView(pair(
-            entryCard("生词本", "释义、笔记与收藏") { selectPage(MainPage.VOCABULARY) },
-            entryCard("复习", "四选一，继续今日计划") { selectPage(MainPage.STUDY) },
-            inlineAt(contentWidthDp), 12))
-        content.space(10)
-        content.addView(pair(
-            entryCard("添加/补词", "只维护本机个人词义") { selectPage(MainPage.PERSONAL_ENTRY) },
-            entryCard("离线翻译（可选）", "确认后才下载模型") { selectPage(MainPage.TRANSLATION) },
-            inlineAt(contentWidthDp), 12))
-        content.space(10)
-        content.addView(entryCard("统计", "查看真实查询与复习进度") { selectPage(MainPage.STATISTICS) })
-        content.space(12)
-        content.addView(text("打开悬浮查词 → 点「词」→ 划一笔 → 抬笔即查", 14f, Paper.secondary))
+        floatingAction = action
+        addView(action, LinearLayout.LayoutParams(if (inlineAt(contentWidthDp)) -2 else -1, -2))
+        addView(text("屏幕捕获由你主动开启，并按系统提示确认。", 14f, Paper.secondary))
         statusListener(CaptureStatus.state)
-    }
-    private fun entryCard(title: String, description: String, action: () -> Unit): View = column().apply {
-        setPadding(dp(16), dp(10), dp(16), dp(10)); background = shape(Paper.surface, border = true)
-        addView(text(title, 18f, bold = true))
-        addView(text(description, 15f, Paper.secondary))
-        isClickable = true; isFocusable = true; minimumHeight = dp(64)
-        contentDescription = "打开$title"
-        setOnClickListener { action() }
     }
 
     // ---- Repeatable usage guide ----------------------------------------------------------------
@@ -1043,8 +1008,8 @@ class MainActivity : Activity() {
         content.space(16)
         content.addView(button("从查词开始", true) {
             endPractice(false)
-            selectPage(MainPage.HOME)
-            practiceGeneration++; practiceStep = PracticeStep.LOOKUP
+            selectPage(MainPage.LOOKUP)
+            practiceGeneration++; practiceStep = PracticeStep.INPUT
             updatePracticeCoach()
         }, LinearLayout.LayoutParams(-1, -2))
         content.addView(text("输入与查询 → 看真实词义 → 生词本 → 复习。查询成功会按正常规则收录。", 15f, Paper.secondary))
@@ -1055,7 +1020,7 @@ class MainActivity : Activity() {
                 startService(Intent(this, CaptureService::class.java).setAction(CaptureService.ACTION_PRACTICE))
                 toast("切到你的阅读页，跟随真实悬浮条练习")
             } else {
-                selectPage(MainPage.HOME)
+                selectPage(MainPage.LOOKUP)
                 practiceGeneration++; practiceStep = PracticeStep.CAPTURE
                 pendingCapturePractice = true
                 updatePracticeCoach()
@@ -1063,7 +1028,7 @@ class MainActivity : Activity() {
         }, LinearLayout.LayoutParams(-1, -2))
         content.addView(text("使用当前页面和真实词卡。系统授权由你确认；不会自动截图、代点、查询或下载模型。", 15f, Paper.secondary))
         content.space(16)
-        content.addView(button("返回首页") { selectPage(MainPage.HOME) })
+        content.addView(button("返回划词与查词") { selectPage(MainPage.LOOKUP) })
     }
 
     private fun closePracticeCoach() { practiceCoach?.close(); practiceCoach = null }
@@ -1076,7 +1041,6 @@ class MainActivity : Activity() {
 
     private fun nextPracticeStep() {
         when (practiceStep) {
-            PracticeStep.LOOKUP -> selectPage(MainPage.LOOKUP)
             PracticeStep.INPUT -> {
                 // Explicitly browsing the next real page is not a successful query or collection.
                 practiceStep = PracticeStep.VOCABULARY
@@ -1102,24 +1066,35 @@ class MainActivity : Activity() {
         val step = practiceStep ?: return
         if (step == PracticeStep.WAIT_RESULT || step == PracticeStep.CLOSE_RESULT) return
         val target: View? = when (step) {
-            PracticeStep.LOOKUP -> navigation.practiceTarget(MainPage.LOOKUP.name)
             PracticeStep.INPUT -> lookupPracticeArea
             PracticeStep.VOCABULARY -> navigation.practiceTarget(MainPage.VOCABULARY.name)
             PracticeStep.STUDY -> navigation.practiceTarget(MainPage.STUDY.name)
-            PracticeStep.CAPTURE -> floatingSwitch
+            PracticeStep.CAPTURE -> floatingAction
             else -> null
         }
         if (target == null && step != PracticeStep.COMPLETE) { endPractice(false); return }
+        val owner = practiceGeneration
+        if (target != null && (step == PracticeStep.INPUT || step == PracticeStep.CAPTURE)) {
+            // On a short or zoomed screen the manual panel may begin below the capture panel.
+            // Reveal the real anchor before the coach checks its visible bounds.
+            if (!target.isLaidOut || target.isLayoutRequested) {
+                target.doOnPreDraw {
+                    if (owner == practiceGeneration && step == practiceStep && target.isAttachedToWindow) {
+                        updatePracticeCoach()
+                    }
+                }
+                return
+            }
+            target.requestRectangleOnScreen(android.graphics.Rect(0, 0, target.width, target.height), true)
+        }
         val message = when (step) {
-            PracticeStep.LOOKUP -> "先点这里的「查词」。"
             PracticeStep.INPUT -> "输入单词并查询；也可点「下一步」先认识生词本，不会自动查询或收录。"
             PracticeStep.VOCABULARY -> "词义已显示。是否收录以词卡状态为准；点「生词本」查看实际词条。"
             PracticeStep.STUDY -> "这里是你的生词本。点「复习」，查看今天的真实计划。"
             PracticeStep.COMPLETE -> "已到达真实复习页面。每题四个答案，只有你实际作答才产生反馈。"
-            PracticeStep.CAPTURE -> "打开这个真实开关。授权说明和系统确认都由你操作；返回后切到自己的题页。"
+            PracticeStep.CAPTURE -> "点「开启悬浮划词」。授权说明和系统确认都由你操作；返回后切到自己的题页。"
             else -> return
         }
-        val owner = practiceGeneration
         practiceCoach = PracticeCoach(window.decorView as ViewGroup, target, message,
             onSkip = { if (owner == practiceGeneration) endPractice(true) },
             onFinish = if (step == PracticeStep.COMPLETE) ({ if (owner == practiceGeneration) endPractice(true) }) else null,
@@ -1137,9 +1112,6 @@ class MainActivity : Activity() {
     private fun resumePracticeInput(owner: PracticeLookupOwner?, token: Long) {
         if (!isWaitingForPracticeLookup(owner, token) || activeDialog?.isShowing == true) return
         practiceStep = PracticeStep.INPUT
-        lookupPracticeArea?.let { area ->
-            area.requestRectangleOnScreen(android.graphics.Rect(0, 0, area.width, dp(48)), true)
-        }
         updatePracticeCoach()
     }
 
@@ -1658,6 +1630,13 @@ class MainActivity : Activity() {
         lateinit var screen: LookupScreen
         screen = LookupScreen(
             context = this,
+            capturePanel = floatingLookupPanel(),
+            inlineActions = inlineAt(contentWidthDp),
+            guideReminder = if (guideSeen()) null else UsageGuideEntries.homeCard(
+                this,
+                onOpenGuide = { selectPage(MainPage.GUIDE) },
+                onDismiss = { markGuideSeen(); captureLookupDraft(); render() }
+            ),
             initialText = lookupQuery,
             selectionStart = lookupSelectionStart,
             selectionEnd = lookupSelectionEnd,
@@ -1714,7 +1693,7 @@ class MainActivity : Activity() {
             initialSelectionStart = translationSelectionStart,
             initialSelectionEnd = translationSelectionEnd
         )
-        screen.onCloseRequested = { selectPage(MainPage.HOME) }
+        screen.onCloseRequested = { selectPage(MainPage.LOOKUP) }
         translationScreen = screen
         body.addView(screen.view, LinearLayout.LayoutParams(-1, -1))
     }
@@ -3382,7 +3361,7 @@ class MainActivity : Activity() {
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == NOTIFICATION_PERMISSION && consentIsCurrent()) {
-            if (grantResults.firstOrNull() != PackageManager.PERMISSION_GRANTED) toast("通知未允许；仍可在首页开关或系统前台服务入口停止")
+            if (grantResults.firstOrNull() != PackageManager.PERMISSION_GRANTED) toast("通知未允许；仍可在「划词与查词」页或系统前台服务入口停止")
             requestCapture()
         }
     }

@@ -96,7 +96,8 @@ class MainNavigation(
         setPadding(context.dp(4), context.dp(6), context.dp(4), context.dp(6))
         setBackgroundColor(Paper.background)
         primaryIds.mapNotNull { id -> items.firstOrNull { it.id == id } }.forEach {
-            addView(navButton(it), LinearLayout.LayoutParams(0, -2, 1f))
+            val compactItem = if (it.id == "LOOKUP") it.copy(label = "划词") else it
+            addView(navButton(compactItem), LinearLayout.LayoutParams(0, -2, 1f))
         }
         // Exactly four fixed entries. Every other original route, including settings, is here.
         addView(moreButton(secondary), LinearLayout.LayoutParams(0, -2, 1f))
