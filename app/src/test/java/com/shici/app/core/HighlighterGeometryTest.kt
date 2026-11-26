@@ -48,6 +48,98 @@ class HighlighterGeometryTest {
     @Test fun partialWordHitReturnsEntireElementWithoutNormalization() {
         assertEquals("Evidence,", text(selection(stroke(42f, 30f, 49f, 30f)), word("Evidence,", 20f, 20f, 100f, 40f)))
     }
+    @Test fun shortWordCenterlineExcludesBrushContactWithBothTightNeighbors() {
+        val left = word("for", 20f, 36f, 42f, 56f)
+        val target = word("it", 43f, 20f, 55f, 40f)
+        val right = word("is", 56f, 36f, 68f, 56f)
+        val result = resolve(selection(stroke(29f, 31f, 63f, 31f)), left, target, right)
+        assertEquals(SelectionResolutionMode.EXACT, result.mode)
+        assertEquals("it", HighlighterGeometry.selectedText(result.selected))
+        assertSame(target, result.selected.single())
+    }
+    @Test fun centerlineNearBottomOfWordDoesNotIncludeTheNextLine() {
+        val upper = word("study", 20f, 20f, 80f, 40f)
+        val lower = word("below", 20f, 41f, 80f, 61f, 1)
+        assertEquals(listOf(upper), resolve(selection(stroke(24f, 37f, 55f, 37f)), upper, lower).selected)
+    }
+    @Test fun centerlineAcrossTightWordsStillSelectsAllInReadingOrder() {
+        val left = word("in", 20f, 20f, 38f, 40f)
+        val middle = word("a", 39f, 20f, 46f, 40f)
+        val right = word("row", 47f, 20f, 68f, 40f)
+        val result = resolve(selection(stroke(69f, 30f, 22f, 30f)), right, middle, left)
+        assertEquals(SelectionResolutionMode.EXACT, result.mode)
+        assertEquals(listOf(left, middle, right), result.selected)
+    }
+    @Test fun inkInTightHorizontalGapDoesNotGuessEitherWord() {
+        val left = word("on", 20f, 20f, 38f, 40f)
+        val right = word("it", 40f, 20f, 58f, 40f)
+        val result = resolve(selection(stroke(39f, 23f, 39f, 38f)), left, right)
+        assertEquals(SelectionResolutionMode.NONE, result.mode)
+        assertTrue(result.selected.isEmpty())
+    }
+    @Test fun gapsBetweenTwoRowsRequireChoiceEvenWhenOneRowIsSlightlyCloser() {
+        val upper = word("study", 20f, 20f, 80f, 40f)
+        val lower = word("below", 20f, 48f, 80f, 68f, 1)
+        val result = resolve(selection(stroke(26f, 42f, 73f, 42f)), upper, lower)
+        assertEquals(SelectionResolutionMode.AMBIGUOUS, result.mode)
+        assertTrue(result.selected.isEmpty())
+        assertEquals(listOf(upper, lower), result.candidates)
+    }
+    @Test fun passingAboveASingleWordOffersAChoiceWithoutAutoLookup() {
+        val target = word("study", 20f, 20f, 80f, 40f)
+        val result = resolve(selection(stroke(26f, 17f, 73f, 17f)), target)
+        assertEquals(SelectionResolutionMode.AMBIGUOUS, result.mode)
+        assertTrue(result.selected.isEmpty())
+        assertEquals(listOf(target), result.candidates)
+    }
+    @Test fun aDenseUnderlineRecoversOneOriginalWordEvenIfOcrReportsALine() {
+        val target = word("study", 20f, 20f, 80f, 40f)
+        val line = word("---", 22f, 41f, 76f, 46f, 1)
+        val points = (24..72 step 2).map { HighlighterPoint(it.toFloat(), 44f) }
+        val result = resolve(selection(HighlighterStroke(points)), target, line)
+        assertEquals(SelectionResolutionMode.RECOVERED, result.mode)
+        assertSame(target, result.selected.single())
+    }
+    @Test fun unrelatedLineDoesNotWidenUnderlineRecovery() {
+        val target = word("study", 20f, 20f, 80f, 40f)
+        val unrelated = word("elsewhere", 200f, 44f, 260f, 64f, 1)
+        assertSame(target, resolve(selection(stroke(24f, 44f, 72f, 44f)), target, unrelated).selected.single())
+        assertEquals(SelectionResolutionMode.NONE,
+            resolve(selection(stroke(24f, 61f, 72f, 61f)), target, unrelated).mode)
+    }
+    @Test fun repeatedOrDisconnectedInkCannotFillAnUnpaintedUnderline() {
+        val target = word("study", 20f, 20f, 80f, 40f)
+        val retraced = stroke(24f, 44f, 31f, 44f, 24f, 44f, 31f, 44f)
+        val otherEnd = stroke(66f, 44f, 73f, 44f)
+        assertEquals(SelectionResolutionMode.NONE, resolve(selection(retraced, otherEnd), target).mode)
+    }
+    @Test fun cropRestoredDashAndUnderlineOnlyResultsAreNotSelectedText() {
+        val selected = selection(stroke(84f, 100f, 128f, 100f))
+        val inCrop = FloatBox(84f - selected.crop.left, 96f - selected.crop.top,
+            126f - selected.crop.left, 104f - selected.crop.top)
+        val box = HighlighterGeometry.restoreBox(inCrop, selected.crop)
+        for (text in listOf("-", "---", "___", "_ _ _", "—–", "−−", "──")) {
+            val result = resolve(selected, HighlighterWord(text, box, 0, box))
+            assertEquals(text, SelectionResolutionMode.NONE, result.mode)
+            assertTrue(result.selected.isEmpty())
+            assertTrue(result.candidates.isEmpty())
+        }
+    }
+    @Test fun wordJoinersAndOtherPunctuationAreNotRewrittenOrDropped() {
+        val target = word("well-known", 20f, 20f, 90f, 40f)
+        val punctuation = word("!", 92f, 20f, 98f, 40f)
+        val result = resolve(selection(stroke(26f, 30f, 100f, 30f)), target, punctuation)
+        assertEquals(SelectionResolutionMode.EXACT, result.mode)
+        assertEquals("well-known!", HighlighterGeometry.selectedText(result.selected))
+        val standalone = resolve(selection(stroke(90f, 30f, 101f, 30f)), punctuation)
+        assertSame(punctuation, standalone.selected.single())
+        val correction = word("中文", 20f, 20f, 90f, 40f)
+        assertSame(correction, resolve(selection(stroke(26f, 30f, 55f, 30f)), correction).selected.single())
+    }
+
+    private fun resolve(selected: HighlighterSelection, vararg words: HighlighterWord) =
+        SelectionRecovery.resolve(selected, words.toList())
+
     @Test fun separateStrokesNeverCreateLiftToNextLineBridge() {
         val selected = selection(stroke(20f, 30f, 50f, 30f), stroke(150f, 130f, 180f, 130f))
         assertEquals("Upper\nLower.", text(selected, word("Upper", 20f, 20f, 60f, 40f),

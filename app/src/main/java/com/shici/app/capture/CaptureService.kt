@@ -2427,7 +2427,7 @@ class CaptureService : Service() {
     }
 
     /**
-     * Shows the few original OCR words that [SelectionRecovery] could not disambiguate.
+     * Shows original nearby words that [SelectionRecovery] could not confirm automatically.
      *
      * Nothing is queried, counted or recorded before the user taps one candidate. Every button
      * captures this card's owner, its gate token, the original capture credential and the one page
@@ -2451,7 +2451,7 @@ class CaptureService : Service() {
         val token = gate.next()
         perf.snapshot("ambiguous")
         val card = compactCard("选择要查的词")
-        card.headerLine("笔迹附近有多个可能的词 · 点击前不查询、不收录")
+        card.headerLine("笔迹未明确命中单词 · 点击前不查询、不收录")
         val content = card.body
         content.addView(text("本次笔迹无法唯一对应一个词。请选择一个真实候选；不会自动合并整行，也不使用手动查词入口。",
             14f, Paper.warning)); content.space(8)
